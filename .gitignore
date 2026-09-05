@@ -1,0 +1,39 @@
+# Build outputs
+x64/
+build/
+out/
+
+# Visual Studio
+.vs/
+*.user
+*.suo
+*.VC.db
+*.VC.opendb
+*.cachefile
+*.tlog
+*.obj
+*.pdb
+*.ilk
+*.idb
+*.exp
+*.lib
+*.pch
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*~
+
+# Installer build artifacts
+installer/Output/
+installer/Setup-*/
+
+# Smoke / test runs
+smoke-runs/
+*.smoke.log
+
+# Local-only documentation
+docs/superpowers/

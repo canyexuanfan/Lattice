@@ -1,0 +1,159 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+
+  <PropertyGroup Label="Globals">
+    <VCProjectVersion>17.0</VCProjectVersion>
+    <Keyword>Win32Proj</Keyword>
+    <ProjectGuid>{6E235DA5-49D4-4D1B-8F52-43F1ED4072C5}</ProjectGuid>
+    <RootNamespace>Lattice</RootNamespace>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <PlatformToolset>v143</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>v143</PlatformToolset>
+    <WholeProgramOptimization>true</WholeProgramOptimization>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+
+  <PropertyGroup>
+    <OutDir>$(MSBuildProjectDirectory)\x64\$(Configuration)\</OutDir>
+    <IntDir>$(MSBuildProjectDirectory)\x64\$(Configuration)\obj\</IntDir>
+    <TargetName>Lattice</TargetName>
+  </PropertyGroup>
+
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <ClCompile>
+      <WarningLevel>Level4</WarningLevel>
+      <SDLCheck>true</SDLCheck>
+      <PreprocessorDefinitions>WIN32;_WINDOWS;UNICODE;_UNICODE;NOMINMAX;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <ConformanceMode>true</ConformanceMode>
+      <LanguageStandard>stdcpp20</LanguageStandard>
+      <AdditionalIncludeDirectories>src;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <TreatWarningAsError>false</TreatWarningAsError>
+      <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
+    </ClCompile>
+    <Link>
+      <SubSystem>Windows</SubSystem>
+      <AdditionalDependencies>d2d1.lib;dwrite.lib;windowscodecs.lib;shell32.lib;ole32.lib;uuid.lib;shlwapi.lib;comctl32.lib;user32.lib;gdi32.lib;dwmapi.lib;uxtheme.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+  </ItemDefinitionGroup>
+
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <ClCompile>
+      <WarningLevel>Level4</WarningLevel>
+      <SDLCheck>true</SDLCheck>
+      <PreprocessorDefinitions>WIN32;_WINDOWS;UNICODE;_UNICODE;NOMINMAX;NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <ConformanceMode>true</ConformanceMode>
+      <LanguageStandard>stdcpp20</LanguageStandard>
+      <AdditionalIncludeDirectories>src;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
+    </ClCompile>
+    <Link>
+      <SubSystem>Windows</SubSystem>
+      <EnableCOMDATFolding>true</EnableCOMDATFolding>
+      <OptimizeReferences>true</OptimizeReferences>
+      <AdditionalDependencies>d2d1.lib;dwrite.lib;windowscodecs.lib;shell32.lib;ole32.lib;uuid.lib;shlwapi.lib;comctl32.lib;user32.lib;gdi32.lib;dwmapi.lib;uxtheme.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+  </ItemDefinitionGroup>
+
+  <ItemGroup>
+    <ResourceCompile Include="src\app\Lattice.rc" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Manifest Include="src\app\Lattice.manifest" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ClCompile Include="src\main.cpp" />
+    <ClCompile Include="src\app\App.cpp" />
+    <ClCompile Include="src\app\StartupManager.cpp" />
+    <ClCompile Include="src\app\SingleInstance.cpp" />
+    <ClCompile Include="src\app\TrayIcon.cpp" />
+    <ClCompile Include="src\config\ConfigStore.cpp" />
+    <ClCompile Include="src\desktop\CategoryStorageManager.cpp" />
+    <ClCompile Include="src\desktop\DesktopLayout.cpp" />
+    <ClCompile Include="src\desktop\DesktopPlacementCoordinator.cpp" />
+    <ClCompile Include="src\desktop\DesktopScanner.cpp" />
+    <ClCompile Include="src\desktop\DesktopSession.cpp" />
+    <ClCompile Include="src\desktop\DesktopWatcher.cpp" />
+    <ClCompile Include="src\desktop\ManagedShortcutStore.cpp" />
+    <ClCompile Include="src\desktop\ShortcutResolver.cpp" />
+    <ClCompile Include="src\rendering\D2DContext.cpp" />
+    <ClCompile Include="src\rendering\IconCache.cpp" />
+    <ClCompile Include="src\rendering\WallpaperBackdrop.cpp" />
+    <ClCompile Include="src\shell\ShellLauncher.cpp" />
+    <ClCompile Include="src\shell\ShellDragDrop.cpp" />
+    <ClCompile Include="src\shell\ShellDropTarget.cpp" />
+    <ClCompile Include="src\testing\SmokeCommands.cpp" />
+    <ClCompile Include="src\ui\DragGhostWindow.cpp" />
+    <ClCompile Include="src\ui\IconGrid.cpp" />
+    <ClCompile Include="src\ui\InputDialog.cpp" />
+    <ClCompile Include="src\ui\MessageDialog.cpp" />
+    <ClCompile Include="src\ui\MainWindow.cpp" />
+    <ClCompile Include="src\ui\SettingsDialog.cpp" />
+    <ClCompile Include="src\ui\WidgetWindow.cpp" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ClInclude Include="src\app\App.h" />
+    <ClInclude Include="src\app\StartupManager.h" />
+    <ClInclude Include="src\app\SingleInstance.h" />
+    <ClInclude Include="src\app\TrayIcon.h" />
+    <ClInclude Include="src\app\resource.h" />
+    <ClInclude Include="src\config\ConfigStore.h" />
+    <ClInclude Include="src\desktop\CategoryStorageManager.h" />
+    <ClInclude Include="src\desktop\DesktopLayout.h" />
+    <ClInclude Include="src\desktop\DesktopPlacementCoordinator.h" />
+    <ClInclude Include="src\desktop\DesktopItem.h" />
+    <ClInclude Include="src\desktop\DesktopSession.h" />
+    <ClInclude Include="src\desktop\ManagedShortcutStore.h" />
+    <ClInclude Include="src\desktop\DesktopScanner.h" />
+    <ClInclude Include="src\desktop\DesktopWatcher.h" />
+    <ClInclude Include="src\desktop\ShortcutResolver.h" />
+    <ClInclude Include="src\rendering\D2DContext.h" />
+    <ClInclude Include="src\rendering\IconCache.h" />
+    <ClInclude Include="src\rendering\WallpaperBackdrop.h" />
+    <ClInclude Include="src\shell\ShellLauncher.h" />
+    <ClInclude Include="src\shell\ShellDragDrop.h" />
+    <ClInclude Include="src\shell\ShellDropTarget.h" />
+    <ClInclude Include="src\testing\SmokeCommands.h" />
+    <ClInclude Include="src\ui\DragGhostWindow.h" />
+    <ClInclude Include="src\ui\IconGrid.h" />
+    <ClInclude Include="src\ui\InputDialog.h" />
+    <ClInclude Include="src\ui\MessageDialog.h" />
+    <ClInclude Include="src\ui\MainWindow.h" />
+    <ClInclude Include="src\ui\SettingsDialog.h" />
+    <ClInclude Include="src\ui\WidgetWindow.h" />
+    <ClInclude Include="src\model\OrganizerModel.h" />
+    <ClInclude Include="src\util\ComInit.h" />
+    <ClInclude Include="src\util\PathUtil.h" />
+    <ClInclude Include="src\util\StringUtil.h" />
+    <ClInclude Include="src\util\Win32Error.h" />
+  </ItemGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+</Project>
