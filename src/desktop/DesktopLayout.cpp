@@ -80,37 +80,6 @@ void RefreshFolderView(IFolderView* view) {
     }
 }
 
-class ExactDesktopPositionMode {
-public:
-    bool Begin(IFolderView* view, std::wstring& errorMessage) {
-        view_.Reset();
-        if (view == nullptr ||
-            FAILED(view->QueryInterface(IID_PPV_ARGS(&view_))) ||
-            view_ == nullptr) {
-            errorMessage = L"Explorer 桌面视图不支持精确图标定位。";
-            return false;
-        }
-        DWORD flags = 0;
-        if (FAILED(view_->GetCurrentFolderFlags(&flags))) {
-            errorMessage = L"无法读取 Explorer 桌面对齐设置。";
-            view_.Reset();
-            return false;
-        }
-        if ((flags & FWF_SNAPTOGRID) == 0) {
-            return true;
-        }
-        if (FAILED(view_->SetCurrentFolderFlags(FWF_SNAPTOGRID, 0))) {
-            errorMessage = L"无法关闭当前 Explorer 桌面视图的坐标吸附。";
-            view_.Reset();
-            return false;
-        }
-        return true;
-    }
-
-private:
-    ComPtr<IFolderView2> view_;
-};
-
 HRESULT GetDesktopFolderView(
     ComPtr<IFolderView>& folderView,
     HWND* viewWindow = nullptr) {
@@ -254,7 +223,94 @@ bool EnumerateDesktopItems(IFolderView* view, std::vector<ShellDesktopItem>& ite
     return true;
 }
 
+bool ResolveDesktopViewItem(
+    IFolderView* view,
+    const std::wstring& path,
+    ShellDesktopItem& resolved,
+    std::wstring& errorMessage) {
+    if (ParseDesktopViewItem(view, path, resolved)) {
+        return true;
+    }
+    std::vector<ShellDesktopItem> items;
+    if (!EnumerateDesktopItems(view, items, errorMessage)) {
+        return false;
+    }
+    const auto found = std::find_if(
+        items.begin(),
+        items.end(),
+        [&](const ShellDesktopItem& item) { return PathsEqual(item.path, path); });
+    if (found == items.end()) {
+        errorMessage = L"Explorer 桌面视图中没有找到该项目。";
+        return false;
+    }
+    resolved.pidl = ILClone(found->pidl);
+    if (resolved.pidl == nullptr) {
+        errorMessage = L"无法复制 Explorer 桌面项目标识。";
+        return false;
+    }
+    resolved.path = found->path;
+    resolved.viewIndex = found->viewIndex;
+    return true;
+}
+
+bool PositionViewItemAndConfirm(
+    IFolderView* view,
+    PCUITEMID_CHILD pidl,
+    POINT requestedPoint,
+    DWORD flags,
+    POINT& confirmedPoint,
+    std::wstring& errorMessage) {
+    if (view == nullptr || pidl == nullptr) {
+        errorMessage = L"Explorer 桌面项目标识无效。";
+        return false;
+    }
+    if (FAILED(view->SelectAndPositionItems(1, &pidl, &requestedPoint, flags))) {
+        errorMessage = L"Explorer 拒绝更新桌面项目的显示位置。";
+        return false;
+    }
+    POINT previousPoint{};
+    int stableSamples = 0;
+    for (int attempt = 0; attempt < 18; ++attempt) {
+        POINT confirmed{};
+        if (SUCCEEDED(view->GetItemPosition(pidl, &confirmed))) {
+            if (stableSamples > 0 &&
+                confirmed.x == previousPoint.x && confirmed.y == previousPoint.y) {
+                ++stableSamples;
+            } else {
+                previousPoint = confirmed;
+                stableSamples = 1;
+            }
+            if (stableSamples >= 2) {
+                confirmedPoint = confirmed;
+                return true;
+            }
+        } else {
+            stableSamples = 0;
+        }
+        Sleep(8);
+    }
+    errorMessage = L"Explorer 没有返回稳定的桌面项目显示位置。";
+    return false;
+}
+
 }  // namespace
+
+bool DesktopLayout::CaptureViewFlags(DWORD& flags, std::wstring& errorMessage) const {
+    errorMessage.clear();
+    flags = 0;
+    ComPtr<IFolderView> view;
+    if (FAILED(GetDesktopFolderView(view))) {
+        errorMessage = L"无法连接 Explorer 桌面视图，未读取桌面对齐设置。";
+        return false;
+    }
+    ComPtr<IFolderView2> view2;
+    if (FAILED(view.As(&view2)) || view2 == nullptr ||
+        FAILED(view2->GetCurrentFolderFlags(&flags))) {
+        errorMessage = L"Explorer 桌面视图不支持读取对齐设置。";
+        return false;
+    }
+    return true;
+}
 
 bool DesktopLayout::CaptureAllPositions(
     std::vector<DesktopPosition>& positions,
@@ -375,6 +431,60 @@ bool DesktopLayout::CaptureScreenPosition(
     return true;
 }
 
+bool DesktopLayout::RestorePosition(
+    const std::wstring& path,
+    POINT viewPoint,
+    std::wstring& errorMessage) const {
+    errorMessage.clear();
+    ComPtr<IFolderView> view;
+    if (FAILED(GetDesktopFolderView(view))) {
+        errorMessage = L"无法连接 Explorer 桌面视图，未恢复该项目。";
+        return false;
+    }
+    ShellDesktopItem item;
+    if (!ResolveDesktopViewItem(view.Get(), path, item, errorMessage)) {
+        return false;
+    }
+    POINT confirmedPoint{};
+    return PositionViewItemAndConfirm(
+        view.Get(), item.pidl, viewPoint,
+        SVSI_POSITIONITEM | SVSI_NOSTATECHANGE,
+        confirmedPoint, errorMessage);
+}
+
+bool DesktopLayout::RestoreScreenPositionOnce(
+    const std::wstring& path,
+    POINT screenPoint,
+    POINT& restoredPoint,
+    std::wstring& errorMessage) const {
+    errorMessage.clear();
+    ComPtr<IFolderView> view;
+    HWND viewHwnd = nullptr;
+    if (FAILED(GetDesktopFolderView(view, &viewHwnd))) {
+        errorMessage = L"无法连接 Explorer 桌面视图，未放置该项目。";
+        return false;
+    }
+    const HWND listView = viewHwnd == nullptr
+        ? nullptr
+        : FindWindowExW(viewHwnd, nullptr, L"SysListView32", nullptr);
+    POINT expectedViewPoint = screenPoint;
+    if (listView == nullptr || ScreenToClient(listView, &expectedViewPoint) == FALSE) {
+        errorMessage = L"无法把鼠标释放点转换为 Explorer 桌面坐标。";
+        return false;
+    }
+    ShellDesktopItem item;
+    if (!ResolveDesktopViewItem(view.Get(), path, item, errorMessage)) {
+        return false;
+    }
+    if (!PositionViewItemAndConfirm(
+            view.Get(), item.pidl, expectedViewPoint,
+            SVSI_POSITIONITEM | SVSI_NOSTATECHANGE,
+            restoredPoint, errorMessage)) {
+        return false;
+    }
+    return true;
+}
+
 bool DesktopLayout::RestoreScreenPosition(
     const std::wstring& path,
     POINT screenPoint,
@@ -383,7 +493,6 @@ bool DesktopLayout::RestoreScreenPosition(
     const std::function<void()>& onVisiblePositioned,
     const std::function<bool()>& cancellationRequested) const {
     errorMessage.clear();
-    ExactDesktopPositionMode exactPositionMode;
     const auto isCancelled = [&]() {
         return cancellationRequested && cancellationRequested();
     };
@@ -416,9 +525,6 @@ bool DesktopLayout::RestoreScreenPosition(
             if (FAILED(GetDesktopFolderView(view, &shellViewWindow))) {
                 view.Reset();
             } else {
-                if (!exactPositionMode.Begin(view.Get(), errorMessage)) {
-                    return false;
-                }
                 desktopListView = FindWindowExW(
                     shellViewWindow,
                     nullptr,
@@ -433,8 +539,8 @@ bool DesktopLayout::RestoreScreenPosition(
         }
         if (view != nullptr) {
             constexpr DWORD kPositionFlags =
-                SVSI_POSITIONITEM | SVSI_TRANSLATEPT | SVSI_NOSTATECHANGE;
-            if (!parsedPositionIssued) {
+                SVSI_POSITIONITEM | SVSI_NOSTATECHANGE;
+            if (!parsedPositionIssued && exactViewPointKnown) {
                 ShellDesktopItem parsedItem;
                 if (ParseDesktopViewItem(view.Get(), path, parsedItem)) {
                     if (isCancelled()) {
@@ -442,7 +548,7 @@ bool DesktopLayout::RestoreScreenPosition(
                         return false;
                     }
                     PCUITEMID_CHILD pidl = parsedItem.pidl;
-                    POINT targetPoint = screenPoint;
+                    POINT targetPoint = exactViewPoint;
                     if (SUCCEEDED(view->SelectAndPositionItems(
                             1, &pidl, &targetPoint, kPositionFlags))) {
                         parsedPositionIssued = true;
@@ -484,29 +590,9 @@ bool DesktopLayout::RestoreScreenPosition(
                             errorMessage = L"桌面定位已取消。";
                             return false;
                         }
-                        DWORD_PTR directPositionResult = FALSE;
-                        const bool directPositioned =
-                            exactViewPointKnown &&
-                            visibleItem->viewIndex >= 0 &&
-                            exactViewPoint.x >= -32768 &&
-                            exactViewPoint.x <= 32767 &&
-                            exactViewPoint.y >= -32768 &&
-                            exactViewPoint.y <= 32767 &&
-                            SendMessageTimeoutW(
-                                desktopListView,
-                                LVM_SETITEMPOSITION,
-                                static_cast<WPARAM>(visibleItem->viewIndex),
-                                MAKELPARAM(
-                                    static_cast<SHORT>(exactViewPoint.x),
-                                    static_cast<SHORT>(exactViewPoint.y)),
-                                SMTO_ABORTIFHUNG | SMTO_BLOCK,
-                                250,
-                                &directPositionResult) != 0 &&
-                            directPositionResult != FALSE;
                         PCUITEMID_CHILD pidl = visibleItem->pidl;
-                        POINT targetPoint = screenPoint;
-                        if (directPositioned ||
-                            SUCCEEDED(view->SelectAndPositionItems(
+                        POINT targetPoint = exactViewPoint;
+                        if (SUCCEEDED(view->SelectAndPositionItems(
                                 1, &pidl, &targetPoint, kPositionFlags))) {
                             visiblePositionIssued = true;
                             if (stabilizationStartedAt == 0) {
@@ -525,25 +611,6 @@ bool DesktopLayout::RestoreScreenPosition(
                         !positionedThisAttempt &&
                         SUCCEEDED(view->GetItemPosition(
                             visibleItem->pidl, &confirmed))) {
-                        if (!exactViewPointKnown ||
-                            confirmed.x != exactViewPoint.x ||
-                            confirmed.y != exactViewPoint.y) {
-                            visiblePositionIssued = false;
-                            stablePositionSamples = 0;
-                            stableSince = 0;
-                            independentAgreementSamples = 0;
-                            independentAgreementReady = false;
-                            nextIndependentConfirmationAt = 0;
-                            const ULONGLONG mismatchNow = GetTickCount64();
-                            if (stabilizationStartedAt != 0 &&
-                                mismatchNow - stabilizationStartedAt >=
-                                    kStabilizationTimeoutMilliseconds) {
-                                break;
-                            }
-                            Sleep(8);
-                            ++pollAttempts;
-                            continue;
-                        }
                         const ULONGLONG now = GetTickCount64();
                         if (stablePositionSamples > 0 &&
                             confirmed.x == previousConfirmed.x &&
@@ -576,11 +643,10 @@ bool DesktopLayout::RestoreScreenPosition(
                                 if (FAILED(view->GetItemPosition(
                                         visibleItem->pidl,
                                         &afterRestore)) ||
-                                    !exactViewPointKnown ||
-                                    afterRestore.x != exactViewPoint.x ||
-                                    afterRestore.y != exactViewPoint.y) {
+                                    afterRestore.x != confirmed.x ||
+                                    afterRestore.y != confirmed.y) {
                                     errorMessage =
-                                        L"Explorer 精确定位后改变了图标位置。";
+                                        L"Explorer 定位后改变了图标所在网格位置。";
                                     return false;
                                 }
                                 confirmed = afterRestore;

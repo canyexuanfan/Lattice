@@ -4,6 +4,7 @@
 #include <ShlObj.h>
 #include <ShObjIdl.h>
 #include <shellapi.h>
+#include <winreg.h>
 #include <wrl/client.h>
 
 #include <algorithm>
@@ -13,6 +14,7 @@
 #include <utility>
 #include <vector>
 
+#include "desktop/DesktopLayout.h"
 #include "util/PathUtil.h"
 #include "util/StringUtil.h"
 
@@ -21,6 +23,9 @@ namespace {
 constexpr std::uint32_t kJournalMagic = 0x4F534D44;  // DMSO
 constexpr std::uint32_t kJournalVersion = 1;
 constexpr std::uint32_t kMaximumJournalStringLength = 32768;
+constexpr int kLegacyAttributeVisibilityMode = 1;
+constexpr int kNamespaceVisibilityMode = 2;
+constexpr int kOffscreenVisibilityMode = 3;
 
 struct JournalHeader {
     std::uint32_t magic = kJournalMagic;
@@ -106,6 +111,59 @@ bool PathIsInside(const std::wstring& path, const std::wstring& root) {
            CompareStringOrdinal(
                normalizedPath.c_str(), static_cast<int>(normalizedRoot.size()),
                normalizedRoot.c_str(), static_cast<int>(normalizedRoot.size()), TRUE) == CSTR_EQUAL;
+}
+
+constexpr wchar_t kNewStartPanelKey[] =
+    L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\HideDesktopIcons\\NewStartPanel";
+constexpr wchar_t kClassicStartMenuKey[] =
+    L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\HideDesktopIcons\\ClassicStartMenu";
+
+std::wstring DesktopNamespaceClsid(const std::wstring& parsingName) {
+    const size_t start = parsingName.find(L"::{");
+    const size_t end = start == std::wstring::npos ? std::wstring::npos : parsingName.find(L'}', start + 3);
+    if (start == std::wstring::npos || end == std::wstring::npos) {
+        return {};
+    }
+    std::wstring clsid = parsingName.substr(start + 2, end - start - 1);
+    if (CompareStringOrdinal(clsid.c_str(), -1, L"{26EE0668-A00A-44D7-9371-BEB064C98683}", -1, TRUE) == CSTR_EQUAL) {
+        return L"{5399E694-6CE5-4D6C-8FCE-1D8870FDCBA0}";
+    }
+    return clsid;
+}
+
+int ReadDesktopIconValue(const wchar_t* keyPath, const std::wstring& valueName) {
+    DWORD value = 0;
+    DWORD size = sizeof(value);
+    const LSTATUS status = RegGetValueW(
+        HKEY_CURRENT_USER, keyPath, valueName.c_str(), RRF_RT_REG_DWORD, nullptr, &value, &size);
+    return status == ERROR_SUCCESS ? static_cast<int>(value) : -1;
+}
+
+bool WriteDesktopIconValue(const wchar_t* keyPath, const std::wstring& valueName, int value) {
+    HKEY key = nullptr;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, keyPath, 0, nullptr, 0, KEY_SET_VALUE, nullptr, &key, nullptr) != ERROR_SUCCESS) {
+        return false;
+    }
+    const LSTATUS status = value < 0
+        ? RegDeleteValueW(key, valueName.c_str())
+        : [&]() {
+              const DWORD data = static_cast<DWORD>(value);
+              return RegSetValueExW(key, valueName.c_str(), 0, REG_DWORD,
+                  reinterpret_cast<const BYTE*>(&data), sizeof(data));
+          }();
+    RegCloseKey(key);
+    return status == ERROR_SUCCESS || (value < 0 && status == ERROR_FILE_NOT_FOUND);
+}
+
+void RefreshDesktopShell(const std::wstring& path, bool namespaceItem) {
+    if (namespaceItem) {
+        SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST | SHCNF_FLUSHNOWAIT, nullptr, nullptr);
+        DWORD_PTR ignored = 0;
+        SendMessageTimeoutW(HWND_BROADCAST, WM_SETTINGCHANGE, 0,
+            reinterpret_cast<LPARAM>(L"ShellState"), SMTO_ABORTIFHUNG, 1000, &ignored);
+        return;
+    }
+    SHChangeNotify(SHCNE_UPDATEITEM, SHCNF_PATHW | SHCNF_FLUSHNOWAIT, path.c_str(), nullptr);
 }
 
 bool EnsureDirectoryTree(const std::wstring& path) {
@@ -392,7 +450,10 @@ ManagedShortcutStore::ManagedShortcutStore(std::wstring dataDirectory, std::wstr
 bool ManagedShortcutStore::IsSupportedDesktopItem(const std::wstring& path) const {
     const DWORD attributes = GetFileAttributesW(path.c_str());
     const std::wstring fileName = FileNameFromPath(path);
-    return attributes != INVALID_FILE_ATTRIBUTES &&
+    if (attributes == INVALID_FILE_ATTRIBUTES) {
+        return IsShellNamespaceItem(path);
+    }
+    return
            !PathsEqual(path, desktopPath_) && !PathsEqual(path, publicDesktopPath_) && !PathIsInside(path, rootPath_) &&
            !fileName.empty() && fileName != L"." && fileName != L"..";
 }
@@ -405,10 +466,17 @@ bool ManagedShortcutStore::IsSupportedShortcut(const std::wstring& path) const {
 }
 
 bool ManagedShortcutStore::RequiresManagedStorage(const std::wstring& path) const {
-    // Existing managed items, including ordinary files from older versions,
-    // keep their current safe transaction semantics. New ordinary files and
-    // folders remain at their original paths and are stored by reference.
-    return IsManagedPath(path) || IsSupportedShortcut(path);
+    if (IsManagedPath(path)) {
+        return true;
+    }
+
+    // Explorer has no durable per-item hide API for ordinary filesystem
+    // objects. A collected item from the current user's Desktop therefore has
+    // exactly one real copy: it is moved transactionally into Lattice's
+    // managed category directory. Public Desktop and arbitrary external paths
+    // are deliberately excluded because moving them can require wider
+    // permissions or change machine-wide state.
+    return PathIsInside(path, desktopPath_) && IsSupportedDesktopItem(path);
 }
 
 bool ManagedShortcutStore::IsManagedPath(const std::wstring& path) const {
@@ -417,6 +485,155 @@ bool ManagedShortcutStore::IsManagedPath(const std::wstring& path) const {
 
 bool ManagedShortcutStore::IsDesktopPath(const std::wstring& path) const {
     return PathIsInside(path, desktopPath_) || PathIsInside(path, publicDesktopPath_);
+}
+
+bool ManagedShortcutStore::IsShellNamespaceItem(const std::wstring& path) const {
+    if (path.empty() || GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        return false;
+    }
+    Microsoft::WRL::ComPtr<IShellItem> item;
+    return SUCCEEDED(SHCreateItemFromParsingName(path.c_str(), nullptr, IID_PPV_ARGS(&item))) && item != nullptr;
+}
+
+bool ManagedShortcutStore::IsDesktopPositionSuppressed(const ItemConfig& item) const noexcept {
+    return item.desktopVisibilityMode == kOffscreenVisibilityMode;
+}
+
+bool ManagedShortcutStore::CaptureAndSuppressDesktopVisibility(
+    const std::wstring& path,
+    ItemConfig& item,
+    std::wstring& errorMessage) const {
+    errorMessage.clear();
+    if (IsManagedPath(path)) {
+        return true;
+    }
+    const DWORD attributes = GetFileAttributesW(path.c_str());
+    if (attributes != INVALID_FILE_ATTRIBUTES) {
+        if (!IsDesktopPath(path)) {
+            return true;
+        }
+        errorMessage = PathIsInside(path, publicDesktopPath_)
+            ? L"共享桌面项目不能通过改变坐标隐藏；当前权限下未移动该项目。"
+            : L"该桌面项目必须通过托管存储收纳，不能通过改变坐标隐藏。";
+        return false;
+    }
+    if (!IsShellNamespaceItem(path)) {
+        errorMessage = L"该桌面项目当前不可访问。";
+        return false;
+    }
+    const std::wstring clsid = DesktopNamespaceClsid(path);
+    if (clsid.empty()) {
+        errorMessage = L"无法识别该虚拟桌面项目的稳定标识。";
+        return false;
+    }
+    item.desktopVisibilityMode = kNamespaceVisibilityMode;
+    item.desktopVisibilityNewStartValue = ReadDesktopIconValue(kNewStartPanelKey, clsid);
+    item.desktopVisibilityClassicValue = ReadDesktopIconValue(kClassicStartMenuKey, clsid);
+    if (!WriteDesktopIconValue(kNewStartPanelKey, clsid, 1) ||
+        !WriteDesktopIconValue(kClassicStartMenuKey, clsid, 1)) {
+        WriteDesktopIconValue(kNewStartPanelKey, clsid, item.desktopVisibilityNewStartValue);
+        WriteDesktopIconValue(kClassicStartMenuKey, clsid, item.desktopVisibilityClassicValue);
+        item.desktopVisibilityMode = 0;
+        errorMessage = L"无法保存并隐藏该虚拟桌面图标。";
+        return false;
+    }
+    RefreshDesktopShell(path, true);
+    return true;
+}
+
+bool ManagedShortcutStore::SuppressDesktopVisibility(ItemConfig& item, std::wstring& errorMessage) const {
+    errorMessage.clear();
+    if (item.desktopVisibilityMode == 0) {
+        return true;
+    }
+    if (item.desktopVisibilityMode == kLegacyAttributeVisibilityMode) {
+        errorMessage = L"旧版文件隐藏状态只能恢复；该项目需要迁移到托管存储。";
+        return false;
+    }
+    if (item.desktopVisibilityMode == kOffscreenVisibilityMode) {
+        errorMessage = L"旧版离屏状态只能恢复；该项目需要迁移到托管存储。";
+        return false;
+    }
+    const std::wstring clsid = DesktopNamespaceClsid(item.path);
+    if (clsid.empty() || !WriteDesktopIconValue(kNewStartPanelKey, clsid, 1) ||
+        !WriteDesktopIconValue(kClassicStartMenuKey, clsid, 1)) {
+        errorMessage = L"无法恢复虚拟桌面图标隐藏状态。";
+        return false;
+    }
+    RefreshDesktopShell(item.path, true);
+    return true;
+}
+
+bool ManagedShortcutStore::PrepareForManagedStorage(
+    ItemConfig& item,
+    std::wstring& errorMessage) const {
+    errorMessage.clear();
+    if (item.desktopVisibilityMode == kNamespaceVisibilityMode) {
+        errorMessage = L"虚拟桌面项目不能迁入文件托管目录。";
+        return false;
+    }
+    if (item.desktopVisibilityMode == kLegacyAttributeVisibilityMode &&
+        !RestoreDesktopVisibility(item, errorMessage)) {
+        return false;
+    }
+    item.desktopVisibilityMode = 0;
+    item.desktopVisibilityOriginalFlags = 0;
+    item.desktopVisibilityNewStartValue = -1;
+    item.desktopVisibilityClassicValue = -1;
+    return true;
+}
+
+bool ManagedShortcutStore::RestoreDesktopVisibility(
+    const ItemConfig& item,
+    std::wstring& errorMessage,
+    const POINT* releaseScreenPoint) const {
+    errorMessage.clear();
+    if (item.desktopVisibilityMode == 0) {
+        return true;
+    }
+    if (item.desktopVisibilityMode == kLegacyAttributeVisibilityMode) {
+        const DWORD attributes = GetFileAttributesW(item.path.c_str());
+        if (attributes == INVALID_FILE_ATTRIBUTES) {
+            errorMessage = L"桌面原件已不存在，无法恢复其显示状态。";
+            return false;
+        }
+        const DWORD restored = (attributes & ~(FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM)) |
+            static_cast<DWORD>(item.desktopVisibilityOriginalFlags);
+        if (SetFileAttributesW(item.path.c_str(), restored) == FALSE) {
+            errorMessage = ErrorText(L"无法恢复 Explorer 桌面原图标", GetLastError());
+            return false;
+        }
+        RefreshDesktopShell(item.path, false);
+        return true;
+    }
+    if (item.desktopVisibilityMode == kOffscreenVisibilityMode) {
+        DesktopLayout desktopLayout;
+        if (releaseScreenPoint != nullptr) {
+            POINT restoredPoint{};
+            return desktopLayout.RestoreScreenPositionOnce(
+                item.path,
+                *releaseScreenPoint,
+                restoredPoint,
+                errorMessage);
+        }
+        if (!item.hasDesktopPosition) {
+            errorMessage = L"没有保存该桌面项目的原始位置，无法恢复显示。";
+            return false;
+        }
+        return desktopLayout.RestorePosition(
+            item.path,
+            POINT{item.desktopX, item.desktopY},
+            errorMessage);
+    }
+    const std::wstring clsid = DesktopNamespaceClsid(item.path);
+    if (clsid.empty() ||
+        !WriteDesktopIconValue(kNewStartPanelKey, clsid, item.desktopVisibilityNewStartValue) ||
+        !WriteDesktopIconValue(kClassicStartMenuKey, clsid, item.desktopVisibilityClassicValue)) {
+        errorMessage = L"无法恢复虚拟桌面图标的原始显示状态。";
+        return false;
+    }
+    RefreshDesktopShell(item.path, true);
+    return true;
 }
 
 std::wstring ManagedShortcutStore::CategoryPath(const std::wstring& categoryId) const {
@@ -476,7 +693,16 @@ bool ManagedShortcutStore::MoveToOriginalDesktop(
         errorMessage = L"该项目不在格子的托管目录中，未移动任何文件。";
         return false;
     }
-    const std::wstring target = FullPath(originalDesktopPath);
+    std::wstring target = FullPath(originalDesktopPath);
+    const bool redirectedFromPublicDesktop = PathIsInside(target, publicDesktopPath_);
+    if (redirectedFromPublicDesktop) {
+        // Public Desktop is normally read-only for unelevated interactive
+        // processes. Historical versions could move these shortcuts into the
+        // managed store while elevated; releasing them must not require
+        // elevation later. Keep one physical file and return it to this user's
+        // desktop instead.
+        target = JoinPath(desktopPath_, FileNameFromPath(target));
+    }
     const std::wstring targetDirectory = ParentDirectory(target);
     if (target.empty() || !IsDesktopPath(target) || targetDirectory.empty()) {
         errorMessage = L"记录的原桌面位置无效，已停止归还以避免移动到桌面以外。";
@@ -484,6 +710,16 @@ bool ManagedShortcutStore::MoveToOriginalDesktop(
     }
     if (GetFileAttributesW(target.c_str()) != INVALID_FILE_ATTRIBUTES && !PathsEqual(sourcePath, target)) {
         if (!FilesHaveSameContents(sourcePath, target)) {
+            if (redirectedFromPublicDesktop) {
+                return ExecuteMove(
+                    itemId,
+                    sourcePath,
+                    desktopPath_,
+                    true,
+                    persistDestination,
+                    destinationPath,
+                    errorMessage);
+            }
             errorMessage = L"原桌面位置已经存在内容不同的同名项目，已保留两份且未覆盖：" + target;
             return false;
         }

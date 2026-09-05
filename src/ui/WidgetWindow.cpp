@@ -44,7 +44,7 @@ constexpr UINT kBackdropRefreshDelayMilliseconds = 80;
 constexpr UINT_PTR kIconDragTimerId = 5;
 constexpr UINT kIconDragPollMilliseconds = 16;
 constexpr wchar_t kAlignmentGuideClassName[] = L"Lattice.AlignmentGuide";
-constexpr wchar_t kCurrentVersion[] = L"0.4.28";
+constexpr wchar_t kCurrentVersion[] = L"0.4.32";
 constexpr UINT kShellNewCommandFirst = 0x5000;
 constexpr UINT kShellNewCommandLast = 0x5FFF;
 
@@ -1697,6 +1697,42 @@ bool WidgetWindow::AddDroppedPaths(
             continue;
         }
 
+        ItemConfig visibilityState;
+        visibilityState.id = item.id;
+        visibilityState.path = sourcePath;
+        if (existingByPath != appConfig.items.end()) {
+            visibilityState = *existingByPath;
+        }
+        if (physicallyManagedShortcut) {
+            std::wstring visibilityError;
+            if (!shortcutStore_.PrepareForManagedStorage(
+                    visibilityState, visibilityError)) {
+                if (firstError.empty()) {
+                    firstError = visibilityError;
+                }
+                continue;
+            }
+        }
+        bool capturedNewVisibility = false;
+        if (!physicallyManagedShortcut) {
+            std::wstring visibilityError;
+            if (visibilityState.desktopVisibilityMode == 0) {
+                if (!shortcutStore_.CaptureAndSuppressDesktopVisibility(
+                        sourcePath, visibilityState, visibilityError)) {
+                    if (firstError.empty()) {
+                        firstError = visibilityError;
+                    }
+                    continue;
+                }
+                capturedNewVisibility = visibilityState.desktopVisibilityMode != 0;
+            } else if (!shortcutStore_.SuppressDesktopVisibility(visibilityState, visibilityError)) {
+                if (firstError.empty()) {
+                    firstError = visibilityError;
+                }
+                continue;
+            }
+        }
+
         const AppConfig beforeItemConfig = appConfig;
         std::wstring destinationPath;
         std::wstring errorMessage;
@@ -1718,6 +1754,18 @@ bool WidgetWindow::AddDroppedPaths(
                 registered->desktopX = originalDesktopPoint.x;
                 registered->desktopY = originalDesktopPoint.y;
                 registered->hasDesktopPosition = hasOriginalDesktopPoint;
+                registered->desktopVisibilityMode = physicallyManagedShortcut
+                    ? 0
+                    : visibilityState.desktopVisibilityMode;
+                registered->desktopVisibilityOriginalFlags = physicallyManagedShortcut
+                    ? 0
+                    : visibilityState.desktopVisibilityOriginalFlags;
+                registered->desktopVisibilityNewStartValue = physicallyManagedShortcut
+                    ? -1
+                    : visibilityState.desktopVisibilityNewStartValue;
+                registered->desktopVisibilityClassicValue = physicallyManagedShortcut
+                    ? -1
+                    : visibilityState.desktopVisibilityClassicValue;
                 if (hasOriginalDesktopPoint) {
                     auto placement = std::find_if(
                         appConfig.desktopLayout.begin(),
@@ -1834,6 +1882,10 @@ bool WidgetWindow::AddDroppedPaths(
         }
         if (!collected) {
             appConfig = beforeItemConfig;
+            if (capturedNewVisibility) {
+                std::wstring rollbackError;
+                shortcutStore_.RestoreDesktopVisibility(visibilityState, rollbackError);
+            }
             if (firstError.empty()) {
                 firstError = errorMessage;
             }
@@ -2336,9 +2388,9 @@ void WidgetWindow::ShowPersonalCenter() {
 }
 
 void WidgetWindow::CheckForUpdates() {
-    const std::wstring message = std::wstring(L"当前版本：") + kCurrentVersion +
-        L"\n\n当前构建未配置在线更新源。新的安装包可直接覆盖安装，原有分类和布局数据会保留。";
-    MessageDialog::Show(instance_, hwnd_, message.c_str(), L"检查更新", MB_OK | MB_ICONINFORMATION);
+    if (owner_ != nullptr && IsWindow(owner_) != FALSE) {
+        SendMessageW(owner_, kWidgetHostCommandMessage, static_cast<WPARAM>(WidgetHostCommand::CheckForUpdates), reinterpret_cast<LPARAM>(hwnd_));
+    }
 }
 
 void WidgetWindow::ShowSortMenu(POINT screenPoint) {
@@ -3304,7 +3356,7 @@ bool WidgetWindow::MoveItemOut(
     const auto registeredBeforeRemoval = std::find_if(beforeRemoval.items.begin(), beforeRemoval.items.end(), [&](const ItemConfig& value) {
         return value.id == itemId;
     });
-    const ItemConfig placement = registeredBeforeRemoval == beforeRemoval.items.end() ? ItemConfig{} : *registeredBeforeRemoval;
+    ItemConfig placement = registeredBeforeRemoval == beforeRemoval.items.end() ? ItemConfig{} : *registeredBeforeRemoval;
     const auto removeFromConfig = [&]() {
         AppConfig config = configStore_.LoadAppConfig();
         config.uncategorizedItemIds.erase(
@@ -3327,9 +3379,20 @@ bool WidgetWindow::MoveItemOut(
     std::wstring desktopPath = sourcePath;
     std::wstring errorMessage;
     if (!shortcutStore_.IsManagedPath(sourcePath)) {
-        moved = removeFromConfig();
+        bool restoredVisibility = true;
+        if (placement.desktopVisibilityMode != 0) {
+            restoredVisibility = shortcutStore_.RestoreDesktopVisibility(
+                placement,
+                errorMessage,
+                dropScreenPoint);
+        }
+        moved = restoredVisibility && removeFromConfig();
         if (!moved) {
-            errorMessage = L"项目原件未发生改变，但无法保存移出格子的配置。";
+            if (restoredVisibility) {
+                std::wstring rollbackError;
+                shortcutStore_.SuppressDesktopVisibility(placement, rollbackError);
+                errorMessage = L"项目原件未发生改变，但无法保存移出格子的配置。";
+            }
         }
     } else {
         std::wstring destinationPath;

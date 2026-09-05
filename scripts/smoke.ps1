@@ -52,6 +52,7 @@ function Invoke-SmokeMode {
     $processEnvironment["DESKTOP_ORGANIZER_DATA_DIR"] = $smokeDataDir
     $processEnvironment["DESKTOP_ORGANIZER_INSTANCE_SUFFIX"] = "smoke-$runId"
     $processEnvironment["DESKTOP_ORGANIZER_SMOKE_ITEMS_DIR"] = $managedItemsSmokeDir
+    $processEnvironment["DESKTOP_ORGANIZER_DISABLE_AUTO_UPDATE"] = "1"
     $process = [System.Diagnostics.Process]::Start($psi)
     $processId = $process.Id
     $processStartTime = $process.StartTime.ToFileTime()
@@ -91,7 +92,8 @@ try {
         "--smoke-widget-desktop-layer",
         "--smoke-widget-interaction",
         "--smoke-widget-drop-latency",
-        "--smoke-widget-drop-placement")) {
+        "--smoke-widget-drop-placement",
+        "--smoke-update-dialog")) {
         Invoke-SmokeMode $mode
     }
     $runSucceeded = $true

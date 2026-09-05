@@ -1,5 +1,7 @@
 #pragma once
 
+#include <Windows.h>
+
 #include <functional>
 #include <string>
 
@@ -15,6 +17,21 @@ public:
     bool RequiresManagedStorage(const std::wstring& path) const;
     bool IsManagedPath(const std::wstring& path) const;
     bool IsDesktopPath(const std::wstring& path) const;
+    bool IsShellNamespaceItem(const std::wstring& path) const;
+    bool IsDesktopPositionSuppressed(const ItemConfig& item) const noexcept;
+
+    bool CaptureAndSuppressDesktopVisibility(
+        const std::wstring& path,
+        ItemConfig& item,
+        std::wstring& errorMessage) const;
+    bool SuppressDesktopVisibility(ItemConfig& item, std::wstring& errorMessage) const;
+    bool PrepareForManagedStorage(
+        ItemConfig& item,
+        std::wstring& errorMessage) const;
+    bool RestoreDesktopVisibility(
+        const ItemConfig& item,
+        std::wstring& errorMessage,
+        const POINT* releaseScreenPoint = nullptr) const;
 
     bool MoveIntoCategory(
         const std::wstring& itemId,

@@ -490,6 +490,22 @@ LRESULT CALLBACK MessageDialogProc(HWND hwnd, UINT message, WPARAM wParam, LPARA
 
 }  // namespace
 
+RECT MessageDialog::CalculatePlacement(
+    const RECT& anchor,
+    const RECT& workArea,
+    int width,
+    int height) {
+    const int workWidth = std::max(1, static_cast<int>(workArea.right - workArea.left));
+    const int workHeight = std::max(1, static_cast<int>(workArea.bottom - workArea.top));
+    width = std::clamp(width, 1, workWidth);
+    height = std::clamp(height, 1, workHeight);
+    int x = anchor.left + ((anchor.right - anchor.left) - width) / 2;
+    int y = anchor.top + ((anchor.bottom - anchor.top) - height) / 2;
+    x = std::clamp(x, static_cast<int>(workArea.left), static_cast<int>(workArea.right) - width);
+    y = std::clamp(y, static_cast<int>(workArea.top), static_cast<int>(workArea.bottom) - height);
+    return RECT{x, y, x + width, y + height};
+}
+
 int MessageDialog::Show(
     HINSTANCE instance,
     HWND owner,
@@ -514,12 +530,38 @@ int MessageDialog::Show(
     if (state.dpi < 96) {
         state.dpi = 96;
     }
-    state.width = Scale(state, kDialogWidth);
+    RECT anchor{};
+    if (owner == nullptr || !GetWindowRect(owner, &anchor)) {
+        POINT cursor{};
+        if (GetCursorPos(&cursor) == FALSE) {
+            cursor = POINT{0, 0};
+        }
+        HMONITOR fallbackMonitor = MonitorFromPoint(cursor, MONITOR_DEFAULTTOPRIMARY);
+        MONITORINFO fallbackInfo{};
+        fallbackInfo.cbSize = sizeof(fallbackInfo);
+        if (GetMonitorInfoW(fallbackMonitor, &fallbackInfo)) {
+            anchor = fallbackInfo.rcWork;
+        }
+    }
+    HMONITOR monitor = owner != nullptr && IsWindow(owner) != FALSE
+        ? MonitorFromWindow(owner, MONITOR_DEFAULTTONEAREST)
+        : MonitorFromRect(&anchor, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO monitorInfo{};
+    monitorInfo.cbSize = sizeof(monitorInfo);
+    RECT workArea = anchor;
+    if (monitor != nullptr && GetMonitorInfoW(monitor, &monitorInfo)) {
+        workArea = monitorInfo.rcWork;
+    }
+
+    const int workWidth = std::max(1, static_cast<int>(workArea.right - workArea.left));
+    const int workHeight = std::max(1, static_cast<int>(workArea.bottom - workArea.top));
+    state.width = std::min(Scale(state, kDialogWidth), workWidth);
     state.messageHeight = MeasureMessageHeight(message, state.dpi);
     state.height = std::clamp(
         Scale(state, kTitleHeight + 13 + 14 + kButtonHeight + kBottomPadding) + state.messageHeight,
         Scale(state, kMinimumHeight),
         Scale(state, kMaximumHeight));
+    state.height = std::min(state.height, workHeight);
     state.result = HasYesNoButtons(type) ? IDNO : IDCANCEL;
 
     HWND hwnd = CreateWindowExW(
@@ -539,18 +581,8 @@ int MessageDialog::Show(
         return state.result;
     }
 
-    RECT anchor{};
-    if (owner == nullptr || !GetWindowRect(owner, &anchor)) {
-        HMONITOR monitor = MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
-        MONITORINFO monitorInfo{};
-        monitorInfo.cbSize = sizeof(monitorInfo);
-        if (GetMonitorInfoW(monitor, &monitorInfo)) {
-            anchor = monitorInfo.rcWork;
-        }
-    }
-    const int x = anchor.left + ((anchor.right - anchor.left) - state.width) / 2;
-    const int y = anchor.top + ((anchor.bottom - anchor.top) - state.height) / 2;
-    SetWindowPos(hwnd, HWND_TOP, x, y, 0, 0, SWP_NOSIZE | SWP_SHOWWINDOW);
+    const RECT placement = CalculatePlacement(anchor, workArea, state.width, state.height);
+    SetWindowPos(hwnd, HWND_TOP, placement.left, placement.top, 0, 0, SWP_NOSIZE | SWP_SHOWWINDOW);
     SetForegroundWindow(hwnd);
 
     const bool ownerEnabled = owner != nullptr && IsWindowEnabled(owner);
@@ -558,15 +590,31 @@ int MessageDialog::Show(
         EnableWindow(owner, FALSE);
     }
     MSG modalMessage{};
-    while (IsWindow(hwnd) && GetMessageW(&modalMessage, nullptr, 0, 0) > 0) {
+    bool quitRequested = false;
+    int quitCode = 0;
+    while (IsWindow(hwnd)) {
+        const BOOL messageResult = GetMessageW(&modalMessage, nullptr, 0, 0);
+        if (messageResult <= 0) {
+            if (messageResult == 0) {
+                quitRequested = true;
+                quitCode = static_cast<int>(modalMessage.wParam);
+            }
+            break;
+        }
         if (!IsDialogMessageW(hwnd, &modalMessage)) {
             TranslateMessage(&modalMessage);
             DispatchMessageW(&modalMessage);
         }
     }
-    if (ownerEnabled) {
+    if (quitRequested && IsWindow(hwnd)) {
+        DestroyWindow(hwnd);
+    }
+    if (ownerEnabled && !quitRequested && IsWindow(owner)) {
         EnableWindow(owner, TRUE);
         SetForegroundWindow(owner);
+    }
+    if (quitRequested) {
+        PostQuitMessage(quitCode);
     }
     return state.result;
 }

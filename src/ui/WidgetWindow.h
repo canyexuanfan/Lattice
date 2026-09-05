@@ -39,6 +39,7 @@ enum class WidgetHostCommand : UINT {
     MoveCategoryUp,
     MoveCategoryDown,
     ExitApplication,
+    CheckForUpdates,
 };
 
 class WidgetWindow {

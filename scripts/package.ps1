@@ -20,6 +20,30 @@ if ($null -eq $versionDefinition -or $versionDefinition.Line -notmatch '^#define
 $installerVersion = $Matches[1]
 $expectedBinaryVersion = [version]("$installerVersion.0")
 
+$installerSource = Get-Content -LiteralPath $installerScript -Raw
+if ($installerSource -match 'WaitForProductExit\s*\(\s*\d{3,}\s*\)') {
+    throw "Installer contains a minute-scale product exit wait."
+}
+$pollMatch = [regex]::Match($installerSource, 'ProductExitPollMilliseconds\s*=\s*(\d+)\s*;')
+$messageAttemptsMatch = [regex]::Match($installerSource, 'ProductExitMessageWaitAttempts\s*=\s*(\d+)\s*;')
+$closeAttemptsMatch = [regex]::Match($installerSource, 'ProductExitCloseWaitAttempts\s*=\s*(\d+)\s*;')
+if (-not $pollMatch.Success -or -not $messageAttemptsMatch.Success -or -not $closeAttemptsMatch.Success) {
+    throw "Installer product exit timing constants are missing."
+}
+$productExitPollMilliseconds = [int]$pollMatch.Groups[1].Value
+$productExitMessageAttempts = [int]$messageAttemptsMatch.Groups[1].Value
+$productExitCloseAttempts = [int]$closeAttemptsMatch.Groups[1].Value
+$maximumProductExitWaitMilliseconds =
+    $productExitPollMilliseconds * ($productExitMessageAttempts + $productExitCloseAttempts)
+if (
+    $productExitPollMilliseconds -le 0 -or
+    $productExitMessageAttempts -le 0 -or
+    $productExitCloseAttempts -le 0 -or
+    $maximumProductExitWaitMilliseconds -gt 5000
+) {
+    throw "Installer product exit wait exceeds the 5-second UX budget: $maximumProductExitWaitMilliseconds ms."
+}
+
 & $buildScript -Configuration Release
 $releaseExe = Join-Path $releaseDir "Lattice.exe"
 if (!(Test-Path -LiteralPath $releaseExe)) {

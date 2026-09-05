@@ -8,6 +8,7 @@
 
 #include "app/StartupManager.h"
 #include "app/TrayIcon.h"
+#include "app/UpdateService.h"
 #include "config/ConfigStore.h"
 #include "desktop/DesktopPlacementCoordinator.h"
 #include "desktop/DesktopWatcher.h"
@@ -70,6 +71,8 @@ private:
     void ImportCurrentCategory();
     void RenameItemDisplayName(const std::wstring& itemId);
     void RefreshIconCache();
+    void CheckForUpdates(HWND sourceWindow);
+    void HandleUpdateServiceResult(UpdateServiceResult* result);
     void EnsureWindowVisible();
     void LoadOrganizerConfig();
     void Render();

@@ -4,6 +4,7 @@
 #include <commctrl.h>
 #include <commoncontrols.h>
 #include <shellapi.h>
+#include <shlobj.h>
 #include <shobjidl.h>
 
 #include <algorithm>
@@ -123,12 +124,14 @@ bool HasActiveFailedIconBackoffLocked(
 HICON LoadShellIcon(const std::wstring& path) {
     SHFILEINFOW fileInfo{};
     constexpr UINT flags = SHGFI_ICON | SHGFI_SYSICONINDEX;
-    const DWORD_PTR infoResult = SHGetFileInfoW(
-        path.c_str(),
-        0,
-        &fileInfo,
-        sizeof(fileInfo),
-        flags);
+    PIDLIST_ABSOLUTE pidl = nullptr;
+    const bool namespaceItem = GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES &&
+        SUCCEEDED(SHParseDisplayName(path.c_str(), nullptr, &pidl, 0, nullptr)) && pidl != nullptr;
+    const DWORD_PTR infoResult = SHGetFileInfoW(namespaceItem ? reinterpret_cast<LPCWSTR>(pidl) : path.c_str(), 0,
+        &fileInfo, sizeof(fileInfo), flags | (namespaceItem ? SHGFI_PIDL : 0));
+    if (pidl != nullptr) {
+        CoTaskMemFree(pidl);
+    }
     if (infoResult == 0) {
         return nullptr;
     }
@@ -159,12 +162,15 @@ HICON LoadShellIconWithFallback(const std::wstring& path) {
     }
 
     SHFILEINFOW fallbackInfo{};
-    const DWORD_PTR fallbackResult = SHGetFileInfoW(
-        path.c_str(),
-        0,
-        &fallbackInfo,
-        sizeof(fallbackInfo),
-        SHGFI_ICON | SHGFI_LARGEICON | SHGFI_SHELLICONSIZE);
+    PIDLIST_ABSOLUTE pidl = nullptr;
+    const bool namespaceItem = GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES &&
+        SUCCEEDED(SHParseDisplayName(path.c_str(), nullptr, &pidl, 0, nullptr)) && pidl != nullptr;
+    const DWORD_PTR fallbackResult = SHGetFileInfoW(namespaceItem ? reinterpret_cast<LPCWSTR>(pidl) : path.c_str(), 0,
+        &fallbackInfo, sizeof(fallbackInfo), SHGFI_ICON | SHGFI_LARGEICON | SHGFI_SHELLICONSIZE |
+        (namespaceItem ? SHGFI_PIDL : 0));
+    if (pidl != nullptr) {
+        CoTaskMemFree(pidl);
+    }
     return fallbackResult != 0 ? fallbackInfo.hIcon : nullptr;
 }
 

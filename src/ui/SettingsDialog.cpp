@@ -735,16 +735,32 @@ bool SettingsDialog::Show(HINSTANCE instance, HWND owner, AppSettings& settings)
     }
 
     MSG message{};
-    while (IsWindow(dialog) && GetMessageW(&message, nullptr, 0, 0) > 0) {
+    bool quitRequested = false;
+    int quitCode = 0;
+    while (IsWindow(dialog)) {
+        const BOOL messageResult = GetMessageW(&message, nullptr, 0, 0);
+        if (messageResult <= 0) {
+            if (messageResult == 0) {
+                quitRequested = true;
+                quitCode = static_cast<int>(message.wParam);
+            }
+            break;
+        }
         if (!IsDialogMessageW(dialog, &message)) {
             TranslateMessage(&message);
             DispatchMessageW(&message);
         }
     }
 
-    if (ownerEnabled) {
+    if (quitRequested && IsWindow(dialog)) {
+        DestroyWindow(dialog);
+    }
+    if (ownerEnabled && !quitRequested && IsWindow(owner)) {
         EnableWindow(owner, TRUE);
         SetForegroundWindow(owner);
+    }
+    if (quitRequested) {
+        PostQuitMessage(quitCode);
     }
     return state.accepted;
 }

@@ -25,15 +25,18 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include "app/App.h"
+#include "app/UpdateService.h"
 #include "config/ConfigStore.h"
 #include "desktop/DesktopScanner.h"
 #include "desktop/DesktopLayout.h"
 #include "desktop/DesktopPlacementCoordinator.h"
 #include "desktop/CategoryStorageManager.h"
 #include "desktop/ManagedShortcutStore.h"
+#include "shell/ShellDropTarget.h"
 #include "ui/InputDialog.h"
 #include "ui/DragGhostWindow.h"
 #include "ui/MessageDialog.h"
@@ -727,6 +730,10 @@ int RunSmokeConfig() {
     layoutItem.desktopX = 144;
     layoutItem.desktopY = 288;
     layoutItem.hasDesktopPosition = true;
+    layoutItem.desktopVisibilityMode = 1;
+    layoutItem.desktopVisibilityOriginalFlags = FILE_ATTRIBUTE_SYSTEM;
+    layoutItem.desktopVisibilityNewStartValue = 0;
+    layoutItem.desktopVisibilityClassicValue = -1;
     appConfig.items.erase(
         std::remove_if(appConfig.items.begin(), appConfig.items.end(), [&](const ItemConfig& item) { return item.id == layoutItem.id; }),
         appConfig.items.end());
@@ -788,6 +795,10 @@ int RunSmokeConfig() {
     if (loadedAppConfig.uncategorizedName != appConfig.uncategorizedName || loadedLayoutItem == loadedAppConfig.items.end() ||
         loadedLayoutItem->originalDesktopPath != layoutItem.originalDesktopPath || !loadedLayoutItem->hasDesktopPosition ||
         loadedLayoutItem->desktopX != layoutItem.desktopX || loadedLayoutItem->desktopY != layoutItem.desktopY ||
+        loadedLayoutItem->desktopVisibilityMode != layoutItem.desktopVisibilityMode ||
+        loadedLayoutItem->desktopVisibilityOriginalFlags != layoutItem.desktopVisibilityOriginalFlags ||
+        loadedLayoutItem->desktopVisibilityNewStartValue != layoutItem.desktopVisibilityNewStartValue ||
+        loadedLayoutItem->desktopVisibilityClassicValue != layoutItem.desktopVisibilityClassicValue ||
         loadedAppConfig.desktopLayout.size() != 1 ||
         loadedAppConfig.desktopLayout.front().path != desktopPlacement.path ||
         loadedAppConfig.desktopLayout.front().x != desktopPlacement.x ||
@@ -973,6 +984,11 @@ int RunSmokeManagedItems() {
     const std::filesystem::path sourceShortcut =
         desktopDirectory / L"测试快捷方式.lnk";
     const std::filesystem::path sourceUrl = desktopDirectory / L"测试网址.url";
+    const std::filesystem::path externalFile = testRoot / L"外部引用.txt";
+    {
+        std::ofstream file(externalFile, std::ios::binary);
+        file << "external reference";
+    }
     const auto fail = [&](const std::wstring& message) {
         std::wcerr << message << L"\n";
         std::error_code cleanupError;
@@ -982,11 +998,32 @@ int RunSmokeManagedItems() {
     if (!store.IsSupportedDesktopItem(sourceFile.wstring()) ||
         !store.IsSupportedDesktopItem(sourceFolder.wstring()) ||
         store.IsSupportedShortcut(sourceFile.wstring()) ||
-        store.RequiresManagedStorage(sourceFile.wstring()) ||
-        store.RequiresManagedStorage(sourceFolder.wstring()) ||
+        !store.RequiresManagedStorage(sourceFile.wstring()) ||
+        !store.RequiresManagedStorage(sourceFolder.wstring()) ||
         !store.RequiresManagedStorage(sourceShortcut.wstring()) ||
-        !store.RequiresManagedStorage(sourceUrl.wstring())) {
+        !store.RequiresManagedStorage(sourceUrl.wstring()) ||
+        store.RequiresManagedStorage(externalFile.wstring())) {
         return fail(L"Manual desktop item type acceptance failed");
+    }
+
+    const DWORD originalAttributes = GetFileAttributesW(sourceFile.c_str());
+    ItemConfig visibilityItem;
+    visibilityItem.path = sourceFile.wstring();
+    visibilityItem.desktopVisibilityMode = 1;
+    visibilityItem.desktopVisibilityOriginalFlags = static_cast<int>(
+        originalAttributes & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM));
+    std::wstring visibilityError;
+    if (SetFileAttributesW(
+            sourceFile.c_str(),
+            originalAttributes | FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM) == FALSE ||
+        !store.PrepareForManagedStorage(visibilityItem, visibilityError) ||
+        (GetFileAttributesW(sourceFile.c_str()) & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM)) !=
+            (originalAttributes & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM)) ||
+        visibilityItem.desktopVisibilityMode != 0 ||
+        visibilityItem.desktopVisibilityOriginalFlags != 0 ||
+        visibilityItem.desktopVisibilityNewStartValue != -1 ||
+        visibilityItem.desktopVisibilityClassicValue != -1) {
+        return fail(L"Legacy desktop visibility restore failed: " + visibilityError);
     }
 
     std::wstring managedFile;
@@ -1089,6 +1126,50 @@ int RunSmokeManagedItems() {
         return fail(L"Desktop conflict final restore failed: " + moveError);
     }
 
+    PWSTR publicDesktopRaw = nullptr;
+    if (FAILED(SHGetKnownFolderPath(FOLDERID_PublicDesktop, KF_FLAG_DEFAULT, nullptr, &publicDesktopRaw)) ||
+        publicDesktopRaw == nullptr) {
+        return fail(L"Public Desktop lookup failed");
+    }
+    const std::filesystem::path publicDesktop(publicDesktopRaw);
+    CoTaskMemFree(publicDesktopRaw);
+    const std::wstring legacyName =
+        L"Lattice-Public-Desktop-" + std::to_wstring(GetCurrentProcessId()) + L".lnk";
+    const std::filesystem::path publicTarget = publicDesktop / legacyName;
+    const std::filesystem::path userTarget = desktopDirectory / legacyName;
+    if (std::filesystem::exists(publicTarget)) {
+        return fail(L"Public Desktop legacy fixture unexpectedly exists");
+    }
+    std::wstring managedPublicShortcut;
+    if (!store.MoveIntoCategory(
+            L"smoke-public-desktop",
+            sourceShortcut.wstring(),
+            L"smoke-category",
+            [](const std::wstring&) { return true; },
+            managedPublicShortcut,
+            moveError)) {
+        return fail(L"Public Desktop legacy setup failed: " + moveError);
+    }
+    bool publicFallbackPersisted = false;
+    std::wstring publicFallbackDestination;
+    if (!store.MoveToOriginalDesktop(
+            L"smoke-public-desktop",
+            managedPublicShortcut,
+            publicTarget.wstring(),
+            [&](const std::wstring& path) {
+                publicFallbackPersisted = path == userTarget.wstring();
+                return publicFallbackPersisted;
+            },
+            publicFallbackDestination,
+            moveError) ||
+        !publicFallbackPersisted ||
+        publicFallbackDestination != userTarget.wstring() ||
+        std::filesystem::exists(managedPublicShortcut) ||
+        !std::filesystem::exists(userTarget) ||
+        std::filesystem::exists(publicTarget)) {
+        return fail(L"Public Desktop legacy release fallback failed: " + moveError);
+    }
+
     std::wstring managedFolder;
     if (!store.MoveIntoCategory(
             L"smoke-folder",
@@ -1119,7 +1200,7 @@ int RunSmokeManagedItems() {
         std::wcerr << L"Managed item smoke cleanup failed\n";
         return 1;
     }
-    std::wcout << L"Ordinary file and folder collection/restore passed\n";
+    std::wcout << L"Ordinary items and Public Desktop legacy release passed\n";
     return 0;
 }
 
@@ -2152,6 +2233,12 @@ int RunSmokeWidgetInteraction(HINSTANCE instance) {
         app.Run();
         return fail(L"Widget update-exit preservation setup failed", 49);
     }
+    MessageDialog::Show(
+        instance,
+        mainWindow,
+        L"Update-exit modal loop propagation smoke",
+        L"Lattice update exit smoke",
+        MB_OK | MB_ICONINFORMATION);
     const int runResult = app.Run();
     if (runResult != 0) {
         return fail(L"Widget interaction app loop returned failure", 39);
@@ -2177,7 +2264,7 @@ int RunSmokeWidgetInteraction(HINSTANCE instance) {
     }
 
     cleanup();
-    std::wcout << L"Widget header hit testing, lower-edge resize, geometry lock, internal order, drag ghost, and byte-identical update-exit preservation passed\n";
+    std::wcout << L"Widget header hit testing, lower-edge resize, geometry lock, internal order, drag ghost, modal update-exit propagation, and byte-identical preservation passed\n";
     return 0;
 }
 
@@ -2635,8 +2722,7 @@ int RunSmokeWidgetDropPlacement(HINSTANCE instance) {
         }
     }
     if (!SetEnvironmentVariableW(L"DESKTOP_ORGANIZER_CONFIG_DIR", configRoot.c_str()) ||
-        !SetEnvironmentVariableW(L"DESKTOP_ORGANIZER_DATA_DIR", dataRoot.c_str()) ||
-        !SetEnvironmentVariableW(L"DESKTOP_ORGANIZER_DESKTOP_DIR", desktopRoot.c_str())) {
+        !SetEnvironmentVariableW(L"DESKTOP_ORGANIZER_DATA_DIR", dataRoot.c_str())) {
         return fail(L"Widget drop placement environment setup failed", 85);
     }
 
@@ -2954,9 +3040,7 @@ int RunSmokeWidgetDropPlacement(HINSTANCE instance) {
         std::vector<const ItemConfig*> matches;
         for (const ItemConfig& item : persisted.items) {
             if (samePath(item.path, incomingPaths[index].wstring()) &&
-                samePath(
-                    item.originalDesktopPath,
-                    incomingPaths[index].wstring())) {
+                item.originalDesktopPath.empty()) {
                 matches.push_back(&item);
             }
         }
@@ -3012,9 +3096,7 @@ int RunSmokeWidgetDropPlacement(HINSTANCE instance) {
         if (configCount != 1 || categoryCount != 1 ||
             registered == persisted.items.end() ||
             !samePath(registered->path, incomingPaths[index].wstring()) ||
-            !samePath(
-                registered->originalDesktopPath,
-                incomingPaths[index].wstring()) ||
+            !registered->originalDesktopPath.empty() ||
             !std::filesystem::exists(incomingPaths[index]) ||
             std::filesystem::exists(
                 managedRoot / incomingPaths[index].filename()) ||
@@ -3222,9 +3304,7 @@ int RunSmokeWidgetDropPlacement(HINSTANCE instance) {
         oldCollisionItem == collisionPersisted.items.end() ||
         newCollisionItem == collisionPersisted.items.end() ||
         !oldCollisionItem->originalDesktopPath.empty() ||
-        !samePath(
-            newCollisionItem->originalDesktopPath,
-            collisionOriginalPath.wstring()) ||
+        !newCollisionItem->originalDesktopPath.empty() ||
         std::count(
             collisionCategory->itemIds.begin(),
             collisionCategory->itemIds.end(),
@@ -3310,6 +3390,339 @@ int RunSettingsDialogPreview(HINSTANCE instance) {
     return 0;
 }
 
+int RunSmokeUpdateAndDialog() {
+    AttachParentConsole();
+    const std::string versionedJson = R"({"tag_name":"v0.4.29","name":"Lattice 0.4.29","assets":[{"name":"Lattice-Setup-0.4.29.exe","browser_download_url":"https://github.com/canyexuanfan/Lattice/releases/download/v0.4.29/Lattice-Setup-0.4.29.exe"}]})";
+    std::wstring version;
+    std::wstring url;
+    if (UpdateService::CompareVersions(L"0.4.29", L"0.4.28") <= 0 ||
+        UpdateService::CompareVersions(L"0.4.28", L"0.4.28") != 0 ||
+        UpdateService::CompareVersions(L"0.4.27", L"0.4.28") >= 0 ||
+        !UpdateService::SelectReleaseAsset(versionedJson, version, url) ||
+        version != L"0.4.29" || url.find(L"Lattice-Setup-0.4.29.exe") == std::wstring::npos) {
+        std::wcerr << L"Update versioned release selection failed\n";
+        return 1;
+    }
+    const std::string fallbackJson = R"({"tag_name":"0.4.30","assets":[{"name":"Lattice-Setup-Latest.exe","browser_download_url":"https://github.com/canyexuanfan/Lattice/releases/download/v0.4.30/Lattice-Setup-Latest.exe"}]})";
+    if (!UpdateService::SelectReleaseAsset(fallbackJson, version, url) ||
+        version != L"0.4.30" || url.find(L"Latest.exe") == std::wstring::npos ||
+        UpdateService::SelectReleaseAsset(R"({"tag_name":"next","assets":[]})", version, url)) {
+        std::wcerr << L"Update fallback or invalid release rejection failed\n";
+        return 2;
+    }
+
+    const RECT primaryWork{0, 0, 1920, 1040};
+    const RECT edgeOwner{1800, 980, 1980, 1100};
+    const RECT edge = MessageDialog::CalculatePlacement(edgeOwner, primaryWork, 590, 310);
+    const RECT negativeWork{-1600, -200, 0, 700};
+    const RECT negativeOwner{-1590, -190, -1500, -100};
+    const RECT negative = MessageDialog::CalculatePlacement(negativeOwner, negativeWork, 590, 310);
+    const RECT tinyWork{50, 60, 350, 240};
+    const RECT oversized = MessageDialog::CalculatePlacement(tinyWork, tinyWork, 590, 310);
+    const auto contained = [](const RECT& value, const RECT& work) {
+        return value.left >= work.left && value.top >= work.top &&
+            value.right <= work.right && value.bottom <= work.bottom;
+    };
+    if (!contained(edge, primaryWork) || !contained(negative, negativeWork) ||
+        !contained(oversized, tinyWork) || oversized.right - oversized.left != 300 ||
+        oversized.bottom - oversized.top != 180) {
+        std::wcerr << L"Message dialog work-area placement failed\n";
+        return 3;
+    }
+
+    DesktopScanner scanner;
+    ManagedShortcutStore store;
+    const std::array<std::wstring, 2> controlPanelNames{
+        L"::{26EE0668-A00A-44D7-9371-BEB064C98683}",
+        L"shell:::{26EE0668-A00A-44D7-9371-BEB064C98683}"};
+    bool shellItemAccepted = false;
+    for (const std::wstring& parsingName : controlPanelNames) {
+        if (!store.IsShellNamespaceItem(parsingName)) continue;
+        const DesktopItem item = scanner.CreateItemFromPath(parsingName, false);
+        shellItemAccepted = store.IsSupportedDesktopItem(parsingName) &&
+            !item.missing && !item.displayName.empty() && item.id.rfind(L"shell|", 0) == 0;
+        if (shellItemAccepted) break;
+    }
+    if (!shellItemAccepted) {
+        std::wcerr << L"Control Panel Shell parsing identity failed\n";
+        return 4;
+    }
+    std::wcout << L"Update parsing, Shell identity, and dialog work-area regression passed\n";
+    return 0;
+}
+
+int RunSmokeRealShellVisibility() {
+    AttachParentConsole();
+    constexpr wchar_t newStartKey[] =
+        L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\HideDesktopIcons\\NewStartPanel";
+    constexpr wchar_t classicKey[] =
+        L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\HideDesktopIcons\\ClassicStartMenu";
+    constexpr wchar_t controlPanelClsid[] = L"{5399E694-6CE5-4D6C-8FCE-1D8870FDCBA0}";
+    const auto readValue = [](const wchar_t* keyPath) {
+        DWORD value = 0;
+        DWORD bytes = sizeof(value);
+        const LSTATUS status = RegGetValueW(
+            HKEY_CURRENT_USER,
+            keyPath,
+            controlPanelClsid,
+            RRF_RT_REG_DWORD,
+            nullptr,
+            &value,
+            &bytes);
+        return status == ERROR_SUCCESS ? static_cast<int>(value) : -1;
+    };
+
+    if (PreferredShellDropPreviewEffect(DROPEFFECT_MOVE | DROPEFFECT_LINK) != DROPEFFECT_MOVE ||
+        PreferredShellDropPreviewEffect(DROPEFFECT_LINK) != DROPEFFECT_LINK ||
+        PreferredShellDropPreviewEffect(DROPEFFECT_COPY) != DROPEFFECT_COPY ||
+        PreferredShellDropPreviewEffect(DROPEFFECT_NONE) != DROPEFFECT_NONE) {
+        std::wcerr << L"Shell drop effect negotiation failed\n";
+        return 1;
+    }
+
+    PIDLIST_ABSOLUTE absolutePidl = nullptr;
+    SFGAOF parsedAttributes = 0;
+    Microsoft::WRL::ComPtr<IDataObject> controlPanelData;
+    const HRESULT parseResult = SHParseDisplayName(
+        L"shell:::{26EE0668-A00A-44D7-9371-BEB064C98683}",
+        nullptr,
+        &absolutePidl,
+        0,
+        &parsedAttributes);
+    if (SUCCEEDED(parseResult) && absolutePidl != nullptr) {
+        PIDLIST_ABSOLUTE parentPidl = ILCloneFull(absolutePidl);
+        PCUITEMID_CHILD childPidl = ILFindLastID(absolutePidl);
+        if (parentPidl != nullptr && ILRemoveLastID(parentPidl) != FALSE) {
+            SHCreateDataObject(
+                parentPidl,
+                1,
+                &childPidl,
+                nullptr,
+                IID_PPV_ARGS(controlPanelData.GetAddressOf()));
+        }
+        if (parentPidl != nullptr) {
+            ILFree(parentPidl);
+        }
+        ILFree(absolutePidl);
+    }
+
+    ManagedShortcutStore store;
+    const std::vector<std::wstring> dropPaths = ExtractShellDropPaths(controlPanelData.Get());
+    const auto controlPanelPath = std::find_if(
+        dropPaths.begin(),
+        dropPaths.end(),
+        [&](const std::wstring& path) { return store.IsShellNamespaceItem(path); });
+    if (controlPanelData == nullptr || controlPanelPath == dropPaths.end()) {
+        std::wcerr << L"Real Control Panel IDataObject extraction failed\n";
+        return 2;
+    }
+
+    const int originalNewStart = readValue(newStartKey);
+    const int originalClassic = readValue(classicKey);
+    ItemConfig visibility;
+    visibility.path = *controlPanelPath;
+    std::wstring errorMessage;
+    if (!store.CaptureAndSuppressDesktopVisibility(visibility.path, visibility, errorMessage)) {
+        std::wcerr << L"Real Control Panel visibility capture failed: " << errorMessage << L"\n";
+        return 3;
+    }
+    const bool hidden = visibility.desktopVisibilityMode == 2 &&
+        readValue(newStartKey) == 1 && readValue(classicKey) == 1;
+    const bool restored = store.RestoreDesktopVisibility(visibility, errorMessage);
+    const bool exactOriginal = readValue(newStartKey) == originalNewStart &&
+        readValue(classicKey) == originalClassic;
+    if (!hidden || !restored || !exactOriginal) {
+        std::wcerr << L"Real Control Panel visibility transaction failed: " << errorMessage << L"\n";
+        return 4;
+    }
+    std::wcout << L"Real Control Panel OLE identity and visibility hide/restore passed\n";
+    return 0;
+}
+
+bool GetDesktopFolderView2ForSmoke(
+    Microsoft::WRL::ComPtr<IFolderView2>& folderView,
+    std::wstring& errorMessage) {
+    Microsoft::WRL::ComPtr<IShellWindows> shellWindows;
+    HRESULT result = CoCreateInstance(
+        CLSID_ShellWindows, nullptr, CLSCTX_ALL,
+        IID_PPV_ARGS(shellWindows.GetAddressOf()));
+    if (FAILED(result) || shellWindows == nullptr) {
+        errorMessage = L"无法连接 Explorer 桌面窗口集合。";
+        return false;
+    }
+    VARIANT location{};
+    location.vt = VT_I4;
+    location.lVal = CSIDL_DESKTOP;
+    VARIANT root{};
+    root.vt = VT_EMPTY;
+    long desktopHwnd = 0;
+    Microsoft::WRL::ComPtr<IDispatch> dispatch;
+    result = shellWindows->FindWindowSW(
+        &location, &root, SWC_DESKTOP, &desktopHwnd,
+        SWFO_NEEDDISPATCH, dispatch.GetAddressOf());
+    if (FAILED(result) || dispatch == nullptr) {
+        errorMessage = L"无法取得 Explorer 桌面调度接口。";
+        return false;
+    }
+    Microsoft::WRL::ComPtr<IServiceProvider> serviceProvider;
+    Microsoft::WRL::ComPtr<IShellBrowser> browser;
+    Microsoft::WRL::ComPtr<IShellView> shellView;
+    if (FAILED(dispatch.As(&serviceProvider)) || serviceProvider == nullptr ||
+        FAILED(serviceProvider->QueryService(
+            SID_STopLevelBrowser, IID_PPV_ARGS(browser.GetAddressOf()))) ||
+        browser == nullptr ||
+        FAILED(browser->QueryActiveShellView(shellView.GetAddressOf())) ||
+        shellView == nullptr ||
+        FAILED(shellView.As(&folderView)) || folderView == nullptr) {
+        errorMessage = L"无法取得 Explorer 桌面视图设置接口。";
+        return false;
+    }
+    return true;
+}
+
+int RunSmokeRealDesktopGridSnapshot() {
+    AttachParentConsole();
+    ConfigStore configStore;
+    DesktopLayout layout;
+    std::vector<DesktopPosition> positions;
+    DWORD flags = 0;
+    std::wstring errorMessage;
+    const std::filesystem::path resultPath =
+        std::filesystem::path(configStore.ConfigPath()).parent_path() /
+        L"real-desktop-grid-snapshot-result.txt";
+    std::ofstream result(resultPath, std::ios::trunc);
+    if (!layout.CaptureAllPositions(positions, errorMessage) ||
+        !layout.CaptureViewFlags(flags, errorMessage)) {
+        result << "STATUS=FAIL\n";
+        return 1;
+    }
+    AppConfig config;
+    config.desktopLayout.reserve(positions.size());
+    for (const DesktopPosition& position : positions) {
+        config.desktopLayout.push_back(
+            DesktopPlacementConfig{position.path, position.point.x, position.point.y});
+    }
+    if (!configStore.SaveAppConfig(config)) {
+        result << "STATUS=FAIL\n";
+        return 2;
+    }
+    result << "FLAGS=" << flags << "\n";
+    result << "POSITION_COUNT=" << positions.size() << "\n";
+    result << "STATUS=PASS\n";
+    return 0;
+}
+
+int RunSmokeRealDesktopGridCleanup() {
+    AttachParentConsole();
+    const auto environmentValue = [](const wchar_t* name) {
+        const DWORD required = GetEnvironmentVariableW(name, nullptr, 0);
+        if (required == 0) return std::wstring{};
+        std::wstring value(required, L'\0');
+        const DWORD copied = GetEnvironmentVariableW(name, value.data(), required);
+        if (copied == 0 || copied >= required) return std::wstring{};
+        value.resize(copied);
+        return value;
+    };
+    ConfigStore configStore;
+    ManagedShortcutStore managedStore;
+    DesktopLayout layout;
+    const std::filesystem::path configDirectory =
+        std::filesystem::path(configStore.ConfigPath()).parent_path();
+    std::ofstream result(
+        configDirectory / L"real-desktop-grid-cleanup-result.txt",
+        std::ios::trunc);
+    const std::wstring markerPath = environmentValue(L"LATTICE_REAL_DESKTOP_MARKER");
+    const std::wstring markerName = std::filesystem::path(markerPath).filename().wstring();
+    if (markerPath.empty() || !managedStore.IsDesktopPath(markerPath) ||
+        markerName.rfind(L".lattice-grid-restart-", 0) != 0) {
+        result << "MARKER_REJECTED=1\nSTATUS=FAIL\n";
+        return 10;
+    }
+
+    DWORD originalFlags = 0;
+    std::ifstream snapshotResult(
+        configDirectory / L"real-desktop-grid-snapshot-result.txt");
+    std::string line;
+    bool flagsFound = false;
+    while (std::getline(snapshotResult, line)) {
+        if (line.rfind("FLAGS=", 0) == 0) {
+            originalFlags = static_cast<DWORD>(std::stoul(line.substr(6)));
+            flagsFound = true;
+        }
+    }
+    if (!flagsFound) {
+        result << "FLAGS_SNAPSHOT_MISSING=1\nSTATUS=FAIL\n";
+        return 11;
+    }
+
+    const AppConfig snapshot = configStore.LoadAppConfig();
+    std::vector<DesktopPosition> expected;
+    expected.reserve(snapshot.desktopLayout.size());
+    for (const DesktopPlacementConfig& placement : snapshot.desktopLayout) {
+        expected.push_back(
+            DesktopPosition{placement.path, POINT{placement.x, placement.y}});
+    }
+    bool markerRemoved = true;
+    if (GetFileAttributesW(markerPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        markerRemoved = DeleteFileW(markerPath.c_str()) != FALSE;
+        if (markerRemoved) {
+            SHChangeNotify(
+                SHCNE_DELETE, SHCNF_PATHW | SHCNF_FLUSHNOWAIT,
+                markerPath.c_str(), nullptr);
+        }
+    }
+
+    std::wstring errorMessage;
+    DWORD currentFlags = 0;
+    bool flagsRestored = layout.CaptureViewFlags(currentFlags, errorMessage);
+    if (flagsRestored && currentFlags != originalFlags) {
+        Microsoft::WRL::ComPtr<IFolderView2> view2;
+        flagsRestored = GetDesktopFolderView2ForSmoke(view2, errorMessage);
+        if (flagsRestored) {
+            const DWORD changedMask = currentFlags ^ originalFlags;
+            flagsRestored = SUCCEEDED(
+                view2->SetCurrentFolderFlags(changedMask, originalFlags));
+        }
+    }
+    DWORD verifiedFlags = 0;
+    flagsRestored = flagsRestored &&
+        layout.CaptureViewFlags(verifiedFlags, errorMessage) &&
+        verifiedFlags == originalFlags;
+
+    const bool positionsRestored = layout.RestorePositions(expected, errorMessage);
+    Sleep(150);
+    std::vector<DesktopPosition> after1;
+    std::vector<DesktopPosition> after2;
+    const bool captured1 = layout.CaptureAllPositions(after1, errorMessage);
+    Sleep(100);
+    const bool captured2 = layout.CaptureAllPositions(after2, errorMessage);
+    const auto comparable = [](const std::vector<DesktopPosition>& positions) {
+        std::vector<std::tuple<std::wstring, LONG, LONG>> values;
+        values.reserve(positions.size());
+        for (const DesktopPosition& position : positions) {
+            std::wstring normalized = position.path;
+            std::transform(
+                normalized.begin(), normalized.end(), normalized.begin(),
+                [](wchar_t value) {
+                    return static_cast<wchar_t>(std::towlower(value));
+                });
+            values.emplace_back(normalized, position.point.x, position.point.y);
+        }
+        std::sort(values.begin(), values.end());
+        return values;
+    };
+    const bool layoutVerified = positionsRestored && captured1 && captured2 &&
+        comparable(expected) == comparable(after1) &&
+        comparable(after1) == comparable(after2);
+    const bool passed = markerRemoved && flagsRestored && layoutVerified;
+    result << "MARKER_REMOVED=" << (markerRemoved ? 1 : 0) << "\n";
+    result << "FLAGS_RESTORED=" << (flagsRestored ? 1 : 0) << "\n";
+    result << "LAYOUT_VERIFIED=" << (layoutVerified ? 1 : 0) << "\n";
+    result << "STATUS=" << (passed ? "PASS" : "FAIL") << "\n";
+    return passed ? 0 : 12;
+}
+
+
 bool HasArgument(PWSTR commandLine, const wchar_t* target) {
     int argc = 0;
     PWSTR* argv = CommandLineToArgvW(commandLine, &argc);
@@ -3365,6 +3778,18 @@ std::optional<int> RunSmokeOrPreviewCommand(
     }
     if (HasArgument(commandLine, L"--smoke-widget-drop-placement")) {
         return RunSmokeWidgetDropPlacement(instance);
+    }
+    if (HasArgument(commandLine, L"--smoke-update-dialog")) {
+        return RunSmokeUpdateAndDialog();
+    }
+    if (HasArgument(commandLine, L"--smoke-real-shell-visibility")) {
+        return RunSmokeRealShellVisibility();
+    }
+    if (HasArgument(commandLine, L"--smoke-real-desktop-grid-snapshot")) {
+        return RunSmokeRealDesktopGridSnapshot();
+    }
+    if (HasArgument(commandLine, L"--smoke-real-desktop-grid-cleanup")) {
+        return RunSmokeRealDesktopGridCleanup();
     }
     if (HasArgument(commandLine, L"--dialog-preview")) {
         return RunDialogPreview(instance);

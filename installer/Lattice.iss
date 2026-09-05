@@ -2,7 +2,7 @@
 ; 先运行 scripts\package.ps1 构建 Release 并调用 ISCC.exe。
 
 #define MyAppName "Lattice"
-#define MyAppVersion "0.4.28"
+#define MyAppVersion "0.4.32"
 #define MyAppPublisher "Lattice"
 #define MyAppExeName "Lattice.exe"
 #define MyAppFolderName "Lattice"
@@ -45,7 +45,7 @@ Name: "chinesesimplified"; MessagesFile: "compiler:Languages\ChineseSimplified.i
 
 [Messages]
 WelcomeLabel1=欢迎进入 [name] 安装向导
-WelcomeLabel2=把散落在桌面的快捷方式，整理成清晰的分类。%n%n分类收纳会把桌面快捷方式移动到安装目录内的受管数据文件夹；移出或解散格子时会移回桌面，不会复制快捷方式，也不会改动它指向的程序或文件。
+WelcomeLabel2=把散落在桌面的文件、文件夹、快捷方式和系统图标，整理成清晰的分类。%n%n桌面文件系统项目会由 Lattice 安全托管，桌面不再重复显示；移出、解散格子或正常退出时会归还原位置。
 WizardSelectDir=选择安装位置
 SelectDirDesc=选择 [name] 的安装位置
 SelectDirLabel3=请输入或选择上级目录；点击“下一步”时，安装器会自动补齐 Lattice 子文件夹。
@@ -55,8 +55,8 @@ ReadyLabel2a=点击“安装”完成部署；如需调整安装位置，请点�
 ReadyLabel2b=点击“安装”完成部署。
 InstallingLabel=正在把 [name] 安装到你的电脑，请稍候。
 FinishedHeadingLabel=[name] 安装完成
-FinishedLabelNoIcons=安装完成。现在可以启动 [name]，开始整理桌面快捷方式。
-FinishedLabel=安装完成。现在可以启动 [name]，开始整理桌面快捷方式。
+FinishedLabelNoIcons=安装完成。现在可以启动 [name]，开始整理桌面项目。
+FinishedLabel=安装完成。现在可以启动 [name]，开始整理桌面项目。
 ClickFinish=点击“完成”退出安装向导。
 
 
@@ -82,6 +82,7 @@ Type: files; Name: "{app}\DesktopOrganizer.exe"
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "启动 {#MyAppName}"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\{#MyAppExeName}"; Flags: nowait runasoriginaluser; Check: WizardSilent
 
 [Code]
 const
@@ -103,6 +104,9 @@ const
   LegacyLunoUpdateExitMessageName = 'Luno.RequestExitForUpdate.V1';
   OldestUpdateExitMessageName = 'DesktopOrganizer.RequestExitForUpdate.V1';
   WM_CLOSE = $0010;
+  ProductExitPollMilliseconds = 100;
+  ProductExitMessageWaitAttempts = 30;
+  ProductExitCloseWaitAttempts = 20;
 
 function PostMessageW(Wnd: HWND; Msg: Cardinal; WParam: WPARAM; LParam: LPARAM): Boolean;
   external 'PostMessageW@user32.dll stdcall';
@@ -281,7 +285,7 @@ begin
   for Attempt := 1 to Attempts do
   begin
     DismissProductExitDialog;
-    Sleep(100);
+    Sleep(ProductExitPollMilliseconds);
     if not IsProductRunning then
     begin
       Result := True;
@@ -305,8 +309,8 @@ begin
   MainWindow := FindProductMainWindow;
   if MainWindow = 0 then
   begin
-    Log('The product mutex exists but the main window is already gone; waiting for cleanup.');
-    Result := WaitForProductExit(1200);
+    Log('The product mutex exists but the main window is already gone; checking briefly for normal cleanup.');
+    Result := WaitForProductExit(ProductExitCloseWaitAttempts);
     exit;
   end;
 
@@ -317,7 +321,7 @@ begin
   begin
     Log('Posting the matching product update-exit message.');
     PostMessageW(MainWindow, UpdateExitMessage, 0, 0);
-    if WaitForProductExit(20) then
+    if WaitForProductExit(ProductExitMessageWaitAttempts) then
       exit;
   end;
 
@@ -327,7 +331,7 @@ begin
     Log('Falling back to WM_CLOSE for a compatible earlier version.');
     PostMessageW(MainWindow, WM_CLOSE, 0, 0);
   end;
-  Result := WaitForProductExit(1200);
+  Result := WaitForProductExit(ProductExitCloseWaitAttempts);
 end;
 
 function TrimTrailingBackslashes(Value: String): String;
@@ -406,7 +410,7 @@ begin
     exit;
   end;
   if not RequestProductExitForUpdate then
-    Result := 'Lattice 正在完成桌面布局保存或恢复，安装器等待 120 秒后仍未能安全退出。请从托盘菜单选择“退出”，确认没有提示窗口后再点击“重试”。';
+    Result := 'Lattice 未能正常结束更新退出。请先从托盘菜单选择“退出”；如果托盘图标已经消失，请在任务管理器中结束残留的 Lattice 进程，然后点击“重试”。安装器不会强制结束进程，以免损坏桌面数据。';
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);

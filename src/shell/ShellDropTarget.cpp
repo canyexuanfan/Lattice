@@ -7,9 +7,7 @@
 #include <atomic>
 #include <utility>
 
-namespace {
-
-std::vector<std::wstring> ExtractSupportedDropPaths(IDataObject* dataObject) {
+std::vector<std::wstring> ExtractShellDropPaths(IDataObject* dataObject) {
     std::vector<std::wstring> paths;
     if (dataObject == nullptr) {
         return paths;
@@ -36,10 +34,31 @@ std::vector<std::wstring> ExtractSupportedDropPaths(IDataObject* dataObject) {
         if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &path)) && path != nullptr) {
             paths.emplace_back(path);
             CoTaskMemFree(path);
+            continue;
+        }
+        path = nullptr;
+        if (SUCCEEDED(item->GetDisplayName(SIGDN_DESKTOPABSOLUTEPARSING, &path)) && path != nullptr) {
+            paths.emplace_back(path);
+            CoTaskMemFree(path);
         }
     }
     return paths;
 }
+
+DWORD PreferredShellDropPreviewEffect(DWORD allowedEffects) noexcept {
+    if ((allowedEffects & DROPEFFECT_MOVE) != 0) {
+        return DROPEFFECT_MOVE;
+    }
+    if ((allowedEffects & DROPEFFECT_LINK) != 0) {
+        return DROPEFFECT_LINK;
+    }
+    if ((allowedEffects & DROPEFFECT_COPY) != 0) {
+        return DROPEFFECT_COPY;
+    }
+    return DROPEFFECT_NONE;
+}
+
+namespace {
 
 Microsoft::WRL::ComPtr<IUnknown> DataObjectIdentity(IDataObject* dataObject) {
     Microsoft::WRL::ComPtr<IUnknown> identity;
@@ -138,15 +157,19 @@ public:
         }
         ResetDragState();
 
+        previewEffect_ = PreferredShellDropPreviewEffect(*effect);
         const bool canInspect =
-            (*effect & DROPEFFECT_MOVE) != 0 &&
+            previewEffect_ != DROPEFFECT_NONE &&
             (!enabledHandler_ || enabledHandler_());
         if (canInspect) {
-            dragPaths_ = ExtractSupportedDropPaths(dataObject);
+            dragPaths_ = ExtractShellDropPaths(dataObject);
             dragDataIdentity_ = DataObjectIdentity(dataObject);
         }
         accepted_ = !dragPaths_.empty();
-        *effect = accepted_ ? DROPEFFECT_MOVE : DROPEFFECT_NONE;
+        if (!accepted_) {
+            previewEffect_ = DROPEFFECT_NONE;
+        }
+        *effect = previewEffect_;
         POINT screenPoint = CurrentPhysicalDragPoint(point);
         lastScreenPoint_ = screenPoint;
         if (dropHelper_ != nullptr) {
@@ -165,7 +188,7 @@ public:
             return E_POINTER;
         }
         ScopedWindowDpiAwareness callbackDpiAwareness(window_);
-        *effect = accepted_ ? DROPEFFECT_MOVE : DROPEFFECT_NONE;
+        *effect = accepted_ ? previewEffect_ : DROPEFFECT_NONE;
         POINT screenPoint = CurrentPhysicalDragPoint(point);
         lastScreenPoint_ = screenPoint;
         if (dropHelper_ != nullptr) {
@@ -209,7 +232,7 @@ public:
             if (dropIdentity == nullptr ||
                 dragDataIdentity_ == nullptr ||
                 dropIdentity.Get() != dragDataIdentity_.Get()) {
-                dragPaths_ = ExtractSupportedDropPaths(dataObject);
+                dragPaths_ = ExtractShellDropPaths(dataObject);
                 dragDataIdentity_ = dropIdentity;
                 canDrop = !dragPaths_.empty();
             }
@@ -248,6 +271,7 @@ private:
         previewActive_ = false;
         dragPaths_.clear();
         dragDataIdentity_.Reset();
+        previewEffect_ = DROPEFFECT_NONE;
     }
 
     std::atomic<ULONG> references_{1};
@@ -259,6 +283,7 @@ private:
     Microsoft::WRL::ComPtr<IUnknown> dragDataIdentity_;
     std::vector<std::wstring> dragPaths_;
     POINT lastScreenPoint_{};
+    DWORD previewEffect_ = DROPEFFECT_NONE;
     bool accepted_ = false;
     bool previewActive_ = false;
 };

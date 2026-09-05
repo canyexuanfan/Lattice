@@ -1,6 +1,7 @@
 #pragma once
 
 #include <Windows.h>
+#include <ObjIdl.h>
 
 #include <functional>
 #include <string>
@@ -19,6 +20,9 @@ using ShellDropPreviewHandler = std::function<void(
     ShellDropPreviewEvent,
     const std::vector<std::wstring>&,
     POINT)>;
+
+std::vector<std::wstring> ExtractShellDropPaths(IDataObject* dataObject);
+DWORD PreferredShellDropPreviewEffect(DWORD allowedEffects) noexcept;
 
 bool RegisterShellDropTarget(
     HWND window,

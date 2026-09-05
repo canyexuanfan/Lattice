@@ -26,6 +26,10 @@ struct RegisteredItem {
     int desktopX = 0;
     int desktopY = 0;
     bool hasDesktopPosition = false;
+    int desktopVisibilityMode = 0;
+    int desktopVisibilityOriginalFlags = 0;
+    int desktopVisibilityNewStartValue = -1;
+    int desktopVisibilityClassicValue = -1;
 };
 
 struct OrganizerConfig {

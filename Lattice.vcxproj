@@ -57,7 +57,7 @@
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
-      <AdditionalDependencies>d2d1.lib;dwrite.lib;windowscodecs.lib;shell32.lib;ole32.lib;uuid.lib;shlwapi.lib;comctl32.lib;user32.lib;gdi32.lib;dwmapi.lib;uxtheme.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>d2d1.lib;dwrite.lib;windowscodecs.lib;shell32.lib;ole32.lib;uuid.lib;shlwapi.lib;comctl32.lib;user32.lib;gdi32.lib;dwmapi.lib;uxtheme.lib;winhttp.lib;version.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
 
@@ -75,7 +75,7 @@
       <SubSystem>Windows</SubSystem>
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
       <OptimizeReferences>true</OptimizeReferences>
-      <AdditionalDependencies>d2d1.lib;dwrite.lib;windowscodecs.lib;shell32.lib;ole32.lib;uuid.lib;shlwapi.lib;comctl32.lib;user32.lib;gdi32.lib;dwmapi.lib;uxtheme.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>d2d1.lib;dwrite.lib;windowscodecs.lib;shell32.lib;ole32.lib;uuid.lib;shlwapi.lib;comctl32.lib;user32.lib;gdi32.lib;dwmapi.lib;uxtheme.lib;winhttp.lib;version.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
 
@@ -93,6 +93,7 @@
     <ClCompile Include="src\app\StartupManager.cpp" />
     <ClCompile Include="src\app\SingleInstance.cpp" />
     <ClCompile Include="src\app\TrayIcon.cpp" />
+    <ClCompile Include="src\app\UpdateService.cpp" />
     <ClCompile Include="src\config\ConfigStore.cpp" />
     <ClCompile Include="src\desktop\CategoryStorageManager.cpp" />
     <ClCompile Include="src\desktop\DesktopLayout.cpp" />
@@ -123,6 +124,7 @@
     <ClInclude Include="src\app\StartupManager.h" />
     <ClInclude Include="src\app\SingleInstance.h" />
     <ClInclude Include="src\app\TrayIcon.h" />
+    <ClInclude Include="src\app\UpdateService.h" />
     <ClInclude Include="src\app\resource.h" />
     <ClInclude Include="src\config\ConfigStore.h" />
     <ClInclude Include="src\desktop\CategoryStorageManager.h" />

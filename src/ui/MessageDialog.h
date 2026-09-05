@@ -6,6 +6,11 @@
 
 class MessageDialog {
 public:
+    static RECT CalculatePlacement(
+        const RECT& anchor,
+        const RECT& workArea,
+        int width,
+        int height);
     static int Show(
         HINSTANCE instance,
         HWND owner,

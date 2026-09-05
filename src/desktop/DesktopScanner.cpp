@@ -2,6 +2,8 @@
 
 #include <Windows.h>
 #include <ShlObj.h>
+#include <ShObjIdl.h>
+#include <wrl/client.h>
 
 #include <algorithm>
 #include <string>
@@ -84,6 +86,22 @@ DesktopItem DesktopScanner::CreateItemFromPath(
     item.path = path;
     DWORD attributes = GetFileAttributesW(path.c_str());
     if (attributes == INVALID_FILE_ATTRIBUTES) {
+        Microsoft::WRL::ComPtr<IShellItem> shellItem;
+        if (SUCCEEDED(SHCreateItemFromParsingName(path.c_str(), nullptr, IID_PPV_ARGS(&shellItem))) && shellItem != nullptr) {
+            PWSTR displayName = nullptr;
+            if (SUCCEEDED(shellItem->GetDisplayName(SIGDN_NORMALDISPLAY, &displayName)) && displayName != nullptr) {
+                item.displayName = displayName;
+                CoTaskMemFree(displayName);
+            }
+            SFGAOF shellAttributes = 0;
+            shellItem->GetAttributes(SFGAO_FOLDER | SFGAO_LINK, &shellAttributes);
+            item.kind = (shellAttributes & SFGAO_FOLDER) != 0 ? DesktopItemKind::Folder : DesktopItemKind::Shortcut;
+            item.id = L"shell|" + ToLowerCopy(path);
+            if (item.displayName.empty()) {
+                item.displayName = path;
+            }
+            return item;
+        }
         attributes = 0;
         item.missing = true;
     }

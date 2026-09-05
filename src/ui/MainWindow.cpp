@@ -14,6 +14,7 @@
 #include "desktop/DesktopLayout.h"
 #include "desktop/CategoryStorageManager.h"
 #include "app/resource.h"
+#include "app/UpdateService.h"
 #include "ui/InputDialog.h"
 #include "ui/DragGhostWindow.h"
 #include "ui/MessageDialog.h"
@@ -377,6 +378,22 @@ void MainWindow::Show(int showCommand) {
     OpenAllCategoryWidgets();
 }
 
+void MainWindow::CheckForUpdates(HWND sourceWindow) {
+    if (!UpdateService::Start(hwnd_, true, sourceWindow)) {
+        MessageDialog::Show(instance_, sourceWindow, L"更新检查已在后台进行，请稍候。", L"检查更新", MB_OK | MB_ICONINFORMATION);
+    }
+}
+
+void MainWindow::HandleUpdateServiceResult(UpdateServiceResult* rawResult) {
+    std::unique_ptr<UpdateServiceResult> result(rawResult);
+    if (result == nullptr || !result->manual) return;
+    const UINT icon = result->status == UpdateServiceStatus::Failed ? MB_ICONWARNING : MB_ICONINFORMATION;
+    HWND owner = result->dialogOwner != nullptr && IsWindow(result->dialogOwner) != FALSE
+        ? result->dialogOwner
+        : hwnd_;
+    MessageDialog::Show(instance_, owner, result->message, L"检查更新", MB_OK | icon);
+}
+
 LRESULT CALLBACK MainWindow::WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
     MainWindow* window = nullptr;
     if (message == WM_NCCREATE) {
@@ -459,6 +476,11 @@ LRESULT MainWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
             });
             desktopPlacementCoordinator_.AttachNotificationWindow(hwnd_);
             LayoutSearchEdit();
+            UpdateService::Start(hwnd_, false);
+            return 0;
+
+        case kUpdateServiceResultMessage:
+            HandleUpdateServiceResult(reinterpret_cast<UpdateServiceResult*>(lParam));
             return 0;
 
         case WM_SIZE:
@@ -1150,6 +1172,9 @@ LRESULT MainWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
                 case WidgetHostCommand::ExitApplication:
                     DestroyWindow(hwnd_);
                     break;
+                case WidgetHostCommand::CheckForUpdates:
+                    CheckForUpdates(reinterpret_cast<HWND>(lParam));
+                    break;
             }
             return 0;
         }
@@ -1772,6 +1797,10 @@ void MainWindow::LoadOrganizerConfig() {
         item.desktopX = itemConfig.desktopX;
         item.desktopY = itemConfig.desktopY;
         item.hasDesktopPosition = itemConfig.hasDesktopPosition;
+        item.desktopVisibilityMode = itemConfig.desktopVisibilityMode;
+        item.desktopVisibilityOriginalFlags = itemConfig.desktopVisibilityOriginalFlags;
+        item.desktopVisibilityNewStartValue = itemConfig.desktopVisibilityNewStartValue;
+        item.desktopVisibilityClassicValue = itemConfig.desktopVisibilityClassicValue;
         organizerConfig_.items.push_back(std::move(item));
     }
     organizerConfig_.uncategorizedItemIds = appConfig.uncategorizedItemIds;
@@ -2459,6 +2488,10 @@ bool MainWindow::SaveOrganizerConfig() {
         itemConfig.desktopX = item.desktopX;
         itemConfig.desktopY = item.desktopY;
         itemConfig.hasDesktopPosition = item.hasDesktopPosition;
+        itemConfig.desktopVisibilityMode = item.desktopVisibilityMode;
+        itemConfig.desktopVisibilityOriginalFlags = item.desktopVisibilityOriginalFlags;
+        itemConfig.desktopVisibilityNewStartValue = item.desktopVisibilityNewStartValue;
+        itemConfig.desktopVisibilityClassicValue = item.desktopVisibilityClassicValue;
         appConfig.items.push_back(std::move(itemConfig));
     }
     for (const RegisteredItem& item : organizerConfig_.items) {
@@ -3663,9 +3696,29 @@ bool MainWindow::MoveItemOut(
     std::wstring desktopPath = sourcePath;
     std::wstring errorMessage;
     if (!shortcutStore_.IsManagedPath(sourcePath)) {
-        moved = persistRemoval();
+        ItemConfig visibilityState;
+        visibilityState.path = placement.path;
+        visibilityState.desktopVisibilityMode = placement.desktopVisibilityMode;
+        visibilityState.desktopVisibilityOriginalFlags = placement.desktopVisibilityOriginalFlags;
+        visibilityState.desktopVisibilityNewStartValue = placement.desktopVisibilityNewStartValue;
+        visibilityState.desktopVisibilityClassicValue = placement.desktopVisibilityClassicValue;
+        visibilityState.desktopX = placement.desktopX;
+        visibilityState.desktopY = placement.desktopY;
+        visibilityState.hasDesktopPosition = placement.hasDesktopPosition;
+        bool restoredVisibility = true;
+        if (visibilityState.desktopVisibilityMode != 0) {
+            restoredVisibility = shortcutStore_.RestoreDesktopVisibility(
+                visibilityState,
+                errorMessage,
+                dropScreenPoint);
+        }
+        moved = restoredVisibility && persistRemoval();
         if (!moved) {
-            errorMessage = L"项目原件未发生改变，但无法保存移出格子的配置。";
+            if (restoredVisibility) {
+                std::wstring rollbackError;
+                shortcutStore_.SuppressDesktopVisibility(visibilityState, rollbackError);
+                errorMessage = L"项目原件未发生改变，但无法保存移出格子的配置。";
+            }
         }
     } else {
         std::wstring destinationPath;
@@ -3847,6 +3900,48 @@ bool MainWindow::ImportPathToCategory(
     }
 
     const OrganizerConfig originalConfig = organizerConfig_;
+    ItemConfig visibilityState;
+    visibilityState.id = item.id;
+    visibilityState.path = item.path;
+    if (existing != organizerConfig_.items.end()) {
+        visibilityState.desktopVisibilityMode = existing->desktopVisibilityMode;
+        visibilityState.desktopVisibilityOriginalFlags = existing->desktopVisibilityOriginalFlags;
+        visibilityState.desktopVisibilityNewStartValue = existing->desktopVisibilityNewStartValue;
+        visibilityState.desktopVisibilityClassicValue = existing->desktopVisibilityClassicValue;
+    }
+    if (physicallyManagedShortcut) {
+        std::wstring visibilityError;
+        if (!shortcutStore_.PrepareForManagedStorage(
+                visibilityState, visibilityError)) {
+            if (showError) {
+                MessageDialog::Show(
+                    instance_,
+                    hwnd_,
+                    visibilityError.c_str(),
+                    L"桌面项目收纳失败",
+                    MB_OK | MB_ICONERROR);
+            }
+            return false;
+        }
+    }
+    bool capturedNewVisibility = false;
+    if (!physicallyManagedShortcut) {
+        std::wstring visibilityError;
+        if (visibilityState.desktopVisibilityMode == 0) {
+            if (!shortcutStore_.CaptureAndSuppressDesktopVisibility(item.path, visibilityState, visibilityError)) {
+                if (showError) {
+                    MessageDialog::Show(instance_, hwnd_, visibilityError.c_str(), L"桌面项目收纳失败", MB_OK | MB_ICONERROR);
+                }
+                return false;
+            }
+            capturedNewVisibility = visibilityState.desktopVisibilityMode != 0;
+        } else if (!shortcutStore_.SuppressDesktopVisibility(visibilityState, visibilityError)) {
+            if (showError) {
+                MessageDialog::Show(instance_, hwnd_, visibilityError.c_str(), L"桌面项目收纳失败", MB_OK | MB_ICONERROR);
+            }
+            return false;
+        }
+    }
     std::wstring destinationPath;
     std::wstring errorMessage;
     const auto persistCollectedItem = [&](const std::wstring& storedPath) {
@@ -3863,6 +3958,18 @@ bool MainWindow::ImportPathToCategory(
             registered->desktopX = originalDesktopPoint.x;
             registered->desktopY = originalDesktopPoint.y;
             registered->hasDesktopPosition = hasOriginalDesktopPoint;
+            registered->desktopVisibilityMode = physicallyManagedShortcut
+                ? 0
+                : visibilityState.desktopVisibilityMode;
+            registered->desktopVisibilityOriginalFlags = physicallyManagedShortcut
+                ? 0
+                : visibilityState.desktopVisibilityOriginalFlags;
+            registered->desktopVisibilityNewStartValue = physicallyManagedShortcut
+                ? -1
+                : visibilityState.desktopVisibilityNewStartValue;
+            registered->desktopVisibilityClassicValue = physicallyManagedShortcut
+                ? -1
+                : visibilityState.desktopVisibilityClassicValue;
             std::vector<std::wstring> removalIds{item.id};
             const auto appendTransientId = [&](const std::wstring& candidate) {
                 if (candidate.empty() || candidate == item.id) {
@@ -3930,6 +4037,10 @@ bool MainWindow::ImportPathToCategory(
     }
     if (!moved) {
         organizerConfig_ = originalConfig;
+        if (capturedNewVisibility) {
+            std::wstring rollbackError;
+            shortcutStore_.RestoreDesktopVisibility(visibilityState, rollbackError);
+        }
         if (showError) {
             MessageDialog::Show(instance_, hwnd_, errorMessage.c_str(), L"桌面项目收纳失败", MB_OK | MB_ICONERROR);
         }
