@@ -1,0 +1,36 @@
+#include "resource.h"
+#include <winver.h>
+
+IDI_APP_ICON ICON "../../assets/branding/lattice-logo.ico"
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION 0,4,28,0
+ PRODUCTVERSION 0,4,28,0
+ FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
+#ifdef _DEBUG
+ FILEFLAGS VS_FF_DEBUG
+#else
+ FILEFLAGS 0x0L
+#endif
+ FILEOS VOS_NT_WINDOWS32
+ FILETYPE VFT_APP
+ FILESUBTYPE 0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "080404B0"
+        BEGIN
+            VALUE "CompanyName", "Lattice"
+            VALUE "FileDescription", "Lattice"
+            VALUE "FileVersion", "0.4.28.0"
+            VALUE "InternalName", "Lattice.exe"
+            VALUE "OriginalFilename", "Lattice.exe"
+            VALUE "ProductName", "Lattice"
+            VALUE "ProductVersion", "0.4.28.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0804, 1200
+    END
+END
