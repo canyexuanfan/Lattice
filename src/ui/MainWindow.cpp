@@ -3533,18 +3533,14 @@ void MainWindow::MoveItemToCategory(const std::wstring& itemId, const std::wstri
     const OrganizerConfig originalConfig = organizerConfig_;
     std::wstring destinationPath;
     std::wstring errorMessage;
-    const bool moved = shortcutStore_.MoveIntoCategory(
-        managedItemId,
-        sourcePath,
-        StorageFolderForCategory(categoryId),
-        [&](const std::wstring& managedPath) {
+    const auto persistCategoryMove = [&](const std::wstring& storedPath) {
             auto registered = std::find_if(organizerConfig_.items.begin(), organizerConfig_.items.end(), [&](const RegisteredItem& value) {
                 return value.id == managedItemId;
             });
             if (registered == organizerConfig_.items.end()) {
-                organizerConfig_.items.push_back(RegisteredItem{managedItemId, managedPath, displayName});
+                organizerConfig_.items.push_back(RegisteredItem{managedItemId, storedPath, displayName});
             } else {
-                registered->path = managedPath;
+                registered->path = storedPath;
             }
             std::vector<std::wstring> removalIds{managedItemId};
             const auto appendTransientId = [&](const std::wstring& candidate) {
@@ -3595,9 +3591,25 @@ void MainWindow::MoveItemToCategory(const std::wstring& itemId, const std::wstri
                 return false;
             }
             return true;
-        },
-        destinationPath,
-        errorMessage);
+        };
+    const bool requiresPhysicalMove =
+        shortcutStore_.RequiresManagedStorage(sourcePath);
+    bool moved = false;
+    if (requiresPhysicalMove) {
+        moved = shortcutStore_.MoveIntoCategory(
+            managedItemId,
+            sourcePath,
+            StorageFolderForCategory(categoryId),
+            persistCategoryMove,
+            destinationPath,
+            errorMessage);
+    } else {
+        destinationPath = sourcePath;
+        moved = persistCategoryMove(destinationPath);
+        if (!moved) {
+            errorMessage = L"无法保存该文件或文件夹的分类，原件未发生改变。";
+        }
+    }
     if (!moved) {
         organizerConfig_ = originalConfig;
         MessageDialog::Show(instance_, hwnd_, errorMessage.c_str(), L"移动桌面项目失败", MB_OK | MB_ICONERROR);
@@ -3650,10 +3662,10 @@ bool MainWindow::MoveItemOut(
     bool moved = false;
     std::wstring desktopPath = sourcePath;
     std::wstring errorMessage;
-    if (shortcutStore_.IsDesktopPath(sourcePath)) {
+    if (!shortcutStore_.IsManagedPath(sourcePath)) {
         moved = persistRemoval();
         if (!moved) {
-            errorMessage = L"桌面项目已经在桌面，但无法保存移出格子的配置。";
+            errorMessage = L"项目原件未发生改变，但无法保存移出格子的配置。";
         }
     } else {
         std::wstring destinationPath;
@@ -3691,7 +3703,8 @@ bool MainWindow::MoveItemOut(
         }
         return false;
     }
-    if (dropScreenPoint != nullptr) {
+    const bool canPlaceOnDesktop = shortcutStore_.IsDesktopPath(desktopPath);
+    if (dropScreenPoint != nullptr && canPlaceOnDesktop) {
         DesktopPlacementRequest request;
         request.path = desktopPath;
         request.screenPoint = *dropScreenPoint;
@@ -3724,6 +3737,8 @@ bool MainWindow::MoveItemOut(
                     MB_OK | MB_ICONWARNING);
             }
         }
+    } else if (dropScreenPoint != nullptr) {
+        DragGhostWindow::Instance().EndIfGeneration(dragGhostGeneration);
     }
     if (dropScreenPoint != nullptr) {
         items_.erase(
@@ -3811,6 +3826,8 @@ bool MainWindow::ImportPathToCategory(
     }
 
     std::wstring originalDesktopPath;
+    const bool physicallyManagedShortcut =
+        shortcutStore_.RequiresManagedStorage(item.path);
     POINT originalDesktopPoint{};
     bool hasOriginalDesktopPoint = false;
     if (shortcutStore_.IsDesktopPath(item.path)) {
@@ -3818,30 +3835,29 @@ bool MainWindow::ImportPathToCategory(
         DesktopLayout desktopLayout;
         std::wstring captureError;
         if (!desktopLayout.CapturePosition(item.path, originalDesktopPoint, captureError)) {
-            if (showError) {
+            if (physicallyManagedShortcut && showError) {
                 MessageDialog::Show(instance_, hwnd_, captureError.c_str(), L"桌面布局保护", MB_OK | MB_ICONWARNING);
             }
-            return false;
+            if (physicallyManagedShortcut) {
+                return false;
+            }
+        } else {
+            hasOriginalDesktopPoint = true;
         }
-        hasOriginalDesktopPoint = true;
     }
 
     const OrganizerConfig originalConfig = organizerConfig_;
     std::wstring destinationPath;
     std::wstring errorMessage;
-    const bool moved = shortcutStore_.MoveIntoCategory(
-        item.id,
-        item.path,
-        StorageFolderForCategory(categoryId),
-        [&](const std::wstring& managedPath) {
+    const auto persistCollectedItem = [&](const std::wstring& storedPath) {
             auto registered = std::find_if(organizerConfig_.items.begin(), organizerConfig_.items.end(), [&](const RegisteredItem& value) {
                 return value.id == item.id;
             });
             if (registered == organizerConfig_.items.end()) {
-                organizerConfig_.items.push_back(RegisteredItem{item.id, managedPath, item.displayName});
+                organizerConfig_.items.push_back(RegisteredItem{item.id, storedPath, item.displayName});
                 registered = std::prev(organizerConfig_.items.end());
             } else {
-                registered->path = managedPath;
+                registered->path = storedPath;
             }
             registered->originalDesktopPath = originalDesktopPath;
             registered->desktopX = originalDesktopPoint.x;
@@ -3895,9 +3911,23 @@ bool MainWindow::ImportPathToCategory(
                 return false;
             }
             return true;
-        },
-        destinationPath,
-        errorMessage);
+        };
+    bool moved = false;
+    if (physicallyManagedShortcut) {
+        moved = shortcutStore_.MoveIntoCategory(
+            item.id,
+            item.path,
+            StorageFolderForCategory(categoryId),
+            persistCollectedItem,
+            destinationPath,
+            errorMessage);
+    } else {
+        destinationPath = item.path;
+        moved = persistCollectedItem(destinationPath);
+        if (!moved) {
+            errorMessage = L"无法保存该文件或文件夹的收纳配置，原件未发生改变。";
+        }
+    }
     if (!moved) {
         organizerConfig_ = originalConfig;
         if (showError) {

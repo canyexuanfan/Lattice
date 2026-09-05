@@ -404,6 +404,13 @@ bool ManagedShortcutStore::IsSupportedShortcut(const std::wstring& path) const {
            (EndsWithInsensitive(path, L".lnk") || EndsWithInsensitive(path, L".url"));
 }
 
+bool ManagedShortcutStore::RequiresManagedStorage(const std::wstring& path) const {
+    // Existing managed items, including ordinary files from older versions,
+    // keep their current safe transaction semantics. New ordinary files and
+    // folders remain at their original paths and are stored by reference.
+    return IsManagedPath(path) || IsSupportedShortcut(path);
+}
+
 bool ManagedShortcutStore::IsManagedPath(const std::wstring& path) const {
     return PathIsInside(path, rootPath_);
 }

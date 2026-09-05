@@ -226,7 +226,12 @@ bool CategoryStorageManager::Rename(
     const std::wstring oldFolder = *storageFolder;
     const std::wstring sourcePath = managedStore_.CategoryPath(oldFolder);
     const std::wstring targetPath = managedStore_.CategoryPath(displayName);
-    if (*storedName == displayName && *storageFolder == displayName && DirectoryExists(targetPath)) {
+    if (*storedName == displayName && *storageFolder == displayName) {
+        if (!DirectoryExists(targetPath) &&
+            !managedStore_.EnsureCategoryDirectory(displayName)) {
+            errorMessage = L"无法创建与格子同名的受管文件夹。";
+            return false;
+        }
         return true;
     }
     const bool samePath = SamePath(sourcePath, targetPath);

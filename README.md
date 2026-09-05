@@ -21,10 +21,13 @@ intentionally not included.
 - **Persistent category lattices.** Each category remembers its position,
   size, collapsed/expanded state, opacity, and contained items across
   restarts and reboots.
-- **Real shortcut custody.** Dropping a desktop item into a category moves
-  the real shortcut into the application's managed data folder and keeps a
-  faithful placeholder. Dropping it back restores the real file at the
-  exact Explorer position.
+- **Real shortcut custody and native file/folder reference.** Dropping a
+  `.lnk` or `.url` shortcut into a category moves the real shortcut into
+  the application's managed data folder and keeps a faithful placeholder;
+  dropping it back restores the real file at the exact Explorer position.
+  Regular files and folders stay at their original location, are registered
+  by reference in the configuration, and are displayed using their native
+  Shell icon. This is a configurable policy, not an accident.
 - **Desktop-layer awareness.** Lattice's category windows live on the
   desktop layer, so they are covered by any normal application window but
   remain visible when the desktop is in the foreground. They never overlap

@@ -65,6 +65,17 @@ struct WidgetWindowSmokeAccess {
         return widget.shellDropQueued_;
     }
 
+    static void MoveItemToCategory(
+        WidgetWindow& widget,
+        const std::wstring& itemId,
+        const std::wstring& categoryId) {
+        widget.MoveItemToCategory(itemId, categoryId);
+    }
+
+    static bool MoveItemOut(WidgetWindow& widget, const std::wstring& itemId) {
+        return widget.MoveItemOut(itemId, false);
+    }
+
     static bool DropBusy(const WidgetWindow& widget) {
         return widget.IsShellDropBusy();
     }
@@ -746,6 +757,30 @@ int RunSmokeConfig() {
         std::wcerr << L"App config save failed\n";
         return 1;
     }
+    const std::wstring configPath = store.ConfigPath();
+    const size_t configSeparator = configPath.find_last_of(L"\\/");
+    const std::wstring configDirectory = configSeparator == std::wstring::npos
+        ? L"."
+        : configPath.substr(0, configSeparator);
+    const std::array<std::wstring, 4> noOpConfigPaths{
+        configPath,
+        configDirectory + L"\\config.backup.ini",
+        configDirectory + L"\\config.backup.ini.1",
+        configDirectory + L"\\config.backup.ini.2"};
+    std::array<std::optional<std::string>, 4> noOpConfigBefore{};
+    for (size_t index = 0; index < noOpConfigPaths.size(); ++index) {
+        noOpConfigBefore[index] = ReadFileBytes(noOpConfigPaths[index]);
+    }
+    if (!store.SaveAppConfig(appConfig)) {
+        std::wcerr << L"No-op app config save failed\n";
+        return 1;
+    }
+    for (size_t index = 0; index < noOpConfigPaths.size(); ++index) {
+        if (ReadFileBytes(noOpConfigPaths[index]) != noOpConfigBefore[index]) {
+            std::wcerr << L"No-op app config save rewrote config history\n";
+            return 1;
+        }
+    }
     const AppConfig loadedAppConfig = store.LoadAppConfig();
     const auto loadedLayoutItem = std::find_if(loadedAppConfig.items.begin(), loadedAppConfig.items.end(), [&](const ItemConfig& item) {
         return item.id == layoutItem.id;
@@ -768,9 +803,6 @@ int RunSmokeConfig() {
         std::wcerr << L"Tile collapse state failed\n";
         return 1;
     }
-    const std::wstring configPath = store.ConfigPath();
-    const size_t separator = configPath.find_last_of(L"\\/");
-    const std::wstring configDirectory = separator == std::wstring::npos ? L"." : configPath.substr(0, separator);
     const std::wstring categoryPath = configDirectory + L"\\smoke-category.ini";
     if (!store.ExportCategoryConfig(category, categoryPath)) {
         std::wcerr << L"Category export failed\n";
@@ -926,10 +958,21 @@ int RunSmokeManagedItems() {
         std::ofstream file(desktopDirectory / L"资料文件夹" / L"内容.md", std::ios::binary);
         file << "folder child";
     }
+    {
+        std::ofstream file(desktopDirectory / L"测试快捷方式.lnk", std::ios::binary);
+        file << "shortcut fixture";
+    }
+    {
+        std::ofstream file(desktopDirectory / L"测试网址.url", std::ios::binary);
+        file << "url fixture";
+    }
 
     ManagedShortcutStore store(dataDirectory.wstring(), desktopDirectory.wstring());
     const std::filesystem::path sourceFile = desktopDirectory / L"说明.txt";
     const std::filesystem::path sourceFolder = desktopDirectory / L"资料文件夹";
+    const std::filesystem::path sourceShortcut =
+        desktopDirectory / L"测试快捷方式.lnk";
+    const std::filesystem::path sourceUrl = desktopDirectory / L"测试网址.url";
     const auto fail = [&](const std::wstring& message) {
         std::wcerr << message << L"\n";
         std::error_code cleanupError;
@@ -938,7 +981,11 @@ int RunSmokeManagedItems() {
     };
     if (!store.IsSupportedDesktopItem(sourceFile.wstring()) ||
         !store.IsSupportedDesktopItem(sourceFolder.wstring()) ||
-        store.IsSupportedShortcut(sourceFile.wstring())) {
+        store.IsSupportedShortcut(sourceFile.wstring()) ||
+        store.RequiresManagedStorage(sourceFile.wstring()) ||
+        store.RequiresManagedStorage(sourceFolder.wstring()) ||
+        !store.RequiresManagedStorage(sourceShortcut.wstring()) ||
+        !store.RequiresManagedStorage(sourceUrl.wstring())) {
         return fail(L"Manual desktop item type acceptance failed");
     }
 
@@ -952,7 +999,8 @@ int RunSmokeManagedItems() {
             managedFile,
             moveError) ||
         std::filesystem::exists(sourceFile) ||
-        !std::filesystem::exists(managedFile)) {
+        !std::filesystem::exists(managedFile) ||
+        !store.RequiresManagedStorage(managedFile)) {
         return fail(L"Ordinary file collection failed: " + moveError);
     }
     std::wstring restoredFile;
@@ -1215,6 +1263,31 @@ int RunSmokeCategoryStorage() {
     if (fileError || !storageManager.RemoveEmpty(categoryId, errorMessage) ||
         std::filesystem::exists(managedDirectory / L"编程工具")) {
         return fail(L"Empty category storage cleanup failed: " + errorMessage);
+    }
+
+    const std::array<std::filesystem::path, 4> preservedConfigPaths{
+        configDirectory / L"config.ini",
+        configDirectory / L"config.backup.ini",
+        configDirectory / L"config.backup.ini.1",
+        configDirectory / L"config.backup.ini.2"};
+    std::array<std::optional<std::string>, 4> preservedConfigBytes{};
+    for (size_t index = 0; index < preservedConfigPaths.size(); ++index) {
+        preservedConfigBytes[index] = ReadFileBytes(preservedConfigPaths[index]);
+        if (!preservedConfigBytes[index].has_value()) {
+            return fail(L"Category storage no-op snapshot failed");
+        }
+    }
+    if (!storageManager.SynchronizeAll(errorMessage) ||
+        !std::filesystem::exists(managedDirectory / L"编程工具")) {
+        return fail(L"Category storage no-op synchronization failed: " + errorMessage);
+    }
+    for (size_t index = 0; index < preservedConfigPaths.size(); ++index) {
+        const std::optional<std::string> after =
+            ReadFileBytes(preservedConfigPaths[index]);
+        if (!after.has_value() ||
+            *after != *preservedConfigBytes[index]) {
+            return fail(L"Category storage no-op synchronization rewrote config history");
+        }
     }
 
     std::filesystem::remove_all(testRoot, fileError);
@@ -1555,14 +1628,6 @@ int RunSmokeWidgetDesktopLayer(HINSTANCE instance) {
         std::wcerr << L"Widget desktop layer config save failed\n";
         return 62;
     }
-    const std::optional<std::string> configBeforeWindow =
-        ReadFileBytes(configStore.ConfigPath());
-    if (!configBeforeWindow.has_value()) {
-        std::filesystem::remove_all(testRoot, fileError);
-        std::wcerr << L"Widget desktop layer config snapshot failed\n";
-        return 62;
-    }
-
     constexpr wchar_t kCoverClassName[] = L"Lattice.SmokeNormalCoverWindow";
     WNDCLASSEXW coverClass{};
     coverClass.cbSize = sizeof(coverClass);
@@ -1773,12 +1838,17 @@ int RunSmokeWidgetDesktopLayer(HINSTANCE instance) {
         return fail(L"Desktop-hosted widget coordinate or activation behavior failed", 73);
     }
 
+    const std::optional<std::string> configBeforeClose =
+        ReadFileBytes(configStore.ConfigPath());
+    if (!configBeforeClose.has_value()) {
+        return fail(L"Widget desktop layer close snapshot failed", 74);
+    }
     widget->Close();
     widget.reset();
     const std::optional<std::string> configAfterWindowClose =
         ReadFileBytes(configStore.ConfigPath());
     if (!configAfterWindowClose.has_value() ||
-        *configAfterWindowClose != *configBeforeWindow) {
+        *configAfterWindowClose != *configBeforeClose) {
         return fail(L"Closing a widget rewrote persisted user state", 74);
     }
 
@@ -1888,7 +1958,7 @@ int RunSmokeWidgetInteraction(HINSTANCE instance) {
     }
 
     App app(instance);
-    if (!app.Initialize(SW_SHOWNOACTIVATE)) {
+    if (!app.InitializeForIsolatedSmoke(SW_SHOWNOACTIVATE)) {
         return fail(L"Widget interaction app initialization failed", 33);
     }
     HWND mainWindow = FindCurrentProcessMainWindow();
@@ -1942,19 +2012,30 @@ int RunSmokeWidgetInteraction(HINSTANCE instance) {
     GetClientRect(categoryWindow, &expandedClient);
     const int headerHeight = dip(32);
     const int lowerEdgeY = std::min(
-        expandedClient.bottom - dip(8),
+        static_cast<int>(expandedClient.bottom) - dip(8),
         headerHeight + dip(24));
-    if (hitTestClientPixel(expandedClient.right / 2, 1) != HTCAPTION ||
-        hitTestClientPixel(1, 1) != HTCLIENT ||
-        hitTestClientPixel(expandedClient.right - 2, 1) != HTCLIENT ||
-        hitTestClientPixel(1, lowerEdgeY) != HTLEFT ||
-        hitTestClientPixel(expandedClient.right - 2, lowerEdgeY) != HTRIGHT ||
-        hitTestClientPixel(expandedClient.right / 2, expandedClient.bottom - 2) != HTBOTTOM ||
-        hitTestClientPixel(1, expandedClient.bottom - 2) != HTBOTTOMLEFT ||
-        hitTestClientPixel(expandedClient.right - 2, expandedClient.bottom - 2) != HTBOTTOMRIGHT) {
+    const LRESULT topCenterHit = hitTestClientPixel(expandedClient.right / 2, 1);
+    const LRESULT topLeftHit = hitTestClientPixel(1, 1);
+    const LRESULT topRightHit = hitTestClientPixel(expandedClient.right - 2, 1);
+    const LRESULT lowerLeftHit = hitTestClientPixel(1, lowerEdgeY);
+    const LRESULT lowerRightHit = hitTestClientPixel(expandedClient.right - 2, lowerEdgeY);
+    const LRESULT bottomCenterHit =
+        hitTestClientPixel(expandedClient.right / 2, expandedClient.bottom - 2);
+    const LRESULT bottomLeftHit = hitTestClientPixel(1, expandedClient.bottom - 2);
+    const LRESULT bottomRightHit =
+        hitTestClientPixel(expandedClient.right - 2, expandedClient.bottom - 2);
+    if (topCenterHit != HTCAPTION ||
+        topLeftHit != HTCLIENT ||
+        topRightHit != HTCAPTION ||
+        lowerLeftHit != HTLEFT ||
+        lowerRightHit != HTRIGHT ||
+        bottomCenterHit != HTBOTTOM ||
+        bottomLeftHit != HTBOTTOMLEFT ||
+        bottomRightHit != HTBOTTOMRIGHT) {
         DestroyWindow(mainWindow);
-        app.Run();
-        return fail(L"Widget header or lower resize hit-test matrix failed", 51);
+        std::wcerr << L"Widget header or lower resize hit-test matrix failed\n";
+        cleanup();
+        return 51;
     }
     SendMessageW(categoryWindow, WM_LBUTTONDOWN, MK_LBUTTON, collapsePoint);
     SendMessageW(categoryWindow, WM_LBUTTONUP, 0, collapsePoint);
@@ -1967,12 +2048,14 @@ int RunSmokeWidgetInteraction(HINSTANCE instance) {
     }
     RECT collapsedClient{};
     GetClientRect(categoryWindow, &collapsedClient);
-    if (hitTestClientPixel(
-            collapsedClient.right - 2,
-            collapsedClient.bottom - 2) != HTCLIENT) {
+    const LRESULT collapsedBottomRightHit = hitTestClientPixel(
+        collapsedClient.right - 2,
+        collapsedClient.bottom - 2);
+    if (collapsedBottomRightHit != HTCAPTION) {
         DestroyWindow(mainWindow);
-        app.Run();
-        return fail(L"Collapsed widget still exposed a resize hit target", 52);
+        std::wcerr << L"Collapsed widget title blank did not remain draggable without resize\n";
+        cleanup();
+        return 52;
     }
     SendMessageW(categoryWindow, WM_LBUTTONDOWN, MK_LBUTTON, collapsePoint);
     SendMessageW(categoryWindow, WM_LBUTTONUP, 0, collapsePoint);
@@ -2502,8 +2585,9 @@ int RunSmokeWidgetDropPlacement(HINSTANCE instance) {
     const std::filesystem::path configRoot = testRoot / L"Config";
     const std::filesystem::path dataRoot = testRoot / L"Data";
     const std::filesystem::path desktopRoot = testRoot / L"Desktop";
-    const std::filesystem::path incomingRoot = testRoot / L"Incoming";
     const std::wstring categoryId = L"widget-drop-placement-category";
+    const std::wstring secondaryCategoryId =
+        L"widget-drop-placement-secondary";
     const std::wstring categoryName =
         L"拖放落点隔离测试-" + std::to_wstring(GetCurrentProcessId());
     const std::filesystem::path managedRoot =
@@ -2543,8 +2627,8 @@ int RunSmokeWidgetDropPlacement(HINSTANCE instance) {
 
     std::error_code fileError;
     for (const std::filesystem::path& directory :
-         std::array<std::filesystem::path, 5>{
-             configRoot, dataRoot, desktopRoot, incomingRoot, managedRoot}) {
+         std::array<std::filesystem::path, 4>{
+             configRoot, dataRoot, desktopRoot, managedRoot}) {
         std::filesystem::create_directories(directory, fileError);
         if (fileError) {
             return fail(L"Widget drop placement directory setup failed", 85);
@@ -2562,13 +2646,14 @@ int RunSmokeWidgetDropPlacement(HINSTANCE instance) {
         managedRoot / L"C.txt",
         managedRoot / L"D.txt",
     };
-    const std::array<std::filesystem::path, 3> incomingPaths{
-        incomingRoot / L"N1.txt",
-        incomingRoot / L"N2.txt",
-        incomingRoot / L"N3.txt",
+    const std::array<std::filesystem::path, 4> incomingPaths{
+        desktopRoot / L"N1.txt",
+        desktopRoot / L"N2.txt",
+        desktopRoot / L"N3.txt",
+        desktopRoot / L"资料文件夹",
     };
     const std::filesystem::path collisionOriginalPath =
-        incomingRoot / L"再次出现.txt";
+        desktopRoot / L"再次出现.txt";
     const std::filesystem::path collisionManagedPath =
         managedRoot / collisionOriginalPath.filename();
     for (size_t index = 0; index < basePaths.size(); ++index) {
@@ -2576,10 +2661,15 @@ int RunSmokeWidgetDropPlacement(HINSTANCE instance) {
             return fail(L"Widget drop placement base fixture creation failed", 85);
         }
     }
-    for (size_t index = 0; index < incomingPaths.size(); ++index) {
+    for (size_t index = 0; index + 1 < incomingPaths.size(); ++index) {
         if (!writeFixture(incomingPaths[index], "incoming batch fixture")) {
             return fail(L"Widget drop placement incoming fixture creation failed", 85);
         }
+    }
+    std::filesystem::create_directories(incomingPaths.back(), fileError);
+    if (fileError ||
+        !writeFixture(incomingPaths.back() / L"内容.md", "folder child fixture")) {
+        return fail(L"Widget drop placement folder fixture creation failed", 85);
     }
     if (!writeFixture(collisionManagedPath, "existing managed collision fixture")) {
         return fail(L"Widget drop placement ID collision fixture creation failed", 85);
@@ -2625,6 +2715,12 @@ int RunSmokeWidgetDropPlacement(HINSTANCE instance) {
     category.layout.locked = false;
     category.layout.monitorId = monitorInfo.szDevice;
     config.categories.push_back(category);
+    CategoryConfig secondaryCategory;
+    secondaryCategory.id = secondaryCategoryId;
+    secondaryCategory.name = L"引用分类移动测试";
+    secondaryCategory.storageFolder = secondaryCategory.name;
+    secondaryCategory.layout = category.layout;
+    config.categories.push_back(secondaryCategory);
     ConfigStore configStore;
     if (!configStore.SaveAppConfig(config)) {
         return fail(L"Widget drop placement config save failed", 85);
@@ -2751,12 +2847,13 @@ int RunSmokeWidgetDropPlacement(HINSTANCE instance) {
     }
 
     DesktopScanner scanner;
-    std::array<std::wstring, 3> incomingIds{};
+    std::array<std::wstring, 4> incomingIds{};
     const std::vector<std::wstring> dropPaths{
         incomingPaths[0].wstring(),
         incomingPaths[1].wstring(),
         incomingPaths[1].wstring(),
         incomingPaths[2].wstring(),
+        incomingPaths[3].wstring(),
     };
     const POINT insertionPoint =
         WidgetWindowSmokeAccess::InsertionScreenPoint(widget, 2);
@@ -2856,10 +2953,10 @@ int RunSmokeWidgetDropPlacement(HINSTANCE instance) {
     for (size_t index = 0; index < incomingPaths.size(); ++index) {
         std::vector<const ItemConfig*> matches;
         for (const ItemConfig& item : persisted.items) {
-            if (item.originalDesktopPath.empty() &&
+            if (samePath(item.path, incomingPaths[index].wstring()) &&
                 samePath(
-                    std::filesystem::path(item.path).filename().wstring(),
-                    incomingPaths[index].filename().wstring())) {
+                    item.originalDesktopPath,
+                    incomingPaths[index].wstring())) {
                 matches.push_back(&item);
             }
         }
@@ -2870,13 +2967,14 @@ int RunSmokeWidgetDropPlacement(HINSTANCE instance) {
                 matches.front()->id) !=
                 incomingIds.begin() + static_cast<std::ptrdiff_t>(index)) {
             return fail(
-                L"Widget drop placement did not assign unique managed IDs",
+                L"Widget drop placement did not assign unique reference IDs",
                 92);
         }
         incomingIds[index] = matches.front()->id;
     }
     const std::vector<std::wstring> expectedIds{
         baseIds[0], baseIds[1], incomingIds[0], incomingIds[1], incomingIds[2],
+        incomingIds[3],
         baseIds[2], baseIds[3]};
     if (persistedCategory == persisted.categories.end() ||
         persistedCategory->itemIds != expectedIds) {
@@ -2886,7 +2984,7 @@ int RunSmokeWidgetDropPlacement(HINSTANCE instance) {
                 std::wcerr << L"  " << id << L"\n";
             }
         }
-        return fail(L"Widget drop placement did not insert three files at index 2", 90);
+        return fail(L"Widget drop placement did not insert four references at index 2", 90);
     }
     if (persistedCategory->layout.autoArrange ||
         persistedCategory->layout.sortMode != 0) {
@@ -2913,19 +3011,20 @@ int RunSmokeWidgetDropPlacement(HINSTANCE instance) {
             [&](const ItemConfig& value) { return value.id == id; });
         if (configCount != 1 || categoryCount != 1 ||
             registered == persisted.items.end() ||
-            !registered->originalDesktopPath.empty() ||
-            std::filesystem::exists(incomingPaths[index]) ||
-            !std::filesystem::exists(registered->path) ||
+            !samePath(registered->path, incomingPaths[index].wstring()) ||
             !samePath(
-                std::filesystem::path(registered->path).parent_path().wstring(),
-                managedRoot.wstring()) ||
+                registered->originalDesktopPath,
+                incomingPaths[index].wstring()) ||
+            !std::filesystem::exists(incomingPaths[index]) ||
+            std::filesystem::exists(
+                managedRoot / incomingPaths[index].filename()) ||
             std::any_of(
                 destinationPaths.begin(),
                 destinationPaths.end(),
                 [&](const std::wstring& path) {
                     return samePath(path, registered->path);
                 })) {
-            return fail(L"Widget drop placement file/config uniqueness mismatch", 92);
+            return fail(L"Widget drop placement reference/config uniqueness mismatch", 92);
         }
         destinationPaths.push_back(registered->path);
     }
@@ -2985,11 +3084,14 @@ int RunSmokeWidgetDropPlacement(HINSTANCE instance) {
             101);
     }
 
-    std::error_code desktopError;
-    if (std::filesystem::directory_iterator(desktopRoot, desktopError) !=
-            std::filesystem::directory_iterator{} ||
-        desktopError) {
-        return fail(L"Widget drop placement touched the isolated desktop", 92);
+    if (!std::filesystem::exists(incomingPaths.back() / L"内容.md")) {
+        return fail(L"Widget drop placement changed the referenced folder tree", 92);
+    }
+    for (const std::filesystem::path& incomingPath : incomingPaths) {
+        if (!std::filesystem::exists(incomingPath) ||
+            std::filesystem::exists(managedRoot / incomingPath.filename())) {
+            return fail(L"Widget drop placement activation moved a reference", 92);
+        }
     }
 
     if (!writeFixture(collisionOriginalPath, "reappeared original-path fixture")) {
@@ -3120,7 +3222,9 @@ int RunSmokeWidgetDropPlacement(HINSTANCE instance) {
         oldCollisionItem == collisionPersisted.items.end() ||
         newCollisionItem == collisionPersisted.items.end() ||
         !oldCollisionItem->originalDesktopPath.empty() ||
-        !newCollisionItem->originalDesktopPath.empty() ||
+        !samePath(
+            newCollisionItem->originalDesktopPath,
+            collisionOriginalPath.wstring()) ||
         std::count(
             collisionCategory->itemIds.begin(),
             collisionCategory->itemIds.end(),
@@ -3130,15 +3234,49 @@ int RunSmokeWidgetDropPlacement(HINSTANCE instance) {
             collisionCategory->itemIds.end(),
             newCollisionItem->id) != 1 ||
         !std::filesystem::exists(collisionManagedPath) ||
-        !std::filesystem::exists(newCollisionItem->path) ||
-        !samePath(
-            std::filesystem::path(newCollisionItem->path).parent_path().wstring(),
-            managedRoot.wstring()) ||
+        !samePath(newCollisionItem->path, collisionOriginalPath.wstring()) ||
         samePath(newCollisionItem->path, collisionManagedPath.wstring()) ||
-        std::filesystem::exists(collisionOriginalPath)) {
+        !std::filesystem::exists(collisionOriginalPath)) {
         return fail(
-            L"Widget drop placement reused a managed ID for a live source path collision",
+            L"Widget drop placement reused an ID for a live reference path collision",
             95);
+    }
+
+    WidgetWindowSmokeAccess::MoveItemToCategory(
+        widget,
+        incomingIds.front(),
+        secondaryCategoryId);
+    AppConfig movedReferenceConfig = configStore.LoadAppConfig();
+    const auto movedReferenceCategory = std::find_if(
+        movedReferenceConfig.categories.begin(),
+        movedReferenceConfig.categories.end(),
+        [&](const CategoryConfig& value) {
+            return value.id == secondaryCategoryId;
+        });
+    if (movedReferenceCategory == movedReferenceConfig.categories.end() ||
+        std::count(
+            movedReferenceCategory->itemIds.begin(),
+            movedReferenceCategory->itemIds.end(),
+            incomingIds.front()) != 1 ||
+        !std::filesystem::exists(incomingPaths.front()) ||
+        std::filesystem::exists(managedRoot / incomingPaths.front().filename())) {
+        return fail(L"Widget reference category move touched the original item", 95);
+    }
+    const std::wstring removedReferenceId = incomingIds[1];
+    if (!WidgetWindowSmokeAccess::MoveItemOut(widget, removedReferenceId)) {
+        return fail(L"Widget reference removal returned false", 95);
+    }
+    const AppConfig removedReferenceConfig = configStore.LoadAppConfig();
+    const bool removedReferenceStillRegistered = std::any_of(
+        removedReferenceConfig.items.begin(),
+        removedReferenceConfig.items.end(),
+        [&](const ItemConfig& value) {
+            return value.id == removedReferenceId;
+        });
+    if (removedReferenceStillRegistered ||
+        !std::filesystem::exists(incomingPaths[1]) ||
+        std::filesystem::exists(managedRoot / incomingPaths[1].filename())) {
+        return fail(L"Widget reference removal touched the original item", 95);
     }
 
     if (!cleanup()) {

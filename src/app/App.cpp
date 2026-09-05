@@ -6,6 +6,14 @@
 App::App(HINSTANCE instance) : instance_(instance) {}
 
 bool App::Initialize(int showCommand) {
+    return InitializeInternal(showCommand, true);
+}
+
+bool App::InitializeForIsolatedSmoke(int showCommand) {
+    return InitializeInternal(showCommand, false);
+}
+
+bool App::InitializeInternal(int showCommand, bool activateDesktopSession) {
     if (!singleInstance_.IsPrimary()) {
         return false;
     }
@@ -30,13 +38,15 @@ bool App::Initialize(int showCommand) {
             MB_OK | MB_ICONWARNING);
     }
 
-    std::wstring activationError;
-    if (!desktopSession_.Activate(configStore_, shortcutStore_, activationError) && !activationError.empty()) {
-        MessageDialog::Show(instance_,
-            nullptr,
-            (L"为保护原桌面布局，以下项目没有被移入格子：\n\n" + activationError).c_str(),
-            L"Lattice 桌面布局保护",
-            MB_OK | MB_ICONWARNING);
+    if (activateDesktopSession) {
+        std::wstring activationError;
+        if (!desktopSession_.Activate(configStore_, shortcutStore_, activationError) && !activationError.empty()) {
+            MessageDialog::Show(instance_,
+                nullptr,
+                (L"为保护原桌面布局，以下项目没有被移入格子：\n\n" + activationError).c_str(),
+                L"Lattice 桌面布局保护",
+                MB_OK | MB_ICONWARNING);
+        }
     }
 
     mainWindow_ = std::make_unique<MainWindow>(instance_);

@@ -15,9 +15,12 @@ public:
     explicit App(HINSTANCE instance);
 
     bool Initialize(int showCommand);
+    bool InitializeForIsolatedSmoke(int showCommand);
     int Run();
 
 private:
+    bool InitializeInternal(int showCommand, bool activateDesktopSession);
+
     HINSTANCE instance_;
     SingleInstance singleInstance_;
     ConfigStore configStore_;

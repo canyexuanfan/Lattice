@@ -12,6 +12,7 @@ public:
 
     bool IsSupportedDesktopItem(const std::wstring& path) const;
     bool IsSupportedShortcut(const std::wstring& path) const;
+    bool RequiresManagedStorage(const std::wstring& path) const;
     bool IsManagedPath(const std::wstring& path) const;
     bool IsDesktopPath(const std::wstring& path) const;
 

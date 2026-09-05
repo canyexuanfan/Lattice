@@ -132,6 +132,13 @@ bool DesktopSession::Activate(
             continue;
         }
 
+        // Ordinary files and folders are reference-only items. Their original
+        // paths must remain untouched across startup; only shortcuts enter the
+        // managed storage transaction below.
+        if (!managedStore.RequiresManagedStorage(item.path)) {
+            continue;
+        }
+
         const DesktopPlacementConfig* placement = FindDesktopPosition(config, item.path);
         if (placement == nullptr) {
             POINT recoveredPoint{};
