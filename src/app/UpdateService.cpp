@@ -105,7 +105,7 @@ bool ReadResponse(HINTERNET request, std::uint64_t maximumBytes, std::string& ou
 }
 
 bool RequestHttps(const wchar_t* host, INTERNET_PORT port, const std::wstring& path, HINTERNET& requestOut, InternetHandle& session, InternetHandle& connection, InternetHandle& request) {
-    session.value = WinHttpOpen(L"Lattice/0.4.32", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    session.value = WinHttpOpen(L"Lattice/0.4.35", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
     if (session.value == nullptr) return false;
     WinHttpSetTimeouts(session.value, 5000, 5000, 10000, 10000);
     connection.value = WinHttpConnect(session.value, host, port, 0);

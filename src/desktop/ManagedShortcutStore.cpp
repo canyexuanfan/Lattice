@@ -305,13 +305,32 @@ void NotifyShellMove(const std::wstring& source, const std::wstring& destination
         nullptr);
 }
 
-bool MovePath(const std::wstring& source, const std::wstring& destination, DWORD attributes, DWORD& error) {
+bool MovePath(
+    const std::wstring& source,
+    const std::wstring& destination,
+    DWORD attributes,
+    bool allowElevation,
+    HWND ownerWindow,
+    DWORD& error) {
     if (MoveFileExW(source.c_str(), destination.c_str(), MOVEFILE_COPY_ALLOWED | MOVEFILE_WRITE_THROUGH) != FALSE) {
-        error = ERROR_SUCCESS;
-        return true;
+        const bool completed =
+            GetFileAttributesW(source.c_str()) == INVALID_FILE_ATTRIBUTES &&
+            GetFileAttributesW(destination.c_str()) != INVALID_FILE_ATTRIBUTES;
+        error = completed ? ERROR_SUCCESS : ERROR_GEN_FAILURE;
+        return completed;
     }
     error = GetLastError();
-    if ((attributes & FILE_ATTRIBUTE_DIRECTORY) == 0 || error != ERROR_NOT_SAME_DEVICE) {
+    const bool needsCrossVolumeDirectoryMove =
+        (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0 && error == ERROR_NOT_SAME_DEVICE;
+    const bool needsPermissionBroker =
+        allowElevation &&
+        (error == ERROR_ACCESS_DENIED || error == ERROR_PRIVILEGE_NOT_HELD);
+    if (!needsCrossVolumeDirectoryMove && !needsPermissionBroker) {
+        return false;
+    }
+    if (GetFileAttributesW(source.c_str()) == INVALID_FILE_ATTRIBUTES ||
+        GetFileAttributesW(destination.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        error = ERROR_ALREADY_EXISTS;
         return false;
     }
 
@@ -327,8 +346,15 @@ bool MovePath(const std::wstring& source, const std::wstring& destination, DWORD
     if (SUCCEEDED(result)) {
         result = CoCreateInstance(CLSID_FileOperation, nullptr, CLSCTX_ALL, IID_PPV_ARGS(&operation));
     }
+    if (SUCCEEDED(result) && ownerWindow != nullptr && IsWindow(ownerWindow) != FALSE) {
+        result = operation->SetOwnerWindow(ownerWindow);
+    }
     if (SUCCEEDED(result)) {
-        result = operation->SetOperationFlags(FOF_SILENT | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_NOCONFIRMMKDIR);
+        FILEOP_FLAGS flags = FOF_SILENT | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_NOCONFIRMMKDIR;
+        if (needsPermissionBroker) {
+            flags |= FOFX_SHOWELEVATIONPROMPT;
+        }
+        result = operation->SetOperationFlags(flags);
     }
     if (SUCCEEDED(result)) {
         result = operation->MoveItem(sourceItem.Get(), destinationFolder.Get(), destinationName.c_str(), nullptr);
@@ -340,11 +366,19 @@ bool MovePath(const std::wstring& source, const std::wstring& destination, DWORD
     if (SUCCEEDED(result)) {
         result = operation->GetAnyOperationsAborted(&aborted);
     }
-    if (SUCCEEDED(result) && aborted == FALSE) {
+    if (SUCCEEDED(result) && aborted == FALSE &&
+        GetFileAttributesW(source.c_str()) == INVALID_FILE_ATTRIBUTES &&
+        GetFileAttributesW(destination.c_str()) != INVALID_FILE_ATTRIBUTES) {
         error = ERROR_SUCCESS;
         return true;
     }
-    error = FAILED(result) ? static_cast<DWORD>(result) : ERROR_CANCELLED;
+    if (aborted != FALSE) {
+        error = ERROR_CANCELLED;
+    } else if (FAILED(result) && HRESULT_FACILITY(result) == FACILITY_WIN32) {
+        error = HRESULT_CODE(result);
+    } else {
+        error = FAILED(result) ? static_cast<DWORD>(result) : ERROR_GEN_FAILURE;
+    }
     return false;
 }
 
@@ -439,10 +473,16 @@ ManagedShortcutStore::ManagedShortcutStore() {
     journalTempPath_ = journalPath_ + L".tmp";
 }
 
-ManagedShortcutStore::ManagedShortcutStore(std::wstring dataDirectory, std::wstring desktopDirectory) {
+ManagedShortcutStore::ManagedShortcutStore(
+    std::wstring dataDirectory,
+    std::wstring desktopDirectory,
+    std::wstring publicDesktopDirectory) {
     rootPath_ = FullPath(JoinPath(std::move(dataDirectory), L"ManagedShortcuts"));
     desktopPath_ = FullPath(std::move(desktopDirectory));
-    publicDesktopPath_ = FullPath(KnownFolderPath(FOLDERID_PublicDesktop));
+    publicDesktopPath_ = FullPath(
+        publicDesktopDirectory.empty()
+            ? KnownFolderPath(FOLDERID_PublicDesktop)
+            : std::move(publicDesktopDirectory));
     journalPath_ = JoinPath(rootPath_, L"move-journal.bin");
     journalTempPath_ = journalPath_ + L".tmp";
 }
@@ -471,12 +511,10 @@ bool ManagedShortcutStore::RequiresManagedStorage(const std::wstring& path) cons
     }
 
     // Explorer has no durable per-item hide API for ordinary filesystem
-    // objects. A collected item from the current user's Desktop therefore has
-    // exactly one real copy: it is moved transactionally into Lattice's
-    // managed category directory. Public Desktop and arbitrary external paths
-    // are deliberately excluded because moving them can require wider
-    // permissions or change machine-wide state.
-    return PathIsInside(path, desktopPath_) && IsSupportedDesktopItem(path);
+    // objects. User and Public Desktop items therefore share the same unique
+    // original move transaction. Public Desktop permission elevation, when it
+    // is actually required, is handled by the move operation itself.
+    return IsDesktopPath(path) && IsSupportedDesktopItem(path);
 }
 
 bool ManagedShortcutStore::IsManagedPath(const std::wstring& path) const {
@@ -650,7 +688,8 @@ bool ManagedShortcutStore::MoveIntoCategory(
     const std::wstring& categoryId,
     const std::function<bool(const std::wstring&)>& persistDestination,
     std::wstring& destinationPath,
-    std::wstring& errorMessage) {
+    std::wstring& errorMessage,
+    HWND ownerWindow) {
     const std::wstring destinationDirectory = CategoryPath(categoryId);
     return ExecuteMove(
         itemId,
@@ -659,7 +698,9 @@ bool ManagedShortcutStore::MoveIntoCategory(
         false,
         persistDestination,
         destinationPath,
-        errorMessage);
+        errorMessage,
+        {},
+        ownerWindow);
 }
 
 bool ManagedShortcutStore::MoveToDesktop(
@@ -667,7 +708,8 @@ bool ManagedShortcutStore::MoveToDesktop(
     const std::wstring& sourcePath,
     const std::function<bool(const std::wstring&)>& persistDestination,
     std::wstring& destinationPath,
-    std::wstring& errorMessage) {
+    std::wstring& errorMessage,
+    HWND ownerWindow) {
     if (!IsManagedPath(sourcePath)) {
         errorMessage = L"该项目不在格子的托管目录中，未移动任何文件。";
         return false;
@@ -679,7 +721,9 @@ bool ManagedShortcutStore::MoveToDesktop(
         true,
         persistDestination,
         destinationPath,
-        errorMessage);
+        errorMessage,
+        {},
+        ownerWindow);
 }
 
 bool ManagedShortcutStore::MoveToOriginalDesktop(
@@ -688,21 +732,14 @@ bool ManagedShortcutStore::MoveToOriginalDesktop(
     const std::wstring& originalDesktopPath,
     const std::function<bool(const std::wstring&)>& persistDestination,
     std::wstring& destinationPath,
-    std::wstring& errorMessage) {
+    std::wstring& errorMessage,
+    HWND ownerWindow,
+    bool notifyShell) {
     if (!IsManagedPath(sourcePath)) {
         errorMessage = L"该项目不在格子的托管目录中，未移动任何文件。";
         return false;
     }
-    std::wstring target = FullPath(originalDesktopPath);
-    const bool redirectedFromPublicDesktop = PathIsInside(target, publicDesktopPath_);
-    if (redirectedFromPublicDesktop) {
-        // Public Desktop is normally read-only for unelevated interactive
-        // processes. Historical versions could move these shortcuts into the
-        // managed store while elevated; releasing them must not require
-        // elevation later. Keep one physical file and return it to this user's
-        // desktop instead.
-        target = JoinPath(desktopPath_, FileNameFromPath(target));
-    }
+    const std::wstring target = FullPath(originalDesktopPath);
     const std::wstring targetDirectory = ParentDirectory(target);
     if (target.empty() || !IsDesktopPath(target) || targetDirectory.empty()) {
         errorMessage = L"记录的原桌面位置无效，已停止归还以避免移动到桌面以外。";
@@ -710,16 +747,6 @@ bool ManagedShortcutStore::MoveToOriginalDesktop(
     }
     if (GetFileAttributesW(target.c_str()) != INVALID_FILE_ATTRIBUTES && !PathsEqual(sourcePath, target)) {
         if (!FilesHaveSameContents(sourcePath, target)) {
-            if (redirectedFromPublicDesktop) {
-                return ExecuteMove(
-                    itemId,
-                    sourcePath,
-                    desktopPath_,
-                    true,
-                    persistDestination,
-                    destinationPath,
-                    errorMessage);
-            }
             errorMessage = L"原桌面位置已经存在内容不同的同名项目，已保留两份且未覆盖：" + target;
             return false;
         }
@@ -738,7 +765,9 @@ bool ManagedShortcutStore::MoveToOriginalDesktop(
             errorMessage = ErrorText(L"桌面已有完全一致的项目，但无法清理托管目录中的重复副本", deleteError);
             return false;
         }
-        SHChangeNotify(SHCNE_DELETE, SHCNF_PATHW | SHCNF_FLUSHNOWAIT, sourcePath.c_str(), nullptr);
+        if (notifyShell) {
+            SHChangeNotify(SHCNE_DELETE, SHCNF_PATHW | SHCNF_FLUSHNOWAIT, sourcePath.c_str(), nullptr);
+        }
         destinationPath = target;
         errorMessage.clear();
         return true;
@@ -751,7 +780,9 @@ bool ManagedShortcutStore::MoveToOriginalDesktop(
         persistDestination,
         destinationPath,
         errorMessage,
-        target);
+        target,
+        ownerWindow,
+        notifyShell);
 }
 
 bool ManagedShortcutStore::RemoveRedundantDesktopCopy(
@@ -787,7 +818,9 @@ bool ManagedShortcutStore::ExecuteMove(
     const std::function<bool(const std::wstring&)>& persistDestination,
     std::wstring& destinationPath,
     std::wstring& errorMessage,
-    const std::wstring& exactDestinationPath) {
+    const std::wstring& exactDestinationPath,
+    HWND ownerWindow,
+    bool notifyShell) {
     destinationPath.clear();
     errorMessage.clear();
     if (itemId.empty() || sourcePath.empty() || destinationDirectory.empty() || !persistDestination) {
@@ -837,13 +870,24 @@ bool ManagedShortcutStore::ExecuteMove(
     }
 
     DWORD moveError = ERROR_SUCCESS;
-    if (!MovePath(journal.sourcePath, journal.destinationPath, attributes, moveError)) {
+    const bool allowElevation =
+        PathIsInside(journal.sourcePath, publicDesktopPath_) ||
+        PathIsInside(journal.destinationPath, publicDesktopPath_);
+    if (!MovePath(
+            journal.sourcePath,
+            journal.destinationPath,
+            attributes,
+            allowElevation,
+            ownerWindow,
+            moveError)) {
         ClearJournal();
         errorMessage = ErrorText(L"无法移动桌面项目", moveError);
         return false;
     }
     const bool isDirectory = (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
-    NotifyShellMove(journal.sourcePath, journal.destinationPath, isDirectory);
+    if (notifyShell) {
+        NotifyShellMove(journal.sourcePath, journal.destinationPath, isDirectory);
+    }
 
     bool persisted = false;
     try {
@@ -858,8 +902,16 @@ bool ManagedShortcutStore::ExecuteMove(
     }
 
     DWORD rollbackError = ERROR_SUCCESS;
-    if (MovePath(journal.destinationPath, journal.sourcePath, attributes, rollbackError)) {
-        NotifyShellMove(journal.destinationPath, journal.sourcePath, isDirectory);
+    if (MovePath(
+            journal.destinationPath,
+            journal.sourcePath,
+            attributes,
+            allowElevation,
+            ownerWindow,
+            rollbackError)) {
+        if (notifyShell) {
+            NotifyShellMove(journal.destinationPath, journal.sourcePath, isDirectory);
+        }
         ClearJournal();
         errorMessage = L"配置保存失败，快捷方式已经自动移回原位置。";
     } else {
@@ -965,8 +1017,8 @@ bool ManagedShortcutStore::RecoverPending(const AppConfig& config, std::wstring&
         return false;
     }
     const bool safeEndpoints =
-        (PathIsInside(journal.sourcePath, rootPath_) || PathIsInside(journal.sourcePath, desktopPath_)) &&
-        (PathIsInside(journal.destinationPath, rootPath_) || PathIsInside(journal.destinationPath, desktopPath_)) &&
+        (PathIsInside(journal.sourcePath, rootPath_) || IsDesktopPath(journal.sourcePath)) &&
+        (PathIsInside(journal.destinationPath, rootPath_) || IsDesktopPath(journal.destinationPath)) &&
         (PathIsInside(journal.sourcePath, rootPath_) || PathIsInside(journal.destinationPath, rootPath_));
     if (!safeEndpoints) {
         errorMessage = L"移动日志中的路径超出应用托管目录和桌面，已停止自动恢复。";
@@ -996,7 +1048,16 @@ bool ManagedShortcutStore::RecoverPending(const AppConfig& config, std::wstring&
     }
     const DWORD destinationAttributes = GetFileAttributesW(journal.destinationPath.c_str());
     DWORD recoveryMoveError = ERROR_SUCCESS;
-    if (!MovePath(journal.destinationPath, journal.sourcePath, destinationAttributes, recoveryMoveError)) {
+    const bool allowElevation =
+        PathIsInside(journal.sourcePath, publicDesktopPath_) ||
+        PathIsInside(journal.destinationPath, publicDesktopPath_);
+    if (!MovePath(
+            journal.destinationPath,
+            journal.sourcePath,
+            destinationAttributes,
+            allowElevation,
+            nullptr,
+            recoveryMoveError)) {
         errorMessage = ErrorText(L"启动时恢复桌面项目失败", recoveryMoveError);
         return false;
     }

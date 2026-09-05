@@ -39,7 +39,7 @@ if (Test-Path -LiteralPath $intermediateDirectory) {
     Remove-Item -LiteralPath $intermediateDirectory -Recurse -Force
 }
 
-# PowerShell hosts can expose both PATH and Path. Start the build in a
+# Codex/PowerShell hosts can expose both PATH and Path. Start the build in a
 # child environment containing exactly one PATH key, while the wrapper sets a
 # writable task-local TEMP/TMP before loading the Visual Studio environment.
 $pathValue = $env:PATH

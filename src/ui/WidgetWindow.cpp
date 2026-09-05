@@ -44,7 +44,7 @@ constexpr UINT kBackdropRefreshDelayMilliseconds = 80;
 constexpr UINT_PTR kIconDragTimerId = 5;
 constexpr UINT kIconDragPollMilliseconds = 16;
 constexpr wchar_t kAlignmentGuideClassName[] = L"Lattice.AlignmentGuide";
-constexpr wchar_t kCurrentVersion[] = L"0.4.32";
+constexpr wchar_t kCurrentVersion[] = L"0.4.35";
 constexpr UINT kShellNewCommandFirst = 0x5000;
 constexpr UINT kShellNewCommandLast = 0x5FFF;
 
@@ -1872,7 +1872,8 @@ bool WidgetWindow::AddDroppedPaths(
                 CategoryStorageFolder(appConfig, categoryId_),
                 persistCollectedItem,
                 destinationPath,
-                errorMessage);
+                errorMessage,
+                hwnd_);
         } else {
             destinationPath = sourcePath;
             collected = persistCollectedItem(destinationPath);
@@ -2422,6 +2423,15 @@ void WidgetWindow::ShowSortMenu(POINT screenPoint) {
     }
 }
 
+bool WidgetWindow::RequestApplicationExit() {
+    return owner_ != nullptr && IsWindow(owner_) != FALSE &&
+           PostMessageW(
+               owner_,
+               kWidgetHostCommandMessage,
+               static_cast<WPARAM>(WidgetHostCommand::ExitApplication),
+               0) != FALSE;
+}
+
 void WidgetWindow::ShowBackgroundMenu(POINT screenPoint) {
     constexpr int kToggleCollapseCommand = 1;
     constexpr int kFixedExpandedCommand = 2;
@@ -2631,8 +2641,8 @@ void WidgetWindow::ShowBackgroundMenu(POINT screenPoint) {
         CheckForUpdates();
     } else if (command == kOpenDataCommand) {
         OpenDataLocation();
-    } else if (command == kExitApplicationCommand && owner_ != nullptr) {
-        SendMessageW(owner_, kWidgetHostCommandMessage, static_cast<WPARAM>(WidgetHostCommand::ExitApplication), 0);
+    } else if (command == kExitApplicationCommand) {
+        RequestApplicationExit();
     } else if (command != kDissolveCommand && command >= kNewCategoryCommand && command <= kImportConfigCommand && owner_ != nullptr) {
         const bool categoryCommand = command >= kImportUnassignedCommand && command <= kMoveCategoryDownCommand;
         if (categoryCommand) {
@@ -3285,7 +3295,8 @@ void WidgetWindow::MoveItemToCategory(const std::wstring& itemId, const std::wst
             CategoryStorageFolder(savedConfig, targetCategoryId),
             persistCategoryMove,
             destinationPath,
-            errorMessage);
+            errorMessage,
+            hwnd_);
     } else {
         destinationPath = sourcePath;
         moved = persistCategoryMove(destinationPath);
@@ -3408,7 +3419,8 @@ bool WidgetWindow::MoveItemOut(
             targetPath,
             [&](const std::wstring&) { return removeFromConfig(); },
             destinationPath,
-            errorMessage);
+            errorMessage,
+            hwnd_);
         if (moved) {
             desktopPath = destinationPath;
         }

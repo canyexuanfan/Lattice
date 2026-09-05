@@ -107,6 +107,7 @@ private:
     void RefreshCurrentItems();
     void ReorderItem(size_t fromIndex, size_t toIndex);
     void ShowBackgroundMenu(POINT screenPoint);
+    bool RequestApplicationExit();
     void RegisterUntrackedCategoryItems();
     void ApplyMovingSnap(RECT& movingRect) const;
     void ApplySizingSnap(RECT& sizingRect, WPARAM sizingEdge) const;

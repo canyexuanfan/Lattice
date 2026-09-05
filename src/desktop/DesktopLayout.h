@@ -34,4 +34,9 @@ public:
         const std::function<void()>& onVisiblePositioned = {},
         const std::function<bool()>& cancellationRequested = {}) const;
     bool RestorePositions(const std::vector<DesktopPosition>& positions, std::wstring& errorMessage) const;
+    bool RestorePositions(
+        const std::vector<DesktopPosition>& positions,
+        const std::vector<std::wstring>& requiredPaths,
+        std::wstring& errorMessage,
+        bool notifyRequiredPaths = true) const;
 };

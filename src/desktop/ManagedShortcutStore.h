@@ -10,7 +10,10 @@
 class ManagedShortcutStore {
 public:
     ManagedShortcutStore();
-    ManagedShortcutStore(std::wstring dataDirectory, std::wstring desktopDirectory);
+    ManagedShortcutStore(
+        std::wstring dataDirectory,
+        std::wstring desktopDirectory,
+        std::wstring publicDesktopDirectory = {});
 
     bool IsSupportedDesktopItem(const std::wstring& path) const;
     bool IsSupportedShortcut(const std::wstring& path) const;
@@ -39,14 +42,16 @@ public:
         const std::wstring& categoryId,
         const std::function<bool(const std::wstring&)>& persistDestination,
         std::wstring& destinationPath,
-        std::wstring& errorMessage);
+        std::wstring& errorMessage,
+        HWND ownerWindow = nullptr);
 
     bool MoveToDesktop(
         const std::wstring& itemId,
         const std::wstring& sourcePath,
         const std::function<bool(const std::wstring&)>& persistDestination,
         std::wstring& destinationPath,
-        std::wstring& errorMessage);
+        std::wstring& errorMessage,
+        HWND ownerWindow = nullptr);
 
     bool MoveToOriginalDesktop(
         const std::wstring& itemId,
@@ -54,7 +59,9 @@ public:
         const std::wstring& originalDesktopPath,
         const std::function<bool(const std::wstring&)>& persistDestination,
         std::wstring& destinationPath,
-        std::wstring& errorMessage);
+        std::wstring& errorMessage,
+        HWND ownerWindow = nullptr,
+        bool notifyShell = true);
 
     bool RemoveRedundantDesktopCopy(
         const std::wstring& managedPath,
@@ -84,7 +91,9 @@ private:
         const std::function<bool(const std::wstring&)>& persistDestination,
         std::wstring& destinationPath,
         std::wstring& errorMessage,
-        const std::wstring& exactDestinationPath = {});
+        const std::wstring& exactDestinationPath = {},
+        HWND ownerWindow = nullptr,
+        bool notifyShell = true);
     bool WriteJournal(const JournalEntry& entry, std::wstring& errorMessage) const;
     bool ReadJournal(JournalEntry& entry, std::wstring& errorMessage) const;
     bool ClearJournal() const;

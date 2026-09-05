@@ -3635,7 +3635,8 @@ void MainWindow::MoveItemToCategory(const std::wstring& itemId, const std::wstri
             StorageFolderForCategory(categoryId),
             persistCategoryMove,
             destinationPath,
-            errorMessage);
+            errorMessage,
+            hwnd_);
     } else {
         destinationPath = sourcePath;
         moved = persistCategoryMove(destinationPath);
@@ -3734,7 +3735,8 @@ bool MainWindow::MoveItemOut(
             targetPath,
             [&](const std::wstring&) { return persistRemoval(); },
             destinationPath,
-            errorMessage);
+            errorMessage,
+            hwnd_);
         if (moved) {
             desktopPath = destinationPath;
         }
@@ -4027,7 +4029,8 @@ bool MainWindow::ImportPathToCategory(
             StorageFolderForCategory(categoryId),
             persistCollectedItem,
             destinationPath,
-            errorMessage);
+            errorMessage,
+            hwnd_);
     } else {
         destinationPath = item.path;
         moved = persistCollectedItem(destinationPath);

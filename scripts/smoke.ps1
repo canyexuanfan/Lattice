@@ -91,6 +91,7 @@ try {
         "--smoke-widget-alignment",
         "--smoke-widget-desktop-layer",
         "--smoke-widget-interaction",
+        "--smoke-widget-normal-exit",
         "--smoke-widget-drop-latency",
         "--smoke-widget-drop-placement",
         "--smoke-update-dialog")) {

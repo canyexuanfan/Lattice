@@ -286,6 +286,7 @@ bool DesktopSession::Deactivate(
     errorMessage.clear();
     AppConfig config = configStore.LoadAppConfig();
     std::vector<DesktopPosition> positions = StoredDesktopPositions(config, managedStore);
+    std::vector<std::wstring> requiredPositionPaths;
     bool allSucceeded = true;
 
     for (size_t index = 0; index < config.items.size(); ++index) {
@@ -296,6 +297,8 @@ bool DesktopSession::Deactivate(
                 if (!managedStore.RestoreDesktopVisibility(item, visibilityError)) {
                     allSucceeded = false;
                     AppendError(errorMessage, FileNameFromPath(item.path), visibilityError);
+                } else if (item.hasDesktopPosition) {
+                    requiredPositionPaths.push_back(item.path);
                 }
             }
             continue;
@@ -321,12 +324,15 @@ bool DesktopSession::Deactivate(
                     return configStore.SaveAppConfig(config);
                 },
                 destination,
-                moveError)) {
+                moveError,
+                nullptr,
+                !item.hasDesktopPosition)) {
             allSucceeded = false;
             AppendError(errorMessage, FileNameFromPath(item.path), moveError);
             continue;
         }
         if (item.hasDesktopPosition) {
+            requiredPositionPaths.push_back(destination);
             const auto existing = std::find_if(positions.begin(), positions.end(), [&](const DesktopPosition& value) {
                 return SamePath(value.path, destination);
             });
@@ -338,7 +344,11 @@ bool DesktopSession::Deactivate(
 
     DesktopLayout desktopLayout;
     std::wstring restoreError;
-    if (!desktopLayout.RestorePositions(positions, restoreError)) {
+    const bool positionsRestored = desktopLayout.RestorePositions(
+        positions,
+        requiredPositionPaths,
+        restoreError);
+    if (!positionsRestored) {
         allSucceeded = false;
         if (!errorMessage.empty()) {
             errorMessage += L"\n";
@@ -348,7 +358,8 @@ bool DesktopSession::Deactivate(
 
     std::vector<DesktopPosition> finalPositions;
     std::wstring finalSnapshotError;
-    if (desktopLayout.CaptureAllPositions(finalPositions, finalSnapshotError)) {
+    if (allSucceeded && desktopLayout.CaptureAllPositions(finalPositions, finalSnapshotError)) {
+        config.desktopLayout.clear();
         MergeDesktopPositions(config, finalPositions, managedStore);
         for (ItemConfig& item : config.items) {
             const std::wstring desktopPath = item.originalDesktopPath.empty() ? item.path : item.originalDesktopPath;
@@ -363,7 +374,7 @@ bool DesktopSession::Deactivate(
             allSucceeded = false;
             AppendError(errorMessage, L"桌面布局", L"最终桌面布局已经恢复，但无法保存为下一次启动基线。");
         }
-    } else {
+    } else if (allSucceeded) {
         allSucceeded = false;
         AppendError(errorMessage, L"桌面布局", finalSnapshotError);
     }

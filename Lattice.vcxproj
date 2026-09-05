@@ -109,7 +109,9 @@
     <ClCompile Include="src\shell\ShellLauncher.cpp" />
     <ClCompile Include="src\shell\ShellDragDrop.cpp" />
     <ClCompile Include="src\shell\ShellDropTarget.cpp" />
-    <ClCompile Include="src\testing\SmokeCommands.cpp" />
+    <ClCompile Include="src\testing\SmokeCommands.cpp">
+      <ExcludedFromBuild Condition="'$(Configuration)'=='Release'">true</ExcludedFromBuild>
+    </ClCompile>
     <ClCompile Include="src\ui\DragGhostWindow.cpp" />
     <ClCompile Include="src\ui\IconGrid.cpp" />
     <ClCompile Include="src\ui\InputDialog.cpp" />

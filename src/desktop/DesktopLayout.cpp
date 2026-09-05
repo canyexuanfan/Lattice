@@ -49,34 +49,36 @@ std::wstring FileName(const std::wstring& path) {
     return separator == std::wstring::npos ? path : path.substr(separator + 1);
 }
 
-void RefreshDesktopDirectoriesAsynchronously(const std::vector<DesktopPosition>& positions) {
-    std::vector<std::wstring> directories;
-    directories.reserve(positions.size());
-    for (const DesktopPosition& position : positions) {
-        const std::wstring directory = ParentDirectory(position.path);
-        if (directory.empty()) {
+void NotifyDesktopItemsCreated(
+    const std::vector<std::wstring>& paths,
+    bool flushLast) {
+    struct Notification {
+        std::wstring path;
+        bool directory = false;
+    };
+    std::vector<Notification> notifications;
+    notifications.reserve(paths.size());
+    for (const std::wstring& path : paths) {
+        const DWORD attributes = GetFileAttributesW(path.c_str());
+        if (attributes == INVALID_FILE_ATTRIBUTES ||
+            std::any_of(
+                notifications.begin(),
+                notifications.end(),
+                [&](const Notification& value) { return PathsEqual(value.path, path); })) {
             continue;
         }
-        const bool alreadyQueued = std::any_of(
-            directories.begin(),
-            directories.end(),
-            [&](const std::wstring& existing) { return PathsEqual(existing, directory); });
-        if (!alreadyQueued) {
-            directories.push_back(directory);
-        }
+        notifications.push_back(Notification{
+            path,
+            (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0});
     }
-    for (const std::wstring& directory : directories) {
-        SHChangeNotify(SHCNE_UPDATEDIR, SHCNF_PATHW | SHCNF_FLUSHNOWAIT, directory.c_str(), nullptr);
-    }
-}
-
-void RefreshFolderView(IFolderView* view) {
-    if (view == nullptr) {
-        return;
-    }
-    ComPtr<IShellView> shellView;
-    if (SUCCEEDED(view->QueryInterface(IID_PPV_ARGS(&shellView))) && shellView != nullptr) {
-        shellView->Refresh();
+    for (size_t index = 0; index < notifications.size(); ++index) {
+        const Notification& notification = notifications[index];
+        const bool flush = flushLast && index + 1 == notifications.size();
+        SHChangeNotify(
+            notification.directory ? SHCNE_MKDIR : SHCNE_CREATE,
+            SHCNF_PATHW | (flush ? SHCNF_FLUSH : SHCNF_FLUSHNOWAIT),
+            notification.path.c_str(),
+            nullptr);
     }
 }
 
@@ -730,40 +732,160 @@ bool DesktopLayout::RestoreScreenPosition(
     return false;
 }
 
-bool DesktopLayout::RestorePositions(const std::vector<DesktopPosition>& positions, std::wstring& errorMessage) const {
+bool DesktopLayout::RestorePositions(
+    const std::vector<DesktopPosition>& positions,
+    std::wstring& errorMessage) const {
+    std::vector<std::wstring> requiredPaths;
+    requiredPaths.reserve(positions.size());
+    for (const DesktopPosition& position : positions) {
+        if (std::none_of(
+                requiredPaths.begin(),
+                requiredPaths.end(),
+                [&](const std::wstring& path) { return PathsEqual(path, position.path); })) {
+            requiredPaths.push_back(position.path);
+        }
+    }
+    return RestorePositions(positions, requiredPaths, errorMessage, false);
+}
+
+bool DesktopLayout::RestorePositions(
+    const std::vector<DesktopPosition>& positions,
+    const std::vector<std::wstring>& requiredPaths,
+    std::wstring& errorMessage,
+    bool notifyRequiredPaths) const {
     errorMessage.clear();
-    if (positions.empty()) {
+    if (positions.empty() && requiredPaths.empty()) {
         return true;
     }
-    RefreshDesktopDirectoriesAsynchronously(positions);
-    for (int attempt = 0; attempt < 60; ++attempt) {
+
+    std::vector<DesktopPosition> uniquePositions;
+    uniquePositions.reserve(positions.size());
+    for (const DesktopPosition& position : positions) {
+        const auto existing = std::find_if(
+            uniquePositions.begin(),
+            uniquePositions.end(),
+            [&](const DesktopPosition& value) { return PathsEqual(value.path, position.path); });
+        if (existing == uniquePositions.end()) {
+            uniquePositions.push_back(position);
+        } else {
+            *existing = position;
+        }
+    }
+    std::vector<std::wstring> uniqueRequiredPaths;
+    uniqueRequiredPaths.reserve(requiredPaths.size());
+    for (const std::wstring& path : requiredPaths) {
+        if (std::none_of(
+                uniqueRequiredPaths.begin(),
+                uniqueRequiredPaths.end(),
+                [&](const std::wstring& value) { return PathsEqual(value, path); })) {
+            uniqueRequiredPaths.push_back(path);
+        }
+    }
+
+    if (notifyRequiredPaths) {
+        NotifyDesktopItemsCreated(uniqueRequiredPaths, false);
+    }
+    constexpr ULONGLONG kTotalTimeoutMilliseconds = 1500;
+    const ULONGLONG startedAt = GetTickCount64();
+    bool refreshedView = false;
+    for (;;) {
         ComPtr<IFolderView> view;
         if (SUCCEEDED(GetDesktopFolderView(view))) {
             std::vector<ShellDesktopItem> items;
             std::wstring enumerateError;
             if (EnumerateDesktopItems(view.Get(), items, enumerateError)) {
-                size_t restored = 0;
-                for (const DesktopPosition& position : positions) {
-                    const auto item = std::find_if(items.begin(), items.end(), [&](const ShellDesktopItem& candidate) {
-                        return PathsEqual(candidate.path, position.path);
+                const bool allRequiredVisible = std::all_of(
+                    uniqueRequiredPaths.begin(),
+                    uniqueRequiredPaths.end(),
+                    [&](const std::wstring& path) {
+                        return std::any_of(
+                            items.begin(),
+                            items.end(),
+                            [&](const ShellDesktopItem& item) { return PathsEqual(item.path, path); });
                     });
-                    if (item == items.end()) {
-                        continue;
+                if (allRequiredVisible) {
+                    std::vector<PCUITEMID_CHILD> pidls;
+                    std::vector<POINT> points;
+                    pidls.reserve(uniquePositions.size());
+                    points.reserve(uniquePositions.size());
+                    for (const DesktopPosition& position : uniquePositions) {
+                        const auto item = std::find_if(
+                            items.begin(),
+                            items.end(),
+                            [&](const ShellDesktopItem& candidate) {
+                                return PathsEqual(candidate.path, position.path);
+                            });
+                        if (item != items.end()) {
+                            pidls.push_back(item->pidl);
+                            points.push_back(position.point);
+                        }
                     }
-                    PCUITEMID_CHILD pidl = item->pidl;
-                    POINT point = position.point;
-                    if (SUCCEEDED(view->SelectAndPositionItems(1, &pidl, &point, SVSI_POSITIONITEM))) {
-                        ++restored;
+                    if (pidls.empty()) {
+                        return true;
                     }
-                }
-                if (restored == positions.size()) {
-                    return true;
+                    ULONGLONG lastPositionedAt = 0;
+                    int stableSamples = 0;
+                    while (GetTickCount64() - startedAt < kTotalTimeoutMilliseconds) {
+                        const ULONGLONG now = GetTickCount64();
+                        if (lastPositionedAt == 0 || now - lastPositionedAt >= 120) {
+                            std::vector<PCUITEMID_CHILD> displacedPidls;
+                            std::vector<POINT> displacedPoints;
+                            displacedPidls.reserve(pidls.size());
+                            displacedPoints.reserve(points.size());
+                            for (size_t index = 0; index < pidls.size(); ++index) {
+                                POINT actual{};
+                                if (FAILED(view->GetItemPosition(pidls[index], &actual)) ||
+                                    actual.x != points[index].x || actual.y != points[index].y) {
+                                    displacedPidls.push_back(pidls[index]);
+                                    displacedPoints.push_back(points[index]);
+                                }
+                            }
+                            if (!displacedPidls.empty() &&
+                                FAILED(view->SelectAndPositionItems(
+                                    static_cast<UINT>(displacedPidls.size()),
+                                    displacedPidls.data(),
+                                    displacedPoints.data(),
+                                    SVSI_POSITIONITEM))) {
+                                stableSamples = 0;
+                            }
+                            lastPositionedAt = now;
+                        }
+                        bool exact = true;
+                        for (size_t index = 0; index < pidls.size(); ++index) {
+                            POINT actual{};
+                            if (FAILED(view->GetItemPosition(pidls[index], &actual)) ||
+                                actual.x != points[index].x || actual.y != points[index].y) {
+                                exact = false;
+                                break;
+                            }
+                        }
+                        stableSamples = exact ? stableSamples + 1 : 0;
+                        if (stableSamples >= 2) {
+                            return true;
+                        }
+                        const ULONGLONG elapsed = GetTickCount64() - startedAt;
+                        if (elapsed >= kTotalTimeoutMilliseconds) {
+                            break;
+                        }
+                        Sleep(static_cast<DWORD>((std::min)(
+                            static_cast<ULONGLONG>(8),
+                            kTotalTimeoutMilliseconds - elapsed)));
+                    }
+                    errorMessage = L"文件已安全归还桌面，但 Explorer 没有稳定保持启动前的图标坐标。";
+                    return false;
                 }
             }
-            RefreshFolderView(view.Get());
         }
-        Sleep(attempt < 10 ? 40 : 80);
+        const ULONGLONG elapsed = GetTickCount64() - startedAt;
+        if (notifyRequiredPaths && !refreshedView && elapsed >= 160) {
+            NotifyDesktopItemsCreated(uniqueRequiredPaths, true);
+            refreshedView = true;
+        }
+        if (elapsed >= kTotalTimeoutMilliseconds) {
+            break;
+        }
+        Sleep(elapsed < 160 ? 8 : 32);
     }
-    errorMessage = L"文件已安全归还桌面，但 Explorer 未能恢复全部图标坐标。";
+    errorMessage = L"文件已安全归还桌面，但 Explorer 未在限定时间内显示全部归还项目。";
     return false;
 }
