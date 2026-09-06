@@ -29,7 +29,6 @@ public:
         IconPlaceholderKind placeholderKind = IconPlaceholderKind::File,
         bool* usedPlaceholder = nullptr);
     bool IsIconReady(ID2D1RenderTarget* target, const std::wstring& path);
-    ID2D1Bitmap* GetShortcutOverlay(ID2D1RenderTarget* target);
     HICON CopyReadyIconForDrag(const std::wstring& path);
     void Preload(const std::wstring& path);
     void Alias(const std::wstring& sourcePath, const std::wstring& destinationPath);
@@ -59,7 +58,6 @@ private:
     std::unordered_map<std::wstring, HICON> dragIconCache_;
     Microsoft::WRL::ComPtr<ID2D1Bitmap> filePlaceholder_;
     Microsoft::WRL::ComPtr<ID2D1Bitmap> folderPlaceholder_;
-    Microsoft::WRL::ComPtr<ID2D1Bitmap> shortcutOverlay_;
     size_t capacity_ = 256;
     std::shared_ptr<IconAsyncState> asyncState_;
 };

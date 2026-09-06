@@ -17,6 +17,7 @@ public:
     bool Initialize(int showCommand);
     bool InitializeForIsolatedSmoke(int showCommand);
     int Run();
+    const std::wstring& LastNormalExitError() const noexcept;
 
 private:
     bool InitializeInternal(int showCommand, bool activateDesktopSession);
@@ -27,4 +28,8 @@ private:
     ManagedShortcutStore shortcutStore_;
     DesktopSession desktopSession_;
     std::unique_ptr<MainWindow> mainWindow_;
+    bool interactiveDesktopSession_ = true;
+    bool desktopItemsRestored_ = false;
+    bool desktopSessionDeactivated_ = false;
+    std::wstring normalExitFinalizationError_;
 };

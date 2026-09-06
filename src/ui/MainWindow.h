@@ -2,7 +2,9 @@
 
 #include <Windows.h>
 
+#include <functional>
 #include <memory>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -24,7 +26,12 @@
 
 class MainWindow {
 public:
-    explicit MainWindow(HINSTANCE instance);
+    using NormalExitHandler = std::function<bool(HWND, std::wstring&)>;
+
+    MainWindow(
+        HINSTANCE instance,
+        NormalExitHandler normalExitHandler,
+        bool keepRunningOnNormalExitFailure = true);
     ~MainWindow();
 
     bool Create();
@@ -34,6 +41,8 @@ public:
                (organizerConfig_.settings.restoreHiddenState && !organizerConfig_.settings.lastVisible);
     }
     bool WasUpdateExitRequested() const noexcept { return updateExitRequested_; }
+    bool WasNormalExitCompleted() const noexcept { return normalExitCompleted_; }
+    const std::wstring& LastNormalExitError() const noexcept { return lastNormalExitError_; }
     void FinishPendingDesktopPlacements();
 
 private:
@@ -122,6 +131,8 @@ private:
         std::uint64_t dragGhostGeneration = 0);
     bool QueueDesktopPlacement(const DesktopPlacementRequest& request);
     void HandleDesktopPlacementEvents(bool allowDialogs);
+    bool DrainPendingDesktopPlacementsForExit(std::wstring& errorMessage);
+    void RequestNormalExit();
     void FlushDeferredRefresh();
     bool SaveDesktopPlacement(
         const std::wstring& path,
@@ -141,6 +152,8 @@ private:
     int HoverButton() const;
 
     HINSTANCE instance_;
+    NormalExitHandler normalExitHandler_;
+    bool keepRunningOnNormalExitFailure_ = true;
     HWND hwnd_ = nullptr;
     HWND searchEdit_ = nullptr;
     HWND searchScopeCombo_ = nullptr;
@@ -181,4 +194,7 @@ private:
     int draggingTileIconIndex_ = -1;
     POINT dragStartPoint_{};
     bool updateExitRequested_ = false;
+    bool normalExitInProgress_ = false;
+    bool normalExitCompleted_ = false;
+    std::wstring lastNormalExitError_;
 };

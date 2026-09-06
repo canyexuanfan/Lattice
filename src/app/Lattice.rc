@@ -2,10 +2,11 @@
 #include <winver.h>
 
 IDI_APP_ICON ICON "../../assets/branding/lattice-logo.ico"
+IDI_SHORTCUT_OVERLAY ICON "../../assets/branding/lattice-shortcut-overlay.ico"
 
 VS_VERSION_INFO VERSIONINFO
- FILEVERSION 0,4,36,0
- PRODUCTVERSION 0,4,36,0
+ FILEVERSION 0,4,38,0
+ PRODUCTVERSION 0,4,38,0
  FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
 #ifdef _DEBUG
  FILEFLAGS VS_FF_DEBUG
@@ -22,11 +23,11 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "Lattice"
             VALUE "FileDescription", "Lattice"
-            VALUE "FileVersion", "0.4.36.0"
+            VALUE "FileVersion", "0.4.38.0"
             VALUE "InternalName", "Lattice.exe"
             VALUE "OriginalFilename", "Lattice.exe"
             VALUE "ProductName", "Lattice"
-            VALUE "ProductVersion", "0.4.36.0"
+            VALUE "ProductVersion", "0.4.38.0"
         END
     END
     BLOCK "VarFileInfo"

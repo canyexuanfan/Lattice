@@ -14,12 +14,13 @@ bool App::InitializeForIsolatedSmoke(int showCommand) {
 }
 
 bool App::InitializeInternal(int showCommand, bool activateDesktopSession) {
+    interactiveDesktopSession_ = activateDesktopSession;
     if (!singleInstance_.IsPrimary()) {
         return false;
     }
 
     std::wstring recoveryError;
-    if (!shortcutStore_.RecoverPending(configStore_.LoadAppConfig(), recoveryError)) {
+    if (!shortcutStore_.RecoverPending(configStore_, recoveryError)) {
         MessageDialog::Show(instance_,
             nullptr,
             (L"检测到上次未完成的桌面项目移动，但自动恢复没有完成：\n\n" + recoveryError +
@@ -49,7 +50,20 @@ bool App::InitializeInternal(int showCommand, bool activateDesktopSession) {
         }
     }
 
-    mainWindow_ = std::make_unique<MainWindow>(instance_);
+    mainWindow_ = std::make_unique<MainWindow>(
+        instance_,
+        [this](HWND ownerWindow, std::wstring& errorMessage) {
+            if (desktopSessionDeactivated_) {
+                errorMessage.clear();
+                return true;
+            }
+            if (!desktopSession_.RestoreItems(configStore_, shortcutStore_, errorMessage, ownerWindow)) {
+                return false;
+            }
+            desktopItemsRestored_ = true;
+            return true;
+        },
+        activateDesktopSession);
     if (!mainWindow_->Create()) {
         return false;
     }
@@ -75,18 +89,34 @@ int App::Run() {
     if (mainWindow_ != nullptr) {
         mainWindow_->FinishPendingDesktopPlacements();
     }
-    if (mainWindow_ == nullptr || !mainWindow_->WasUpdateExitRequested()) {
-        std::wstring deactivationError;
-        if (!desktopSession_.Deactivate(configStore_, shortcutStore_, deactivationError) && !deactivationError.empty()) {
-            MessageDialog::Show(instance_,
+    if (mainWindow_ != nullptr && mainWindow_->WasNormalExitCompleted() && desktopItemsRestored_) {
+        normalExitFinalizationError_.clear();
+        if (desktopSession_.RestoreLayout(configStore_, shortcutStore_, normalExitFinalizationError_)) {
+            desktopSessionDeactivated_ = true;
+        } else if (interactiveDesktopSession_) {
+            MessageDialog::Show(
+                instance_,
                 nullptr,
-                (L"Lattice 已退出，但部分桌面项目或坐标没有完全恢复：\n\n" + deactivationError).c_str(),
+                (L"Lattice 已安全归还桌面项目，但部分图标坐标没有完全恢复：\n\n" +
+                 normalExitFinalizationError_).c_str(),
                 L"Lattice 桌面布局恢复",
                 MB_OK | MB_ICONWARNING);
         }
-    } else {
+    }
+    if (mainWindow_ != nullptr && mainWindow_->WasUpdateExitRequested()) {
         OutputDebugStringW(
             L"Lattice update exit preserved managed desktop items and user configuration in place.\n");
+    } else if (!desktopSessionDeactivated_) {
+        OutputDebugStringW(
+            L"Lattice window ended without a completed normal desktop restore; managed items and the saved layout were left unchanged.\n");
     }
     return static_cast<int>(message.wParam);
+}
+
+const std::wstring& App::LastNormalExitError() const noexcept {
+    static const std::wstring empty;
+    if (!normalExitFinalizationError_.empty()) {
+        return normalExitFinalizationError_;
+    }
+    return mainWindow_ == nullptr ? empty : mainWindow_->LastNormalExitError();
 }

@@ -279,18 +279,71 @@ bool DesktopSession::Activate(
     return allSucceeded;
 }
 
-bool DesktopSession::Deactivate(
+bool DesktopSession::RestoreItems(
     ConfigStore& configStore,
     ManagedShortcutStore& managedStore,
-    std::wstring& errorMessage) {
+    std::wstring& errorMessage,
+    HWND ownerWindow) {
     errorMessage.clear();
+    pendingRequiredPaths_.clear();
+    restorePrepared_ = false;
     AppConfig config = configStore.LoadAppConfig();
-    std::vector<DesktopPosition> positions = StoredDesktopPositions(config, managedStore);
-    std::vector<std::wstring> requiredPositionPaths;
     bool allSucceeded = true;
+
+    std::vector<ManagedShortcutStore::OriginalDesktopMoveRequest> publicMoves;
+    for (const ItemConfig& item : config.items) {
+        if (!managedStore.IsManagedPath(item.path)) {
+            continue;
+        }
+        const std::wstring target = item.originalDesktopPath.empty()
+            ? JoinPath(managedStore.DesktopPath(), FileNameFromPath(item.path))
+            : item.originalDesktopPath;
+        if (managedStore.IsPublicDesktopPath(target)) {
+            publicMoves.push_back(ManagedShortcutStore::OriginalDesktopMoveRequest{
+                item.id, item.path, target, !item.hasDesktopPosition});
+        }
+    }
+    std::vector<std::pair<std::wstring, std::wstring>> publicDestinations;
+    std::wstring publicMoveError;
+    if (!managedStore.MoveToOriginalDesktopBatch(
+            publicMoves,
+            [&](const std::vector<std::pair<std::wstring, std::wstring>>& moved) {
+                for (const auto& [itemId, desktopPath] : moved) {
+                    const auto registered = std::find_if(
+                        config.items.begin(), config.items.end(),
+                        [&](const ItemConfig& value) { return value.id == itemId; });
+                    if (registered == config.items.end()) {
+                        return false;
+                    }
+                    registered->path = desktopPath;
+                }
+                return configStore.SaveAppConfig(config);
+            },
+            publicDestinations,
+            publicMoveError,
+            ownerWindow)) {
+        AppendError(errorMessage, L"共享桌面项目", publicMoveError);
+        return false;
+    }
+    for (const auto& [itemId, destination] : publicDestinations) {
+        const auto item = std::find_if(
+            config.items.begin(), config.items.end(),
+            [&](const ItemConfig& value) { return value.id == itemId; });
+        if (item != config.items.end() && item->hasDesktopPosition) {
+            pendingRequiredPaths_.push_back(destination);
+        }
+    }
 
     for (size_t index = 0; index < config.items.size(); ++index) {
         ItemConfig& item = config.items[index];
+        const std::wstring target = managedStore.IsManagedPath(item.path)
+            ? (item.originalDesktopPath.empty()
+                ? JoinPath(managedStore.DesktopPath(), FileNameFromPath(item.path))
+                : item.originalDesktopPath)
+            : item.path;
+        if (managedStore.IsManagedPath(item.path) && managedStore.IsPublicDesktopPath(target)) {
+            continue;
+        }
         if (!managedStore.IsManagedPath(item.path)) {
             if (item.desktopVisibilityMode != 0) {
                 std::wstring visibilityError;
@@ -298,14 +351,11 @@ bool DesktopSession::Deactivate(
                     allSucceeded = false;
                     AppendError(errorMessage, FileNameFromPath(item.path), visibilityError);
                 } else if (item.hasDesktopPosition) {
-                    requiredPositionPaths.push_back(item.path);
+                    pendingRequiredPaths_.push_back(item.path);
                 }
             }
             continue;
         }
-        const std::wstring target = item.originalDesktopPath.empty()
-            ? JoinPath(managedStore.DesktopPath(), FileNameFromPath(item.path))
-            : item.originalDesktopPath;
         const std::wstring itemId = item.id;
         std::wstring destination;
         std::wstring moveError;
@@ -325,20 +375,44 @@ bool DesktopSession::Deactivate(
                 },
                 destination,
                 moveError,
-                nullptr,
+                ownerWindow,
                 !item.hasDesktopPosition)) {
             allSucceeded = false;
             AppendError(errorMessage, FileNameFromPath(item.path), moveError);
             continue;
         }
         if (item.hasDesktopPosition) {
-            requiredPositionPaths.push_back(destination);
-            const auto existing = std::find_if(positions.begin(), positions.end(), [&](const DesktopPosition& value) {
-                return SamePath(value.path, destination);
-            });
-            if (existing == positions.end()) {
-                positions.push_back(DesktopPosition{destination, POINT{item.desktopX, item.desktopY}});
-            }
+            pendingRequiredPaths_.push_back(destination);
+        }
+    }
+    if (!allSucceeded) {
+        pendingRequiredPaths_.clear();
+        return false;
+    }
+
+    restorePrepared_ = true;
+    return true;
+}
+
+bool DesktopSession::RestoreLayout(
+    ConfigStore& configStore,
+    ManagedShortcutStore& managedStore,
+    std::wstring& errorMessage) {
+    errorMessage.clear();
+    if (!restorePrepared_) {
+        errorMessage = L"桌面项目尚未完成归还，未执行坐标恢复。";
+        return false;
+    }
+    AppConfig config = configStore.LoadAppConfig();
+    std::vector<DesktopPosition> positions = StoredDesktopPositions(config, managedStore);
+    for (const ItemConfig& item : config.items) {
+        if (!item.hasDesktopPosition || managedStore.IsManagedPath(item.path)) {
+            continue;
+        }
+        if (std::none_of(positions.begin(), positions.end(), [&](const DesktopPosition& value) {
+                return SamePath(value.path, item.path);
+            })) {
+            positions.push_back(DesktopPosition{item.path, POINT{item.desktopX, item.desktopY}});
         }
     }
 
@@ -346,8 +420,9 @@ bool DesktopSession::Deactivate(
     std::wstring restoreError;
     const bool positionsRestored = desktopLayout.RestorePositions(
         positions,
-        requiredPositionPaths,
+        pendingRequiredPaths_,
         restoreError);
+    bool allSucceeded = positionsRestored;
     if (!positionsRestored) {
         allSucceeded = false;
         if (!errorMessage.empty()) {
@@ -378,5 +453,20 @@ bool DesktopSession::Deactivate(
         allSucceeded = false;
         AppendError(errorMessage, L"桌面布局", finalSnapshotError);
     }
+    if (allSucceeded) {
+        pendingRequiredPaths_.clear();
+        restorePrepared_ = false;
+    }
     return allSucceeded;
+}
+
+bool DesktopSession::Deactivate(
+    ConfigStore& configStore,
+    ManagedShortcutStore& managedStore,
+    std::wstring& errorMessage,
+    HWND ownerWindow) {
+    if (!RestoreItems(configStore, managedStore, errorMessage, ownerWindow)) {
+        return false;
+    }
+    return RestoreLayout(configStore, managedStore, errorMessage);
 }

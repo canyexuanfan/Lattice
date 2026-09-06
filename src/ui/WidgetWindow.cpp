@@ -46,7 +46,7 @@ constexpr UINT kIconDragPollMilliseconds = 16;
 constexpr UINT_PTR kInteractionSaveTimerId = 6;
 constexpr UINT kInteractionSaveDelayMilliseconds = 240;
 constexpr wchar_t kAlignmentGuideClassName[] = L"Lattice.AlignmentGuide";
-constexpr wchar_t kCurrentVersion[] = L"0.4.36";
+constexpr wchar_t kCurrentVersion[] = L"0.4.38";
 constexpr UINT kShellNewCommandFirst = 0x5000;
 constexpr UINT kShellNewCommandLast = 0x5FFF;
 
@@ -3169,6 +3169,27 @@ void WidgetWindow::UpdateHover(POINT point, bool nonClient) {
     hoverHeaderButton_ = nextHeaderButton;
     headerHovered_ = nextHeaderHovered;
     iconGrid_.SetHoverIndex(nextIconIndex);
+    if (!nonClient &&
+        nextIconIndex >= 0 &&
+        draggingIconIndex_ < 0 &&
+        (GetAsyncKeyState(VK_LBUTTON) & 0x8000) == 0 &&
+        !DragGhostWindow::Instance().IsCommitted()) {
+        const DesktopItem* hoverItem = iconGrid_.ItemAt(static_cast<size_t>(nextIconIndex));
+        if (hoverItem != nullptr) {
+            const bool shortcut =
+                hoverItem->kind == DesktopItemKind::Shortcut ||
+                hoverItem->kind == DesktopItemKind::UrlShortcut;
+            DragGhostWindow::Instance().Stage(
+                instance_,
+                hwnd_,
+                hoverItem->path,
+                iconCache_.CopyReadyIconForDrag(hoverItem->path),
+                hoverItem->displayName,
+                shortcut,
+                windowConfig_.iconSize,
+                iconGrid_.SlotSize());
+        }
+    }
     InvalidateRect(hwnd_, nullptr, FALSE);
 }
 

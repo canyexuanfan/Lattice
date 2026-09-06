@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <iterator>
 #include <unordered_set>
+#include <utility>
 
 #include "desktop/DesktopScanner.h"
 #include "desktop/DesktopLayout.h"
@@ -175,13 +176,89 @@ bool UseLightTheme(int theme) {
 
 }  // namespace
 
-MainWindow::MainWindow(HINSTANCE instance)
-    : instance_(instance) {
+MainWindow::MainWindow(
+    HINSTANCE instance,
+    NormalExitHandler normalExitHandler,
+    bool keepRunningOnNormalExitFailure)
+    : instance_(instance),
+      normalExitHandler_(std::move(normalExitHandler)),
+      keepRunningOnNormalExitFailure_(keepRunningOnNormalExitFailure) {
     LoadOrganizerConfig();
     windowConfig_ = organizerConfig_.window;
     if (windowConfig_.collapsed) {
         windowConfig_.height = kTitleHeight + kTabsHeight + 12;
     }
+}
+
+bool MainWindow::DrainPendingDesktopPlacementsForExit(std::wstring& errorMessage) {
+    errorMessage.clear();
+    HandleDesktopPlacementEvents(false);
+    if (!desktopPlacementCoordinator_.DrainFor(5000)) {
+        errorMessage = L"仍有桌面图标定位操作正在进行，请稍后再退出。";
+        return false;
+    }
+    HandleDesktopPlacementEvents(false);
+    return true;
+}
+
+void MainWindow::RequestNormalExit() {
+    if (normalExitInProgress_ || normalExitCompleted_ || hwnd_ == nullptr || IsWindow(hwnd_) == FALSE) {
+        return;
+    }
+    normalExitInProgress_ = true;
+    lastNormalExitError_.clear();
+
+    bool stateSaved = true;
+    for (auto& widget : widgetWindows_) {
+        if (widget != nullptr && widget->IsOpen() && !widget->FlushPendingStateForExit()) {
+            stateSaved = false;
+        }
+    }
+    SaveWindowConfig();
+    if (!ConfigStore::DrainPendingWrites(5000)) {
+        stateSaved = false;
+    }
+
+    std::wstring errorMessage;
+    bool succeeded = stateSaved;
+    if (!stateSaved) {
+        errorMessage = L"无法保存最新的格子位置或图标顺序。现有配置仍保留，请检查磁盘或目录权限后重试。";
+    } else if (!DrainPendingDesktopPlacementsForExit(errorMessage)) {
+        succeeded = false;
+    } else if (!normalExitHandler_) {
+        errorMessage = L"桌面归还服务尚未就绪，程序继续运行且未改变桌面布局。";
+        succeeded = false;
+    } else {
+        succeeded = normalExitHandler_(hwnd_, errorMessage);
+    }
+
+    if (!succeeded) {
+        lastNormalExitError_ = errorMessage;
+        normalExitInProgress_ = false;
+        if (!keepRunningOnNormalExitFailure_) {
+            DestroyWindow(hwnd_);
+            return;
+        }
+        LoadOrganizerConfig();
+        LoadDesktopItems();
+        for (auto& widget : widgetWindows_) {
+            if (widget != nullptr && widget->IsOpen()) {
+                widget->RefreshFromConfig();
+            }
+        }
+        InvalidateRect(hwnd_, nullptr, FALSE);
+        MessageDialog::Show(
+            instance_,
+            hwnd_,
+            (L"Lattice 暂未退出，桌面项目或坐标没有完全恢复：\n\n" + errorMessage +
+             L"\n\n请处理提示的问题后再次退出；格子与当前配置已保留。").c_str(),
+            L"Lattice 桌面布局恢复",
+            MB_OK | MB_ICONWARNING);
+        return;
+    }
+
+    normalExitCompleted_ = true;
+    DestroyWindow(hwnd_);
 }
 
 MainWindow::~MainWindow() {
@@ -451,7 +528,7 @@ LRESULT MainWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
     }
     switch (message) {
         case WM_CLOSE:
-            DestroyWindow(hwnd_);
+            RequestNormalExit();
             return 0;
 
         case WM_CREATE:
@@ -1235,7 +1312,7 @@ LRESULT MainWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
                     MoveCurrentCategory(1);
                     break;
                 case WidgetHostCommand::ExitApplication:
-                    DestroyWindow(hwnd_);
+                    RequestNormalExit();
                     break;
                 case WidgetHostCommand::CheckForUpdates:
                     CheckForUpdates(reinterpret_cast<HWND>(lParam));
@@ -1296,7 +1373,7 @@ LRESULT MainWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
                 return 0;
             }
             if (command == kExitCommand) {
-                DestroyWindow(hwnd_);
+                RequestNormalExit();
                 return 0;
             }
             if (command == kToggleCollapseCommand) {

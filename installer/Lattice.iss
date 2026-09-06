@@ -2,7 +2,7 @@
 ; 先运行 scripts\package.ps1 构建 Release 并调用 ISCC.exe。
 
 #define MyAppName "Lattice"
-#define MyAppVersion "0.4.36"
+#define MyAppVersion "0.4.38"
 #define MyAppPublisher "Lattice"
 #define MyAppExeName "Lattice.exe"
 #define MyAppFolderName "Lattice"
@@ -68,6 +68,7 @@ Name: "{app}\Data"; Permissions: users-modify
 
 [Tasks]
 Name: "startup"; Description: "随 Windows 启动"; GroupDescription: "附加选项："
+Name: "shortcutoverlay"; Description: "统一为 DeskGo 风格的快捷方式箭头"; GroupDescription: "附加选项："
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
@@ -107,6 +108,15 @@ const
   ProductExitPollMilliseconds = 100;
   ProductExitMessageWaitAttempts = 30;
   ProductExitCloseWaitAttempts = 20;
+  ShellIconsKey = 'Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Icons';
+  OverlayBackupKey = 'Software\Lattice\Installer';
+  OverlayValueName = '29';
+  OverlayBackupReadyName = 'ShortcutOverlayBackupReady';
+  OverlayHadOriginalName = 'ShortcutOverlayHadOriginal';
+  OverlayOriginalValueName = 'ShortcutOverlayOriginalValue';
+  OverlayAppliedValueName = 'ShortcutOverlayAppliedValue';
+  SHCNE_ASSOCCHANGED = $08000000;
+  SHCNF_IDLIST = $0000;
 
 function PostMessageW(Wnd: HWND; Msg: Cardinal; WParam: WPARAM; LParam: LPARAM): Boolean;
   external 'PostMessageW@user32.dll stdcall';
@@ -117,6 +127,9 @@ function RegisterWindowMessageW(MessageName: String): Cardinal;
 function GetWindowThreadProcessId(Wnd: HWND; var ProcessId: DWORD): DWORD;
   external 'GetWindowThreadProcessId@user32.dll stdcall';
 
+procedure SHChangeNotify(EventId: LongWord; Flags: LongWord; Item1: LongWord; Item2: LongWord);
+  external 'SHChangeNotify@shell32.dll stdcall';
+
 var
   ProductExitDialogDismissed: Boolean;
   ProductExitProcessId: DWORD;
@@ -125,6 +138,85 @@ var
   ProductConfigSnapshotReady: Boolean;
   DetectedUpdateExitMessageName: String;
   LegacyStartupWasEnabled: Boolean;
+
+function ShortcutOverlayValue: String;
+begin
+  Result := ExpandConstant('{app}\{#MyAppExeName},-102');
+end;
+
+procedure NotifyShortcutOverlayChanged;
+begin
+  SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, 0, 0);
+end;
+
+procedure SnapshotShortcutOverlay;
+var
+  Ready: Cardinal;
+  ExistingValue: String;
+  HadOriginal: Boolean;
+begin
+  Ready := 0;
+  if RegQueryDWordValue(HKCU, OverlayBackupKey, OverlayBackupReadyName, Ready) and
+     (Ready = 1) then
+    exit;
+
+  HadOriginal := RegQueryStringValue(HKCU, ShellIconsKey, OverlayValueName, ExistingValue);
+  if not RegWriteDWordValue(HKCU, OverlayBackupKey, OverlayHadOriginalName, Ord(HadOriginal)) then
+    RaiseException('无法保存原快捷方式箭头状态，安装已停止。');
+  if HadOriginal and
+     not RegWriteStringValue(HKCU, OverlayBackupKey, OverlayOriginalValueName, ExistingValue) then
+    RaiseException('无法保存原快捷方式箭头路径，安装已停止。');
+  if not RegWriteDWordValue(HKCU, OverlayBackupKey, OverlayBackupReadyName, 1) then
+    RaiseException('无法完成快捷方式箭头备份，安装已停止。');
+end;
+
+procedure ApplyShortcutOverlay;
+var
+  AppliedValue: String;
+begin
+  SnapshotShortcutOverlay;
+  AppliedValue := ShortcutOverlayValue;
+  if not RegWriteStringValue(HKCU, ShellIconsKey, OverlayValueName, AppliedValue) then
+    RaiseException('无法应用 Lattice 快捷方式箭头，安装已停止。');
+  if not RegWriteStringValue(HKCU, OverlayBackupKey, OverlayAppliedValueName, AppliedValue) then
+    RaiseException('无法记录 Lattice 快捷方式箭头状态，安装已停止。');
+  NotifyShortcutOverlayChanged;
+end;
+
+procedure RestoreShortcutOverlay;
+var
+  Ready: Cardinal;
+  HadOriginal: Cardinal;
+  CurrentValue: String;
+  AppliedValue: String;
+  OriginalValue: String;
+begin
+  Ready := 0;
+  if not RegQueryDWordValue(HKCU, OverlayBackupKey, OverlayBackupReadyName, Ready) or
+     (Ready <> 1) then
+    exit;
+
+  if RegQueryStringValue(HKCU, OverlayBackupKey, OverlayAppliedValueName, AppliedValue) and
+     RegQueryStringValue(HKCU, ShellIconsKey, OverlayValueName, CurrentValue) and
+     (CompareText(CurrentValue, AppliedValue) = 0) then
+  begin
+    HadOriginal := 0;
+    RegQueryDWordValue(HKCU, OverlayBackupKey, OverlayHadOriginalName, HadOriginal);
+    if (HadOriginal = 1) and
+       RegQueryStringValue(HKCU, OverlayBackupKey, OverlayOriginalValueName, OriginalValue) then
+      RegWriteStringValue(HKCU, ShellIconsKey, OverlayValueName, OriginalValue)
+    else
+      RegDeleteValue(HKCU, ShellIconsKey, OverlayValueName);
+    NotifyShortcutOverlayChanged;
+  end
+  else
+    Log('Shortcut overlay changed outside Lattice; leaving the current user value untouched.');
+
+  RegDeleteValue(HKCU, OverlayBackupKey, OverlayBackupReadyName);
+  RegDeleteValue(HKCU, OverlayBackupKey, OverlayHadOriginalName);
+  RegDeleteValue(HKCU, OverlayBackupKey, OverlayOriginalValueName);
+  RegDeleteValue(HKCU, OverlayBackupKey, OverlayAppliedValueName);
+end;
 
 function SnapshotProductConfig: Boolean;
 begin
@@ -419,5 +511,15 @@ begin
   begin
     RestoreProductConfigSnapshot;
     MigrateLegacyStartupState;
+    if WizardIsTaskSelected('shortcutoverlay') then
+      ApplyShortcutOverlay
+    else
+      RestoreShortcutOverlay;
   end;
+end;
+
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+begin
+  if CurUninstallStep = usUninstall then
+    RestoreShortcutOverlay;
 end;

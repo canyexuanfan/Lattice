@@ -21,15 +21,30 @@
 namespace {
 
 constexpr std::uint32_t kJournalMagic = 0x4F534D44;  // DMSO
-constexpr std::uint32_t kJournalVersion = 1;
+constexpr std::uint32_t kLegacyJournalVersion = 1;
+constexpr std::uint32_t kJournalVersion = 2;
 constexpr std::uint32_t kMaximumJournalStringLength = 32768;
+constexpr std::uint32_t kMaximumJournalEntryCount = 4096;
 constexpr int kLegacyAttributeVisibilityMode = 1;
 constexpr int kNamespaceVisibilityMode = 2;
 constexpr int kOffscreenVisibilityMode = 3;
 
-struct JournalHeader {
+struct LegacyJournalHeader {
+    std::uint32_t magic = kJournalMagic;
+    std::uint32_t version = kLegacyJournalVersion;
+    std::uint32_t itemIdLength = 0;
+    std::uint32_t sourceLength = 0;
+    std::uint32_t destinationLength = 0;
+    std::uint32_t releaseToDesktop = 0;
+};
+
+struct JournalBatchHeader {
     std::uint32_t magic = kJournalMagic;
     std::uint32_t version = kJournalVersion;
+    std::uint32_t entryCount = 0;
+};
+
+struct JournalEntryHeader {
     std::uint32_t itemIdLength = 0;
     std::uint32_t sourceLength = 0;
     std::uint32_t destinationLength = 0;
@@ -477,6 +492,7 @@ ManagedShortcutStore::ManagedShortcutStore(
     std::wstring dataDirectory,
     std::wstring desktopDirectory,
     std::wstring publicDesktopDirectory) {
+    publicDesktopRequiresElevation_ = publicDesktopDirectory.empty();
     rootPath_ = FullPath(JoinPath(std::move(dataDirectory), L"ManagedShortcuts"));
     desktopPath_ = FullPath(std::move(desktopDirectory));
     publicDesktopPath_ = FullPath(
@@ -523,6 +539,10 @@ bool ManagedShortcutStore::IsManagedPath(const std::wstring& path) const {
 
 bool ManagedShortcutStore::IsDesktopPath(const std::wstring& path) const {
     return PathIsInside(path, desktopPath_) || PathIsInside(path, publicDesktopPath_);
+}
+
+bool ManagedShortcutStore::IsPublicDesktopPath(const std::wstring& path) const {
+    return PathIsInside(path, publicDesktopPath_);
 }
 
 bool ManagedShortcutStore::IsShellNamespaceItem(const std::wstring& path) const {
@@ -785,6 +805,177 @@ bool ManagedShortcutStore::MoveToOriginalDesktop(
         notifyShell);
 }
 
+bool ManagedShortcutStore::MoveToOriginalDesktopBatch(
+    const std::vector<OriginalDesktopMoveRequest>& requests,
+    const std::function<bool(const std::vector<std::pair<std::wstring, std::wstring>>&)>& persistDestinations,
+    std::vector<std::pair<std::wstring, std::wstring>>& destinations,
+    std::wstring& errorMessage,
+    HWND ownerWindow) {
+    destinations.clear();
+    errorMessage.clear();
+    if (requests.empty()) {
+        return true;
+    }
+    if (!persistDestinations || ownerWindow == nullptr || IsWindow(ownerWindow) == FALSE) {
+        errorMessage = L"归还共享桌面项目需要仍然有效的 Lattice 窗口；本次未移动任何项目。";
+        return false;
+    }
+
+    std::vector<JournalEntry> journals;
+    journals.reserve(requests.size());
+    for (const OriginalDesktopMoveRequest& request : requests) {
+        JournalEntry journal;
+        journal.itemId = request.itemId;
+        journal.sourcePath = FullPath(request.sourcePath);
+        journal.destinationPath = FullPath(request.destinationPath);
+        journal.releaseToDesktop = true;
+        const DWORD attributes = GetFileAttributesW(journal.sourcePath.c_str());
+        if (journal.itemId.empty() || !IsManagedPath(journal.sourcePath) ||
+            !IsPublicDesktopPath(journal.destinationPath) ||
+            !PathsEqual(ParentDirectory(journal.destinationPath), publicDesktopPath_) ||
+            attributes == INVALID_FILE_ATTRIBUTES) {
+            errorMessage = L"共享桌面批量归还包含无效路径；本次未移动任何项目。";
+            return false;
+        }
+        if (GetFileAttributesW(journal.destinationPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            errorMessage = L"共享桌面的原位置已被占用，未覆盖任何项目：" + journal.destinationPath;
+            return false;
+        }
+        if (std::any_of(journals.begin(), journals.end(), [&](const JournalEntry& value) {
+                return PathsEqual(value.destinationPath, journal.destinationPath) || value.itemId == journal.itemId;
+            })) {
+            errorMessage = L"共享桌面批量归还包含重复目标；本次未移动任何项目。";
+            return false;
+        }
+        journals.push_back(std::move(journal));
+    }
+    if (!WriteJournal(journals, errorMessage)) {
+        return false;
+    }
+
+    Microsoft::WRL::ComPtr<IFileOperation> operation;
+    Microsoft::WRL::ComPtr<IShellItem> destinationFolder;
+    HRESULT result = CoCreateInstance(CLSID_FileOperation, nullptr, CLSCTX_ALL, IID_PPV_ARGS(&operation));
+    if (SUCCEEDED(result)) {
+        result = operation->SetOwnerWindow(ownerWindow);
+    }
+    if (SUCCEEDED(result)) {
+        DWORD flags =
+            FOF_SILENT | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_NOCONFIRMMKDIR |
+            FOFX_EARLYFAILURE;
+        if (publicDesktopRequiresElevation_) {
+            flags |= FOFX_SHOWELEVATIONPROMPT | FOFX_REQUIREELEVATION;
+        }
+        result = operation->SetOperationFlags(flags);
+    }
+    if (SUCCEEDED(result)) {
+        result = SHCreateItemFromParsingName(
+            publicDesktopPath_.c_str(), nullptr, IID_PPV_ARGS(&destinationFolder));
+    }
+    for (size_t index = 0; SUCCEEDED(result) && index < journals.size(); ++index) {
+        Microsoft::WRL::ComPtr<IShellItem> sourceItem;
+        result = SHCreateItemFromParsingName(
+            journals[index].sourcePath.c_str(), nullptr, IID_PPV_ARGS(&sourceItem));
+        if (SUCCEEDED(result)) {
+            result = operation->MoveItem(
+                sourceItem.Get(),
+                destinationFolder.Get(),
+                FileNameFromPath(journals[index].destinationPath).c_str(),
+                nullptr);
+        }
+    }
+    if (SUCCEEDED(result)) {
+        result = operation->PerformOperations();
+    }
+    BOOL aborted = FALSE;
+    if (SUCCEEDED(result)) {
+        result = operation->GetAnyOperationsAborted(&aborted);
+    }
+
+    std::vector<size_t> movedIndexes;
+    bool endpointsUnambiguous = true;
+    for (size_t index = 0; index < journals.size(); ++index) {
+        const bool sourceExists = GetFileAttributesW(journals[index].sourcePath.c_str()) != INVALID_FILE_ATTRIBUTES;
+        const bool destinationExists = GetFileAttributesW(journals[index].destinationPath.c_str()) != INVALID_FILE_ATTRIBUTES;
+        if (!sourceExists && destinationExists) {
+            movedIndexes.push_back(index);
+        } else if (!(sourceExists && !destinationExists)) {
+            endpointsUnambiguous = false;
+        }
+    }
+
+    const auto rollbackMoved = [&]() {
+        bool rolledBack = true;
+        for (auto it = movedIndexes.rbegin(); it != movedIndexes.rend(); ++it) {
+            const JournalEntry& journal = journals[*it];
+            const DWORD attributes = GetFileAttributesW(journal.destinationPath.c_str());
+            DWORD moveError = ERROR_SUCCESS;
+            if (attributes == INVALID_FILE_ATTRIBUTES ||
+                !MovePath(journal.destinationPath, journal.sourcePath, attributes, true, ownerWindow, moveError)) {
+                rolledBack = false;
+                continue;
+            }
+            NotifyShellMove(
+                journal.destinationPath,
+                journal.sourcePath,
+                (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0);
+        }
+        if (rolledBack && endpointsUnambiguous) {
+            ClearJournal();
+        }
+        return rolledBack;
+    };
+
+    if (!endpointsUnambiguous || movedIndexes.size() != journals.size()) {
+        const bool rolledBack = rollbackMoved();
+        DWORD error = ERROR_GEN_FAILURE;
+        if (aborted != FALSE) {
+            error = ERROR_CANCELLED;
+        } else if (FAILED(result) && HRESULT_FACILITY(result) == FACILITY_WIN32) {
+            error = HRESULT_CODE(result);
+        } else if (FAILED(result)) {
+            error = static_cast<DWORD>(result);
+        }
+        errorMessage = ErrorText(
+            rolledBack && endpointsUnambiguous
+                ? L"共享桌面批量归还没有完成，已恢复到退出前状态"
+                : L"共享桌面批量归还没有完成，且自动回滚未完全成功；移动日志已保留",
+            error);
+        return false;
+    }
+
+    destinations.reserve(journals.size());
+    for (size_t index = 0; index < journals.size(); ++index) {
+        destinations.emplace_back(journals[index].itemId, journals[index].destinationPath);
+    }
+    bool persisted = false;
+    try {
+        persisted = persistDestinations(destinations);
+    } catch (...) {
+        persisted = false;
+    }
+    if (!persisted) {
+        const bool rolledBack = rollbackMoved();
+        destinations.clear();
+        errorMessage = rolledBack
+            ? L"无法保存共享桌面归还结果，全部项目已恢复到退出前状态。"
+            : L"无法保存共享桌面归还结果，且自动回滚未完全成功；移动日志已保留。";
+        return false;
+    }
+
+    for (size_t index = 0; index < journals.size(); ++index) {
+        if (requests[index].notifyShell) {
+            const DWORD attributes = GetFileAttributesW(journals[index].destinationPath.c_str());
+            NotifyShellMove(
+                journals[index].sourcePath,
+                journals[index].destinationPath,
+                attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0);
+        }
+    }
+    ClearJournal();
+    return true;
+}
+
 bool ManagedShortcutStore::RemoveRedundantDesktopCopy(
     const std::wstring& managedPath,
     const std::wstring& desktopPath,
@@ -921,24 +1112,31 @@ bool ManagedShortcutStore::ExecuteMove(
 }
 
 bool ManagedShortcutStore::WriteJournal(const JournalEntry& entry, std::wstring& errorMessage) const {
+    return WriteJournal(std::vector<JournalEntry>{entry}, errorMessage);
+}
+
+bool ManagedShortcutStore::WriteJournal(
+    const std::vector<JournalEntry>& entries,
+    std::wstring& errorMessage) const {
     if (!EnsureDirectoryTree(rootPath_)) {
         errorMessage = ErrorText(L"无法创建移动日志目录", GetLastError());
         return false;
     }
-    if (entry.itemId.size() > kMaximumJournalStringLength ||
-        entry.sourcePath.size() > kMaximumJournalStringLength ||
-        entry.destinationPath.size() > kMaximumJournalStringLength) {
-        errorMessage = L"快捷方式路径过长，无法安全记录移动事务。";
+    if (entries.empty() || entries.size() > kMaximumJournalEntryCount) {
+        errorMessage = L"桌面项目移动日志条目数无效。";
         return false;
     }
-
-    JournalHeader header;
-    header.itemIdLength = static_cast<std::uint32_t>(entry.itemId.size());
-    header.sourceLength = static_cast<std::uint32_t>(entry.sourcePath.size());
-    header.destinationLength = static_cast<std::uint32_t>(entry.destinationPath.size());
-    header.releaseToDesktop = entry.releaseToDesktop ? 1u : 0u;
-    const size_t totalSize = sizeof(header) +
-                             (entry.itemId.size() + entry.sourcePath.size() + entry.destinationPath.size()) * sizeof(wchar_t);
+    size_t totalSize = sizeof(JournalBatchHeader);
+    for (const JournalEntry& entry : entries) {
+        if (entry.itemId.size() > kMaximumJournalStringLength ||
+            entry.sourcePath.size() > kMaximumJournalStringLength ||
+            entry.destinationPath.size() > kMaximumJournalStringLength) {
+            errorMessage = L"桌面项目路径过长，无法安全记录移动事务。";
+            return false;
+        }
+        totalSize += sizeof(JournalEntryHeader) +
+            (entry.itemId.size() + entry.sourcePath.size() + entry.destinationPath.size()) * sizeof(wchar_t);
+    }
     if (totalSize > (std::numeric_limits<DWORD>::max)()) {
         errorMessage = L"快捷方式移动日志过大。";
         return false;
@@ -949,10 +1147,20 @@ bool ManagedShortcutStore::WriteJournal(const JournalEntry& entry, std::wstring&
         std::memcpy(bytes.data() + offset, data, size);
         offset += size;
     };
+    JournalBatchHeader header;
+    header.entryCount = static_cast<std::uint32_t>(entries.size());
     append(&header, sizeof(header));
-    append(entry.itemId.data(), entry.itemId.size() * sizeof(wchar_t));
-    append(entry.sourcePath.data(), entry.sourcePath.size() * sizeof(wchar_t));
-    append(entry.destinationPath.data(), entry.destinationPath.size() * sizeof(wchar_t));
+    for (const JournalEntry& entry : entries) {
+        JournalEntryHeader entryHeader;
+        entryHeader.itemIdLength = static_cast<std::uint32_t>(entry.itemId.size());
+        entryHeader.sourceLength = static_cast<std::uint32_t>(entry.sourcePath.size());
+        entryHeader.destinationLength = static_cast<std::uint32_t>(entry.destinationPath.size());
+        entryHeader.releaseToDesktop = entry.releaseToDesktop ? 1u : 0u;
+        append(&entryHeader, sizeof(entryHeader));
+        append(entry.itemId.data(), entry.itemId.size() * sizeof(wchar_t));
+        append(entry.sourcePath.data(), entry.sourcePath.size() * sizeof(wchar_t));
+        append(entry.destinationPath.data(), entry.destinationPath.size() * sizeof(wchar_t));
+    }
     if (!WriteBytes(journalTempPath_, bytes.data(), static_cast<DWORD>(bytes.size()), errorMessage)) {
         return false;
     }
@@ -968,37 +1176,102 @@ bool ManagedShortcutStore::WriteJournal(const JournalEntry& entry, std::wstring&
     return true;
 }
 
-bool ManagedShortcutStore::ReadJournal(JournalEntry& entry, std::wstring& errorMessage) const {
+bool ManagedShortcutStore::ReadJournal(
+    std::vector<JournalEntry>& entries,
+    std::wstring& errorMessage) const {
+    entries.clear();
     std::vector<unsigned char> bytes;
-    if (!ReadBytes(journalPath_, bytes, errorMessage) || bytes.size() < sizeof(JournalHeader)) {
-        if (bytes.size() < sizeof(JournalHeader) && errorMessage.empty()) {
+    if (!ReadBytes(journalPath_, bytes, errorMessage) || bytes.size() < sizeof(JournalBatchHeader)) {
+        if (bytes.size() < sizeof(JournalBatchHeader) && errorMessage.empty()) {
             errorMessage = L"快捷方式移动日志已损坏。";
         }
         return false;
     }
-    JournalHeader header{};
-    std::memcpy(&header, bytes.data(), sizeof(header));
-    if (header.magic != kJournalMagic || header.version != kJournalVersion ||
-        header.itemIdLength > kMaximumJournalStringLength ||
-        header.sourceLength > kMaximumJournalStringLength ||
-        header.destinationLength > kMaximumJournalStringLength ||
-        header.releaseToDesktop > 1) {
+    std::uint32_t magic = 0;
+    std::uint32_t version = 0;
+    std::memcpy(&magic, bytes.data(), sizeof(magic));
+    std::memcpy(&version, bytes.data() + sizeof(magic), sizeof(version));
+    if (magic != kJournalMagic) {
         errorMessage = L"快捷方式移动日志格式无效。";
         return false;
     }
-    const size_t characterCount = static_cast<size_t>(header.itemIdLength) + header.sourceLength + header.destinationLength;
-    const size_t expectedSize = sizeof(header) + characterCount * sizeof(wchar_t);
-    if (expectedSize != bytes.size()) {
-        errorMessage = L"快捷方式移动日志长度无效。";
+    if (version == kLegacyJournalVersion) {
+        if (bytes.size() < sizeof(LegacyJournalHeader)) {
+            errorMessage = L"旧版桌面项目移动日志已损坏。";
+            return false;
+        }
+        LegacyJournalHeader header{};
+        std::memcpy(&header, bytes.data(), sizeof(header));
+        if (header.itemIdLength > kMaximumJournalStringLength ||
+            header.sourceLength > kMaximumJournalStringLength ||
+            header.destinationLength > kMaximumJournalStringLength || header.releaseToDesktop > 1) {
+            errorMessage = L"旧版桌面项目移动日志格式无效。";
+            return false;
+        }
+        const size_t characterCount = static_cast<size_t>(header.itemIdLength) + header.sourceLength + header.destinationLength;
+        if (sizeof(header) + characterCount * sizeof(wchar_t) != bytes.size()) {
+            errorMessage = L"旧版桌面项目移动日志长度无效。";
+            return false;
+        }
+        const wchar_t* characters = reinterpret_cast<const wchar_t*>(bytes.data() + sizeof(header));
+        JournalEntry entry;
+        entry.itemId.assign(characters, header.itemIdLength);
+        characters += header.itemIdLength;
+        entry.sourcePath.assign(characters, header.sourceLength);
+        characters += header.sourceLength;
+        entry.destinationPath.assign(characters, header.destinationLength);
+        entry.releaseToDesktop = header.releaseToDesktop != 0;
+        entries.push_back(std::move(entry));
+        return true;
+    }
+    if (version != kJournalVersion) {
+        errorMessage = L"桌面项目移动日志版本不受支持。";
         return false;
     }
-    const wchar_t* characters = reinterpret_cast<const wchar_t*>(bytes.data() + sizeof(header));
-    entry.itemId.assign(characters, header.itemIdLength);
-    characters += header.itemIdLength;
-    entry.sourcePath.assign(characters, header.sourceLength);
-    characters += header.sourceLength;
-    entry.destinationPath.assign(characters, header.destinationLength);
-    entry.releaseToDesktop = header.releaseToDesktop != 0;
+    JournalBatchHeader header{};
+    std::memcpy(&header, bytes.data(), sizeof(header));
+    if (header.entryCount == 0 || header.entryCount > kMaximumJournalEntryCount) {
+        errorMessage = L"桌面项目移动日志条目数无效。";
+        return false;
+    }
+    size_t offset = sizeof(header);
+    for (std::uint32_t index = 0; index < header.entryCount; ++index) {
+        if (offset > bytes.size() || bytes.size() - offset < sizeof(JournalEntryHeader)) {
+            errorMessage = L"桌面项目移动日志长度无效。";
+            return false;
+        }
+        JournalEntryHeader entryHeader{};
+        std::memcpy(&entryHeader, bytes.data() + offset, sizeof(entryHeader));
+        offset += sizeof(entryHeader);
+        if (entryHeader.itemIdLength > kMaximumJournalStringLength ||
+            entryHeader.sourceLength > kMaximumJournalStringLength ||
+            entryHeader.destinationLength > kMaximumJournalStringLength ||
+            entryHeader.releaseToDesktop > 1) {
+            errorMessage = L"桌面项目移动日志条目无效。";
+            return false;
+        }
+        const size_t characterCount = static_cast<size_t>(entryHeader.itemIdLength) +
+            entryHeader.sourceLength + entryHeader.destinationLength;
+        const size_t byteCount = characterCount * sizeof(wchar_t);
+        if (offset > bytes.size() || byteCount > bytes.size() - offset) {
+            errorMessage = L"桌面项目移动日志长度无效。";
+            return false;
+        }
+        const wchar_t* characters = reinterpret_cast<const wchar_t*>(bytes.data() + offset);
+        JournalEntry entry;
+        entry.itemId.assign(characters, entryHeader.itemIdLength);
+        characters += entryHeader.itemIdLength;
+        entry.sourcePath.assign(characters, entryHeader.sourceLength);
+        characters += entryHeader.sourceLength;
+        entry.destinationPath.assign(characters, entryHeader.destinationLength);
+        entry.releaseToDesktop = entryHeader.releaseToDesktop != 0;
+        entries.push_back(std::move(entry));
+        offset += byteCount;
+    }
+    if (offset != bytes.size()) {
+        errorMessage = L"桌面项目移动日志包含多余数据。";
+        return false;
+    }
     return true;
 }
 
@@ -1007,65 +1280,53 @@ bool ManagedShortcutStore::ClearJournal() const {
     return DeleteFileW(journalPath_.c_str()) != FALSE || GetLastError() == ERROR_FILE_NOT_FOUND;
 }
 
-bool ManagedShortcutStore::RecoverPending(const AppConfig& config, std::wstring& errorMessage) {
+bool ManagedShortcutStore::RecoverPending(ConfigStore& configStore, std::wstring& errorMessage) {
     errorMessage.clear();
     if (GetFileAttributesW(journalPath_.c_str()) == INVALID_FILE_ATTRIBUTES) {
         return true;
     }
-    JournalEntry journal;
-    if (!ReadJournal(journal, errorMessage)) {
+    std::vector<JournalEntry> journals;
+    if (!ReadJournal(journals, errorMessage)) {
         return false;
     }
-    const bool safeEndpoints =
-        (PathIsInside(journal.sourcePath, rootPath_) || IsDesktopPath(journal.sourcePath)) &&
-        (PathIsInside(journal.destinationPath, rootPath_) || IsDesktopPath(journal.destinationPath)) &&
-        (PathIsInside(journal.sourcePath, rootPath_) || PathIsInside(journal.destinationPath, rootPath_));
-    if (!safeEndpoints) {
-        errorMessage = L"移动日志中的路径超出应用托管目录和桌面，已停止自动恢复。";
+    AppConfig config = configStore.LoadAppConfig();
+    bool configChanged = false;
+    for (const JournalEntry& journal : journals) {
+        const bool safeEndpoints =
+            (PathIsInside(journal.sourcePath, rootPath_) || IsDesktopPath(journal.sourcePath)) &&
+            (PathIsInside(journal.destinationPath, rootPath_) || IsDesktopPath(journal.destinationPath)) &&
+            (PathIsInside(journal.sourcePath, rootPath_) || PathIsInside(journal.destinationPath, rootPath_));
+        if (!safeEndpoints) {
+            errorMessage = L"移动日志中的路径超出应用托管目录和桌面，已停止自动恢复。";
+            return false;
+        }
+        const bool sourceExists = GetFileAttributesW(journal.sourcePath.c_str()) != INVALID_FILE_ATTRIBUTES;
+        const bool destinationExists = GetFileAttributesW(journal.destinationPath.c_str()) != INVALID_FILE_ATTRIBUTES;
+        if (sourceExists && destinationExists) {
+            errorMessage = L"移动事务的原位置和目标位置同时存在，已保留日志并停止自动覆盖。";
+            return false;
+        }
+        if (!sourceExists && !destinationExists) {
+            errorMessage = L"移动事务的原位置和目标位置都不存在，已保留日志等待人工确认。";
+            return false;
+        }
+        auto registered = std::find_if(config.items.begin(), config.items.end(), [&](const ItemConfig& item) {
+            return item.id == journal.itemId;
+        });
+        if (!sourceExists && destinationExists && registered != config.items.end() &&
+            !PathsEqual(registered->path, journal.destinationPath)) {
+            registered->path = journal.destinationPath;
+            configChanged = true;
+        } else if (sourceExists && !destinationExists && registered != config.items.end() &&
+                   !PathsEqual(registered->path, journal.sourcePath)) {
+            registered->path = journal.sourcePath;
+            configChanged = true;
+        }
+    }
+    if (configChanged && !configStore.SaveAppConfig(config)) {
+        errorMessage = L"移动已经完成，但无法把实际文件位置写入配置；移动日志已保留。";
         return false;
     }
-
-    const auto registered = std::find_if(config.items.begin(), config.items.end(), [&](const ItemConfig& item) {
-        return item.id == journal.itemId;
-    });
-    const bool configCommitted = journal.releaseToDesktop
-        ? registered == config.items.end() || PathsEqual(registered->path, journal.destinationPath)
-        : registered != config.items.end() && PathsEqual(registered->path, journal.destinationPath);
-    if (configCommitted) {
-        ClearJournal();
-        return true;
-    }
-
-    const bool sourceExists = GetFileAttributesW(journal.sourcePath.c_str()) != INVALID_FILE_ATTRIBUTES;
-    const bool destinationExists = GetFileAttributesW(journal.destinationPath.c_str()) != INVALID_FILE_ATTRIBUTES;
-    if (!destinationExists) {
-        ClearJournal();
-        return true;
-    }
-    if (sourceExists) {
-        errorMessage = L"移动事务的原位置和目标位置同时存在，已保留日志并停止自动覆盖。";
-        return false;
-    }
-    const DWORD destinationAttributes = GetFileAttributesW(journal.destinationPath.c_str());
-    DWORD recoveryMoveError = ERROR_SUCCESS;
-    const bool allowElevation =
-        PathIsInside(journal.sourcePath, publicDesktopPath_) ||
-        PathIsInside(journal.destinationPath, publicDesktopPath_);
-    if (!MovePath(
-            journal.destinationPath,
-            journal.sourcePath,
-            destinationAttributes,
-            allowElevation,
-            nullptr,
-            recoveryMoveError)) {
-        errorMessage = ErrorText(L"启动时恢复桌面项目失败", recoveryMoveError);
-        return false;
-    }
-    const DWORD restoredAttributes = GetFileAttributesW(journal.sourcePath.c_str());
-    NotifyShellMove(
-        journal.destinationPath,
-        journal.sourcePath,
-        restoredAttributes != INVALID_FILE_ATTRIBUTES && (restoredAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0);
     ClearJournal();
     return true;
 }

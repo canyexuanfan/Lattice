@@ -1,4 +1,6 @@
 #include <Windows.h>
+#include <commctrl.h>
+#include <commoncontrols.h>
 #include <dwmapi.h>
 #include <d3d11.h>
 #include <dxgi1_2.h>
@@ -29,6 +31,7 @@
 #include <vector>
 
 #include "app/App.h"
+#include "app/resource.h"
 #include "app/UpdateService.h"
 #include "config/ConfigStore.h"
 #include "desktop/DesktopScanner.h"
@@ -37,6 +40,7 @@
 #include "desktop/CategoryStorageManager.h"
 #include "desktop/ManagedShortcutStore.h"
 #include "desktop/DesktopSession.h"
+#include "rendering/IconCache.h"
 #include "shell/ShellDropTarget.h"
 #include "ui/InputDialog.h"
 #include "ui/DragGhostWindow.h"
@@ -445,6 +449,109 @@ bool CaptureScreenPixels(
         pixels.clear();
     }
     return succeeded;
+}
+
+bool CaptureIconPixels(
+    HICON icon,
+    std::vector<std::uint32_t>& pixels) {
+    constexpr int size = 64;
+    if (icon == nullptr) {
+        return false;
+    }
+
+    BITMAPINFO info{};
+    info.bmiHeader.biSize = sizeof(info.bmiHeader);
+    info.bmiHeader.biWidth = size;
+    info.bmiHeader.biHeight = -size;
+    info.bmiHeader.biPlanes = 1;
+    info.bmiHeader.biBitCount = 32;
+    info.bmiHeader.biCompression = BI_RGB;
+
+    void* bitmapPixels = nullptr;
+    HDC memory = CreateCompatibleDC(nullptr);
+    HBITMAP bitmap = memory == nullptr
+        ? nullptr
+        : CreateDIBSection(
+              memory,
+              &info,
+              DIB_RGB_COLORS,
+              &bitmapPixels,
+              nullptr,
+              0);
+    HGDIOBJ previous = bitmap == nullptr
+        ? nullptr
+        : SelectObject(memory, bitmap);
+    bool succeeded = false;
+    if (previous != nullptr && bitmapPixels != nullptr) {
+        auto* first = static_cast<std::uint32_t*>(bitmapPixels);
+        std::fill(first, first + size * size, 0);
+        succeeded = DrawIconEx(
+            memory,
+            0,
+            0,
+            icon,
+            48,
+            48,
+            0,
+            nullptr,
+            DI_NORMAL) != FALSE;
+        if (succeeded) {
+            pixels.assign(first, first + size * size);
+        }
+    }
+
+    if (previous != nullptr) {
+        SelectObject(memory, previous);
+    }
+    if (bitmap != nullptr) {
+        DeleteObject(bitmap);
+    }
+    if (memory != nullptr) {
+        DeleteDC(memory);
+    }
+    if (!succeeded) {
+        pixels.clear();
+    }
+    return succeeded;
+}
+
+HICON LoadSmokeShellIcon(
+    const std::wstring& path,
+    bool includeOverlay,
+    int* overlayIndex) {
+    SHFILEINFOW fileInfo{};
+    const UINT flags = SHGFI_ICON | SHGFI_SYSICONINDEX |
+        SHGFI_ADDOVERLAYS | SHGFI_OVERLAYINDEX;
+    if (SHGetFileInfoW(
+            path.c_str(),
+            0,
+            &fileInfo,
+            sizeof(fileInfo),
+            flags) == 0) {
+        return nullptr;
+    }
+
+    const int imageIndex = fileInfo.iIcon & 0x00FFFFFF;
+    const int resolvedOverlayIndex = (fileInfo.iIcon >> 24) & 0xFF;
+    if (overlayIndex != nullptr) {
+        *overlayIndex = resolvedOverlayIndex;
+    }
+    Microsoft::WRL::ComPtr<IImageList> imageList;
+    HICON result = nullptr;
+    if (SUCCEEDED(SHGetImageList(
+            SHIL_EXTRALARGE,
+            IID_PPV_ARGS(imageList.GetAddressOf()))) &&
+        imageList != nullptr) {
+        const UINT imageFlags = ILD_TRANSPARENT |
+            (includeOverlay && resolvedOverlayIndex > 0
+                ? INDEXTOOVERLAYMASK(resolvedOverlayIndex)
+                : 0);
+        imageList->GetIcon(imageIndex, imageFlags, &result);
+    }
+    if (fileInfo.hIcon != nullptr) {
+        DestroyIcon(fileInfo.hIcon);
+    }
+    return result;
 }
 
 size_t CountVisiblePixelDifferences(
@@ -1022,6 +1129,8 @@ int RunSmokeManagedItems() {
     const std::filesystem::path sourceUrl = desktopDirectory / L"测试网址.url";
     const std::filesystem::path publicShortcut = publicDesktopDirectory / L"公共快捷方式.lnk";
     const std::filesystem::path publicFolder = publicDesktopDirectory / L"公共资料文件夹";
+    const std::filesystem::path publicBatchA = publicDesktopDirectory / L"公共批量一.lnk";
+    const std::filesystem::path publicBatchB = publicDesktopDirectory / L"公共批量二.lnk";
     const std::filesystem::path externalFile = testRoot / L"外部引用.txt";
     {
         std::ofstream file(externalFile, std::ios::binary);
@@ -1221,6 +1330,60 @@ int RunSmokeManagedItems() {
         return fail(L"Public Desktop folder exact restore failed: " + moveError);
     }
 
+    {
+        std::ofstream first(publicBatchA, std::ios::binary);
+        std::ofstream second(publicBatchB, std::ios::binary);
+        first << "public batch a";
+        second << "public batch b";
+    }
+    std::wstring managedPublicBatchA;
+    std::wstring managedPublicBatchB;
+    if (!store.MoveIntoCategory(
+            L"smoke-public-batch-a",
+            publicBatchA.wstring(),
+            L"smoke-category",
+            [](const std::wstring&) { return true; },
+            managedPublicBatchA,
+            moveError) ||
+        !store.MoveIntoCategory(
+            L"smoke-public-batch-b",
+            publicBatchB.wstring(),
+            L"smoke-category",
+            [](const std::wstring&) { return true; },
+            managedPublicBatchB,
+            moveError)) {
+        return fail(L"Public Desktop batch setup failed: " + moveError);
+    }
+    HWND batchOwner = CreateWindowExW(
+        0, L"STATIC", L"Lattice batch smoke owner", WS_POPUP,
+        0, 0, 1, 1, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    if (batchOwner == nullptr) {
+        return fail(L"Public Desktop batch owner creation failed");
+    }
+    int batchPersistCalls = 0;
+    std::vector<std::pair<std::wstring, std::wstring>> batchDestinations;
+    const bool batchMoved = store.MoveToOriginalDesktopBatch(
+        {
+            {L"smoke-public-batch-a", managedPublicBatchA, publicBatchA.wstring(), true},
+            {L"smoke-public-batch-b", managedPublicBatchB, publicBatchB.wstring(), true},
+        },
+        [&](const std::vector<std::pair<std::wstring, std::wstring>>& moved) {
+            ++batchPersistCalls;
+            return moved.size() == 2;
+        },
+        batchDestinations,
+        moveError,
+        batchOwner);
+    DestroyWindow(batchOwner);
+    if (!batchMoved || batchPersistCalls != 1 || batchDestinations.size() != 2 ||
+        std::filesystem::exists(managedPublicBatchA) ||
+        std::filesystem::exists(managedPublicBatchB) ||
+        !std::filesystem::exists(publicBatchA) ||
+        !std::filesystem::exists(publicBatchB) ||
+        std::filesystem::exists(dataDirectory / L"ManagedShortcuts" / L"move-journal.bin")) {
+        return fail(L"Public Desktop batch transaction failed: " + moveError);
+    }
+
     std::wstring managedFolder;
     if (!store.MoveIntoCategory(
             L"smoke-folder",
@@ -1252,6 +1415,155 @@ int RunSmokeManagedItems() {
         return 1;
     }
     std::wcout << L"Ordinary and Public Desktop unique-original transactions passed\n";
+    return 0;
+}
+
+int RunSmokeShortcutOverlay(HINSTANCE instance) {
+    AttachParentConsole();
+    wchar_t notifyValue[2]{};
+    if (GetEnvironmentVariableW(
+            L"LATTICE_SMOKE_NOTIFY_SHORTCUT_OVERLAY",
+            notifyValue,
+            ARRAYSIZE(notifyValue)) == 1 &&
+        notifyValue[0] == L'1') {
+        SHChangeNotify(
+            SHCNE_ASSOCCHANGED,
+            SHCNF_IDLIST,
+            nullptr,
+            nullptr);
+    }
+    const DWORD required = GetEnvironmentVariableW(
+        L"DESKTOP_ORGANIZER_SMOKE_ITEMS_DIR",
+        nullptr,
+        0);
+    if (required == 0) {
+        std::wcerr << L"Explicit shortcut overlay smoke directory is required\n";
+        return 1;
+    }
+    std::wstring baseValue(required, L'\0');
+    const DWORD copied = GetEnvironmentVariableW(
+        L"DESKTOP_ORGANIZER_SMOKE_ITEMS_DIR",
+        baseValue.data(),
+        required);
+    if (copied == 0 || copied >= required) {
+        std::wcerr << L"Shortcut overlay smoke directory is invalid\n";
+        return 1;
+    }
+    baseValue.resize(copied);
+
+    std::error_code fileError;
+    const std::filesystem::path testRoot =
+        std::filesystem::absolute(baseValue).lexically_normal() /
+        (L"shortcut-overlay-" + std::to_wstring(GetCurrentProcessId()));
+    if (!std::filesystem::create_directories(testRoot, fileError) || fileError) {
+        std::wcerr << L"Shortcut overlay smoke directory setup failed\n";
+        return 1;
+    }
+
+    wchar_t executablePath[MAX_PATH]{};
+    if (GetModuleFileNameW(instance, executablePath, ARRAYSIZE(executablePath)) == 0) {
+        std::wcerr << L"Unable to resolve smoke executable path\n";
+        return 1;
+    }
+    const std::filesystem::path shortcutPath = testRoot / L"Lattice smoke.lnk";
+    Microsoft::WRL::ComPtr<IShellLinkW> shellLink;
+    Microsoft::WRL::ComPtr<IPersistFile> persistFile;
+    if (FAILED(CoCreateInstance(
+            CLSID_ShellLink,
+            nullptr,
+            CLSCTX_INPROC_SERVER,
+            IID_PPV_ARGS(shellLink.GetAddressOf()))) ||
+        shellLink == nullptr ||
+        FAILED(shellLink->SetPath(executablePath)) ||
+        FAILED(shellLink.As(&persistFile)) ||
+        persistFile == nullptr ||
+        FAILED(persistFile->Save(shortcutPath.c_str(), TRUE))) {
+        std::wcerr << L"Unable to create shortcut overlay fixture\n";
+        return 1;
+    }
+
+    int overlayIndex = 0;
+    HICON baseIcon = LoadSmokeShellIcon(shortcutPath.wstring(), false, nullptr);
+    HICON expectedIcon = LoadSmokeShellIcon(
+        shortcutPath.wstring(),
+        true,
+        &overlayIndex);
+    if (baseIcon == nullptr || expectedIcon == nullptr || overlayIndex <= 0) {
+        if (baseIcon != nullptr) {
+            DestroyIcon(baseIcon);
+        }
+        if (expectedIcon != nullptr) {
+            DestroyIcon(expectedIcon);
+        }
+        std::wcerr << L"Windows Shell did not expose a shortcut overlay\n";
+        return 1;
+    }
+
+    int ordinaryOverlayIndex = -1;
+    HICON ordinaryIcon = LoadSmokeShellIcon(
+        executablePath,
+        true,
+        &ordinaryOverlayIndex);
+    if (ordinaryIcon == nullptr || ordinaryOverlayIndex != 0) {
+        if (ordinaryIcon != nullptr) {
+            DestroyIcon(ordinaryIcon);
+        }
+        DestroyIcon(baseIcon);
+        DestroyIcon(expectedIcon);
+        std::wcerr << L"Ordinary files must not receive a shortcut overlay\n";
+        return 1;
+    }
+    DestroyIcon(ordinaryIcon);
+
+    IconCache iconCache;
+    iconCache.Preload(shortcutPath.wstring());
+    HICON cachedIcon = nullptr;
+    const ULONGLONG deadline = GetTickCount64() + 3000;
+    while (cachedIcon == nullptr && GetTickCount64() < deadline) {
+        Sleep(10);
+        cachedIcon = iconCache.CopyReadyIconForDrag(shortcutPath.wstring());
+    }
+
+    std::vector<std::uint32_t> basePixels;
+    std::vector<std::uint32_t> expectedPixels;
+    std::vector<std::uint32_t> cachedPixels;
+    const bool captured =
+        CaptureIconPixels(baseIcon, basePixels) &&
+        CaptureIconPixels(expectedIcon, expectedPixels) &&
+        CaptureIconPixels(cachedIcon, cachedPixels);
+    DestroyIcon(baseIcon);
+    DestroyIcon(expectedIcon);
+    if (cachedIcon != nullptr) {
+        DestroyIcon(cachedIcon);
+    }
+    if (!captured ||
+        basePixels == expectedPixels ||
+        cachedPixels != expectedPixels) {
+        std::wcerr << L"Lattice shortcut icon is not the Shell-composited icon\n";
+        return 1;
+    }
+
+    HICON resourceIcon = static_cast<HICON>(LoadImageW(
+        instance,
+        MAKEINTRESOURCEW(IDI_SHORTCUT_OVERLAY),
+        IMAGE_ICON,
+        24,
+        24,
+        LR_DEFAULTCOLOR));
+    if (resourceIcon == nullptr) {
+        std::wcerr << L"Shortcut overlay resource 102 is unavailable\n";
+        return 1;
+    }
+    DestroyIcon(resourceIcon);
+
+    std::filesystem::remove_all(testRoot, fileError);
+    if (fileError) {
+        std::wcerr << L"Unable to clean shortcut overlay smoke fixture\n";
+        return 1;
+    }
+    std::wcout << L"Shortcut overlay index: " << overlayIndex << L"\n";
+    std::wcout << L"Ordinary file overlay index: " << ordinaryOverlayIndex << L"\n";
+    std::wcout << L"Shortcut overlay shell composition: PASS\n";
     return 0;
 }
 
@@ -2284,6 +2596,7 @@ int RunSmokeWidgetInteraction(HINSTANCE instance) {
     }
     const LPARAM sourcePoint = MAKELPARAM(dip(43), dip(89));
     const LPARAM targetPoint = MAKELPARAM(dip(123), dip(89));
+    SendMessageW(categoryWindow, WM_MOUSEMOVE, 0, sourcePoint);
     const auto dragPrepareStart = std::chrono::steady_clock::now();
     SendMessageW(categoryWindow, WM_LBUTTONDOWN, MK_LBUTTON, sourcePoint);
     const auto dragPrepareMilliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -2597,6 +2910,30 @@ int RunSmokeWidgetNormalExit(HINSTANCE instance) {
     const ULONGLONG exitStartedAt = GetTickCount64();
     const int runResult = app.Run();
     const ULONGLONG exitElapsedMilliseconds = GetTickCount64() - exitStartedAt;
+    if (!app.LastNormalExitError().empty()) {
+        const std::filesystem::path diagnosticPath = testRoot / L"exit-error-utf16.txt";
+        HANDLE diagnostic = CreateFileW(
+            diagnosticPath.c_str(),
+            GENERIC_WRITE,
+            FILE_SHARE_READ,
+            nullptr,
+            CREATE_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL,
+            nullptr);
+        if (diagnostic != INVALID_HANDLE_VALUE) {
+            const std::wstring& error = app.LastNormalExitError();
+            DWORD written = 0;
+            WriteFile(
+                diagnostic,
+                error.data(),
+                static_cast<DWORD>(error.size() * sizeof(wchar_t)),
+                &written,
+                nullptr);
+            CloseHandle(diagnostic);
+        }
+        std::wcerr << L"Normal exit reported: " << app.LastNormalExitError() << L"\n";
+        return 94;
+    }
     if (runResult != 0) {
         return fail(L"Widget normal-exit app loop returned failure", 88);
     }
@@ -4459,6 +4796,9 @@ std::optional<int> RunSmokeOrPreviewCommand(
     }
     if (HasArgument(commandLine, L"--smoke-category-storage")) {
         return RunSmokeCategoryStorage();
+    }
+    if (HasArgument(commandLine, L"--smoke-shortcut-overlay")) {
+        return RunSmokeShortcutOverlay(instance);
     }
     if (HasArgument(commandLine, L"--smoke-widget-alignment")) {
         return RunSmokeWidgetAlignment(instance);

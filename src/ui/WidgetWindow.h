@@ -59,6 +59,7 @@ public:
     bool IsVisible() const noexcept { return IsOpen() && IsWindowVisible(hwnd_) != FALSE; }
     bool IsForCategory(const std::wstring& categoryId) const noexcept { return categoryId_ == categoryId; }
     bool HasShellDropTarget() const noexcept { return shellDropTargetRegistered_; }
+    bool FlushPendingStateForExit() { return FlushPendingInteractionSave(); }
 
 private:
     friend struct WidgetWindowSmokeAccess;

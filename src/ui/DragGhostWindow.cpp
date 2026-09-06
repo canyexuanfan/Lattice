@@ -48,8 +48,25 @@ void DragGhostWindow::Stage(
     bool shortcut,
     int iconSizeDip,
     SIZE slotSizeDip) {
-    End();
+    const SIZE previousSize = windowSizePixels_;
+    const UINT previousDpi = dpi_;
     ConfigureGeometry(sourceWindow, iconSizeDip, slotSizeDip);
+    const bool canReuseStagedFrame =
+        staged_ &&
+        stagedContentKey_ == contentKey &&
+        displayName_ == displayName &&
+        shortcut_ == shortcut &&
+        previousDpi == dpi_ &&
+        previousSize.cx == windowSizePixels_.cx &&
+        previousSize.cy == windowSizePixels_.cy;
+    if (canReuseStagedFrame) {
+        if (preparedIcon != nullptr) {
+            DestroyIcon(preparedIcon);
+        }
+        return;
+    }
+
+    End();
     if (!EnsureWindow(instance)) {
         if (preparedIcon != nullptr) {
             DestroyIcon(preparedIcon);

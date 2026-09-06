@@ -88,6 +88,7 @@ try {
         "--smoke-shell-new",
         "--smoke-managed-items",
         "--smoke-category-storage",
+        "--smoke-shortcut-overlay",
         "--smoke-widget-alignment",
         "--smoke-widget-desktop-layer",
         "--smoke-widget-interaction",

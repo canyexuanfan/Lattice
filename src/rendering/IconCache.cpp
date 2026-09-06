@@ -123,7 +123,8 @@ bool HasActiveFailedIconBackoffLocked(
 
 HICON LoadShellIcon(const std::wstring& path) {
     SHFILEINFOW fileInfo{};
-    constexpr UINT flags = SHGFI_ICON | SHGFI_SYSICONINDEX;
+    constexpr UINT flags = SHGFI_ICON | SHGFI_SYSICONINDEX |
+        SHGFI_ADDOVERLAYS | SHGFI_OVERLAYINDEX;
     PIDLIST_ABSOLUTE pidl = nullptr;
     const bool namespaceItem = GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES &&
         SUCCEEDED(SHParseDisplayName(path.c_str(), nullptr, &pidl, 0, nullptr)) && pidl != nullptr;
@@ -137,13 +138,16 @@ HICON LoadShellIcon(const std::wstring& path) {
     }
 
     const int imageIndex = fileInfo.iIcon & 0x00FFFFFF;
+    const int overlayIndex = (fileInfo.iIcon >> 24) & 0xFF;
     Microsoft::WRL::ComPtr<IImageList> imageList;
     HICON shellIcon = nullptr;
     if (SUCCEEDED(SHGetImageList(
             SHIL_EXTRALARGE,
             IID_PPV_ARGS(imageList.GetAddressOf()))) &&
         imageList != nullptr) {
-        imageList->GetIcon(imageIndex, ILD_TRANSPARENT, &shellIcon);
+        const UINT imageFlags = ILD_TRANSPARENT |
+            (overlayIndex > 0 ? INDEXTOOVERLAYMASK(overlayIndex) : 0);
+        imageList->GetIcon(imageIndex, imageFlags, &shellIcon);
     }
 
     if (shellIcon != nullptr) {
@@ -166,7 +170,8 @@ HICON LoadShellIconWithFallback(const std::wstring& path) {
     const bool namespaceItem = GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES &&
         SUCCEEDED(SHParseDisplayName(path.c_str(), nullptr, &pidl, 0, nullptr)) && pidl != nullptr;
     const DWORD_PTR fallbackResult = SHGetFileInfoW(namespaceItem ? reinterpret_cast<LPCWSTR>(pidl) : path.c_str(), 0,
-        &fallbackInfo, sizeof(fallbackInfo), SHGFI_ICON | SHGFI_LARGEICON | SHGFI_SHELLICONSIZE |
+        &fallbackInfo, sizeof(fallbackInfo), SHGFI_ICON | SHGFI_LARGEICON |
+        SHGFI_SHELLICONSIZE | SHGFI_ADDOVERLAYS |
         (namespaceItem ? SHGFI_PIDL : 0));
     if (pidl != nullptr) {
         CoTaskMemFree(pidl);
@@ -214,17 +219,6 @@ std::vector<std::uint32_t> BuildFolderPlaceholderPixels() {
     FillRect(pixels, size, size, 5, 14, 43, 41, 0xFF936A20);
     FillRect(pixels, size, size, 7, 17, 41, 39, 0xFFE4B146);
     FillRect(pixels, size, size, 7, 17, 41, 21, 0xFFF4CE72);
-    return pixels;
-}
-
-std::vector<std::uint32_t> BuildShortcutOverlayPixels() {
-    constexpr UINT size = 16;
-    std::vector<std::uint32_t> pixels(size * size, 0);
-    FillRect(pixels, size, size, 2, 9, 11, 14, 0xFF24313A);
-    FillRect(pixels, size, size, 9, 3, 14, 12, 0xFF24313A);
-    FillRect(pixels, size, size, 4, 10, 11, 12, 0xFFF8FAFC);
-    FillRect(pixels, size, size, 10, 5, 12, 11, 0xFFF8FAFC);
-    FillRect(pixels, size, size, 7, 5, 13, 7, 0xFFF8FAFC);
     return pixels;
 }
 
@@ -499,24 +493,6 @@ bool IconCache::IsIconReady(
     return cache_.find(path) != cache_.end();
 }
 
-ID2D1Bitmap* IconCache::GetShortcutOverlay(ID2D1RenderTarget* target) {
-    if (target == nullptr) {
-        return nullptr;
-    }
-    EnsureTargetResources(target);
-    std::lock_guard<std::mutex> lock(cacheMutex_);
-    if (shortcutOverlay_ != nullptr) {
-        return shortcutOverlay_.Get();
-    }
-    const std::vector<std::uint32_t> pixels = BuildShortcutOverlayPixels();
-    shortcutOverlay_ = CreatePixelBitmap(
-        target,
-        pixels.data(),
-        16,
-        16);
-    return shortcutOverlay_.Get();
-}
-
 HICON IconCache::CopyReadyIconForDrag(const std::wstring& path) {
     if (path.empty()) {
         return nullptr;
@@ -628,7 +604,6 @@ void IconCache::Clear() {
     DestroyCachedDragIcons(dragIconCache_);
     filePlaceholder_.Reset();
     folderPlaceholder_.Reset();
-    shortcutOverlay_.Reset();
     resourceTarget_.Reset();
     ++asyncState_->generation;
     asyncState_->pendingById.clear();
@@ -745,7 +720,6 @@ void IconCache::EnsureTargetResources(ID2D1RenderTarget* target) {
         cache_.clear();
         filePlaceholder_.Reset();
         folderPlaceholder_.Reset();
-        shortcutOverlay_.Reset();
         ++asyncState_->generation;
         asyncState_->pendingById.clear();
         asyncState_->pendingIdByPath.clear();

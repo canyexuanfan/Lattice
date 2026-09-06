@@ -6,8 +6,18 @@ $projectFile = Join-Path $projectRoot "Lattice.vcxproj"
 $releaseDir = Join-Path $projectRoot "x64\Release"
 $releaseOutputDir = Join-Path $projectRoot "release"
 $installerScript = Join-Path $projectRoot "installer\Lattice.iss"
+$shortcutOverlayAsset = Join-Path $projectRoot "assets\branding\lattice-shortcut-overlay.ico"
+$resourceScript = Join-Path $projectRoot "src\app\Lattice.rc"
+$iconCacheSourcePath = Join-Path $projectRoot "src\rendering\IconCache.cpp"
+$iconGridSourcePath = Join-Path $projectRoot "src\ui\IconGrid.cpp"
 
-foreach ($requiredPath in @($projectFile, $installerScript)) {
+foreach ($requiredPath in @(
+    $projectFile,
+    $installerScript,
+    $shortcutOverlayAsset,
+    $resourceScript,
+    $iconCacheSourcePath,
+    $iconGridSourcePath)) {
     if (!(Test-Path -LiteralPath $requiredPath)) {
         throw "Required packaging input not found: $requiredPath"
     }
@@ -21,6 +31,23 @@ $installerVersion = $Matches[1]
 $expectedBinaryVersion = [version]("$installerVersion.0")
 
 $installerSource = Get-Content -LiteralPath $installerScript -Raw
+$resourceSource = Get-Content -LiteralPath $resourceScript -Raw
+$iconCacheSource = Get-Content -LiteralPath $iconCacheSourcePath -Raw
+$iconGridSource = Get-Content -LiteralPath $iconGridSourcePath -Raw
+if (
+    $installerSource -notmatch 'Name:\s*"shortcutoverlay"' -or
+    $installerSource -notmatch 'ShellIconsKey\s*=\s*''Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Shell Icons''' -or
+    $installerSource -notmatch 'OverlayValueName\s*=\s*''29''' -or
+    $installerSource -notmatch 'SnapshotShortcutOverlay' -or
+    $installerSource -notmatch 'RestoreShortcutOverlay' -or
+    $resourceSource -notmatch 'IDI_SHORTCUT_OVERLAY\s+ICON\s+"\.\./\.\./assets/branding/lattice-shortcut-overlay\.ico"' -or
+    $iconCacheSource -notmatch 'SHGFI_ADDOVERLAYS\s*\|\s*SHGFI_OVERLAYINDEX' -or
+    $iconCacheSource -notmatch 'INDEXTOOVERLAYMASK\s*\(overlayIndex\)' -or
+    $iconCacheSource -match 'BuildShortcutOverlayPixels|GetShortcutOverlay' -or
+    $iconGridSource -match 'GetShortcutOverlay'
+) {
+    throw "Shortcut overlay packaging contract is incomplete or manual grid composition returned."
+}
 if ($installerSource -match 'WaitForProductExit\s*\(\s*\d{3,}\s*\)') {
     throw "Installer contains a minute-scale product exit wait."
 }

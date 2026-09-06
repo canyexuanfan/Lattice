@@ -373,18 +373,6 @@ void IconGrid::Draw(D2DContext& d2d, IconCache& iconCache) {
             target->FillRoundedRectangle(D2D1::RoundedRect(iconRect, 7.0f, 7.0f), fallbackBrush.Get());
             target->DrawRoundedRectangle(D2D1::RoundedRect(iconRect, 7.0f, 7.0f), fallbackBorderBrush.Get(), 1.0f);
         }
-        if (items_[index].kind == DesktopItemKind::Shortcut || items_[index].kind == DesktopItemKind::UrlShortcut) {
-            ID2D1Bitmap* overlay = iconCache.GetShortcutOverlay(target);
-            if (overlay != nullptr) {
-                const FLOAT overlaySize = listMode_ ? 10.0f : (widgetStyle_ ? 16.0f : 14.0f);
-                const D2D1_RECT_F overlayRect = D2D1::RectF(
-                    iconRect.left - (widgetStyle_ ? 1.0f : 0.0f),
-                    iconRect.bottom - overlaySize + (widgetStyle_ ? 1.0f : 0.0f),
-                    iconRect.left + overlaySize - (widgetStyle_ ? 1.0f : 0.0f),
-                    iconRect.bottom + (widgetStyle_ ? 1.0f : 0.0f));
-                target->DrawBitmap(overlay, overlayRect, 1.0f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
-            }
-        }
         if (labelFormat != nullptr && textBrush != nullptr) {
             const int labelInset = widgetStyle_ ? 2 : 2;
             const FLOAT labelOffset = widgetStyle_ ? 4.6667f : static_cast<FLOAT>(compactStyle_ ? 4 : 7);
