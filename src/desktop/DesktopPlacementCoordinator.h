@@ -8,8 +8,12 @@
 #include <thread>
 #include <vector>
 
+#include "config/ConfigStore.h"
+
 constexpr UINT kDesktopPlacementEventMessage = WM_APP + 17;
 constexpr UINT kDesktopPlacementRequestMessage = WM_APP + 18;
+constexpr UINT kDesktopCollectionRequestMessage = WM_APP + 22;
+constexpr UINT kDesktopCollectionResultMessage = WM_APP + 23;
 
 struct DesktopPlacementRequest {
     std::wstring path;
@@ -17,7 +21,39 @@ struct DesktopPlacementRequest {
     std::uint64_t dragGhostGeneration = 0;
     bool showError = true;
     HWND sourceWindow = nullptr;
+    bool commitMoveOut = false;
+    std::wstring itemId;
+    std::wstring sourcePath;
+    ItemConfig itemState;
 };
+
+bool CommitDesktopMoveOutTransaction(
+    const DesktopPlacementRequest& request,
+    std::wstring& desktopPath,
+    std::wstring& errorMessage);
+
+struct DesktopCollectionItemRequest {
+    std::wstring categoryId;
+    std::wstring path;
+    std::wstring sourceVisibleId;
+    size_t insertionIndex = 0;
+    POINT desktopPoint{};
+    bool hasDesktopPoint = false;
+    bool showError = true;
+    HWND sourceWindow = nullptr;
+};
+
+struct DesktopCollectionItemResult {
+    bool succeeded = false;
+    std::wstring itemId;
+    std::wstring sourcePath;
+    std::wstring destinationPath;
+    ItemConfig itemState;
+    std::wstring errorMessage;
+};
+
+DesktopCollectionItemResult CommitDesktopCollectionItemTransaction(
+    const DesktopCollectionItemRequest& request);
 
 class DesktopPlacementCoordinator {
 public:
@@ -38,6 +74,8 @@ public:
         HWND sourceWindow = nullptr;
         bool succeeded = false;
         std::wstring errorMessage;
+        bool collection = false;
+        DesktopCollectionItemResult collectionResult;
     };
 
     DesktopPlacementCoordinator();
@@ -49,14 +87,17 @@ public:
     void AttachNotificationWindow(HWND hwnd);
     void DetachNotificationWindow(HWND hwnd);
     OperationId PlaceAtScreenAsync(const DesktopPlacementRequest& request);
+    OperationId CollectItemAsync(const DesktopCollectionItemRequest& request);
     std::vector<Event> TakeEvents();
     bool DrainFor(DWORD timeoutMilliseconds);
     bool CancelAndStopFor(DWORD timeoutMilliseconds);
 
 private:
-    struct QueuedPlacement {
+    struct QueuedOperation {
         OperationId id = 0;
-        DesktopPlacementRequest request;
+        bool collection = false;
+        DesktopPlacementRequest placementRequest;
+        DesktopCollectionItemRequest collectionRequest;
     };
     struct State;
 

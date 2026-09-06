@@ -225,6 +225,17 @@ bool MainWindow::QueueDesktopPlacement(const DesktopPlacementRequest& request) {
 void MainWindow::HandleDesktopPlacementEvents(bool allowDialogs) {
     for (DesktopPlacementCoordinator::Event& event :
          desktopPlacementCoordinator_.TakeEvents()) {
+        if (event.collection) {
+            if (event.sourceWindow != nullptr &&
+                IsWindow(event.sourceWindow) != FALSE) {
+                SendMessageW(
+                    event.sourceWindow,
+                    kDesktopCollectionResultMessage,
+                    0,
+                    reinterpret_cast<LPARAM>(&event.collectionResult));
+            }
+            continue;
+        }
         if (event.stage == DesktopPlacementCoordinator::EventStage::Visible) {
             continue;
         }
@@ -233,12 +244,28 @@ void MainWindow::HandleDesktopPlacementEvents(bool allowDialogs) {
             PostMessageW(hwnd_, kOrganizerConfigChangedMessage, 0, 0);
         }
         if (event.succeeded) {
-            SaveDesktopPlacement(
-                event.path,
-                event.finalPoint,
-                event.showError,
-                event.sourceWindow,
-                allowDialogs);
+            if (!event.errorMessage.empty()) {
+                if (event.showError && allowDialogs) {
+                    HWND dialogOwner =
+                        event.sourceWindow != nullptr &&
+                                IsWindow(event.sourceWindow) != FALSE
+                            ? event.sourceWindow
+                            : (hwnd_ != nullptr && IsWindow(hwnd_) != FALSE
+                                ? hwnd_
+                                : nullptr);
+                    MessageDialog::Show(
+                        instance_,
+                        dialogOwner,
+                        event.errorMessage.c_str(),
+                        L"桌面坐标恢复",
+                        MB_OK | MB_ICONWARNING);
+                } else {
+                    const std::wstring diagnostic =
+                        L"Lattice background desktop placement warning for " +
+                        event.path + L": " + event.errorMessage + L"\n";
+                    OutputDebugStringW(diagnostic.c_str());
+                }
+            }
             continue;
         }
 
@@ -359,6 +386,11 @@ bool MainWindow::Create() {
     if (hwnd_ != nullptr) {
         EnsureWindowVisible();
         RedrawWindow(hwnd_, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_ERASE | RDW_FRAME);
+        DragGhostWindow::Instance().Prepare(
+            instance_,
+            hwnd_,
+            windowConfig_.iconSize,
+            iconGrid_.SlotSize());
     }
     return hwnd_ != nullptr;
 }
@@ -646,6 +678,18 @@ LRESULT MainWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
                         draggingItemId_ = item->id;
                         draggingSourceCategoryId_ = tileViews_[tileIndex].categoryId;
                         dragStartPoint_ = point;
+                        const bool shortcut =
+                            item->kind == DesktopItemKind::Shortcut ||
+                            item->kind == DesktopItemKind::UrlShortcut;
+                        DragGhostWindow::Instance().Stage(
+                            instance_,
+                            hwnd_,
+                            item->path,
+                            iconCache_.CopyReadyIconForDrag(item->path),
+                            item->displayName,
+                            shortcut,
+                            windowConfig_.iconSize,
+                            tileViews_[tileIndex].grid.SlotSize());
                         SetCapture(hwnd_);
                     }
                 }
@@ -676,6 +720,18 @@ LRESULT MainWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
                     draggingItemId_ = dragItem->id;
                     draggingSourceCategoryId_ = organizerConfig_.currentCategoryId;
                     dragStartPoint_ = point;
+                    const bool shortcut =
+                        dragItem->kind == DesktopItemKind::Shortcut ||
+                        dragItem->kind == DesktopItemKind::UrlShortcut;
+                    DragGhostWindow::Instance().Stage(
+                        instance_,
+                        hwnd_,
+                        dragItem->path,
+                        iconCache_.CopyReadyIconForDrag(dragItem->path),
+                        dragItem->displayName,
+                        shortcut,
+                        windowConfig_.iconSize,
+                        iconGrid_.SlotSize());
                     SetCapture(hwnd_);
                     return 0;
                 }
@@ -1117,6 +1173,15 @@ LRESULT MainWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
         case kDesktopPlacementRequestMessage: {
             const auto* request = reinterpret_cast<const DesktopPlacementRequest*>(lParam);
             return request != nullptr && QueueDesktopPlacement(*request) ? 1 : 0;
+        }
+
+        case kDesktopCollectionRequestMessage: {
+            const auto* request =
+                reinterpret_cast<const DesktopCollectionItemRequest*>(lParam);
+            return request != nullptr &&
+                           desktopPlacementCoordinator_.CollectItemAsync(*request) != 0
+                ? 1
+                : 0;
         }
 
         case kWidgetActivateCategoryMessage: {

@@ -4,10 +4,16 @@
 #include <ShlObj.h>
 
 #include <algorithm>
+#include <chrono>
+#include <condition_variable>
+#include <deque>
 #include <fstream>
+#include <functional>
 #include <map>
+#include <mutex>
 #include <sstream>
 #include <string>
+#include <thread>
 
 #include "util/PathUtil.h"
 #include "util/StringUtil.h"
@@ -237,6 +243,283 @@ bool AtomicWriteConfig(
         MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != FALSE;
 }
 
+struct InteractionMutation {
+    std::wstring categoryId;
+    WindowConfig layout;
+    std::vector<std::wstring> itemIds;
+    bool updateItemOrder = false;
+    std::uint64_t version = 0;
+};
+
+std::mutex& InteractionMutationMutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+std::map<std::wstring, std::map<std::wstring, InteractionMutation>>& PendingInteractionMutations() {
+    static std::map<std::wstring, std::map<std::wstring, InteractionMutation>> mutations;
+    return mutations;
+}
+
+std::uint64_t& NextInteractionMutationVersion() {
+    static std::uint64_t version = 1;
+    return version;
+}
+
+std::mutex& ConfigFileWriteMutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+struct ConfigFileIdentity {
+    DWORD volumeSerial = 0;
+    DWORD fileIndexHigh = 0;
+    DWORD fileIndexLow = 0;
+    DWORD fileSizeHigh = 0;
+    DWORD fileSizeLow = 0;
+    FILETIME lastWriteTime{};
+};
+
+struct ConfigSnapshot {
+    ConfigFileIdentity identity;
+    AppConfig config;
+};
+
+std::mutex& ConfigSnapshotMutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+std::map<std::wstring, ConfigSnapshot>& ConfigSnapshots() {
+    static std::map<std::wstring, ConfigSnapshot> snapshots;
+    return snapshots;
+}
+
+bool QueryConfigFileIdentity(
+    const std::wstring& path,
+    ConfigFileIdentity& identity) {
+    HANDLE file = CreateFileW(
+        path.c_str(),
+        FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    BY_HANDLE_FILE_INFORMATION information{};
+    const bool succeeded = GetFileInformationByHandle(file, &information) != FALSE;
+    CloseHandle(file);
+    if (!succeeded) {
+        return false;
+    }
+    identity.volumeSerial = information.dwVolumeSerialNumber;
+    identity.fileIndexHigh = information.nFileIndexHigh;
+    identity.fileIndexLow = information.nFileIndexLow;
+    identity.fileSizeHigh = information.nFileSizeHigh;
+    identity.fileSizeLow = information.nFileSizeLow;
+    identity.lastWriteTime = information.ftLastWriteTime;
+    return true;
+}
+
+bool SameConfigFileIdentity(
+    const ConfigFileIdentity& left,
+    const ConfigFileIdentity& right) {
+    return left.volumeSerial == right.volumeSerial &&
+           left.fileIndexHigh == right.fileIndexHigh &&
+           left.fileIndexLow == right.fileIndexLow &&
+           left.fileSizeHigh == right.fileSizeHigh &&
+           left.fileSizeLow == right.fileSizeLow &&
+           CompareFileTime(&left.lastWriteTime, &right.lastWriteTime) == 0;
+}
+
+bool TryLoadConfigSnapshot(
+    const std::wstring& path,
+    const ConfigFileIdentity& identity,
+    AppConfig& config) {
+    std::lock_guard<std::mutex> lock(ConfigSnapshotMutex());
+    const auto snapshot = ConfigSnapshots().find(path);
+    if (snapshot == ConfigSnapshots().end() ||
+        !SameConfigFileIdentity(snapshot->second.identity, identity)) {
+        return false;
+    }
+    config = snapshot->second.config;
+    return true;
+}
+
+void PublishConfigSnapshot(
+    const std::wstring& path,
+    const ConfigFileIdentity& identity,
+    const AppConfig& config) {
+    std::lock_guard<std::mutex> lock(ConfigSnapshotMutex());
+    ConfigSnapshots().insert_or_assign(path, ConfigSnapshot{identity, config});
+}
+
+std::vector<InteractionMutation> SnapshotInteractionMutations(const std::wstring& configPath) {
+    std::lock_guard<std::mutex> lock(InteractionMutationMutex());
+    std::vector<InteractionMutation> result;
+    const auto byPath = PendingInteractionMutations().find(configPath);
+    if (byPath == PendingInteractionMutations().end()) {
+        return result;
+    }
+    result.reserve(byPath->second.size());
+    for (const auto& [categoryId, mutation] : byPath->second) {
+        (void)categoryId;
+        result.push_back(mutation);
+    }
+    return result;
+}
+
+void ApplyInteractionMutations(
+    const std::vector<InteractionMutation>& mutations,
+    AppConfig& config) {
+    for (const InteractionMutation& mutation : mutations) {
+        if (mutation.categoryId == L"uncategorized") {
+            config.window = mutation.layout;
+            if (mutation.updateItemOrder) {
+                config.uncategorizedItemIds = mutation.itemIds;
+            }
+            continue;
+        }
+        const auto category = std::find_if(
+            config.categories.begin(),
+            config.categories.end(),
+            [&](const CategoryConfig& value) {
+                return value.id == mutation.categoryId;
+            });
+        if (category == config.categories.end()) {
+            continue;
+        }
+        category->layout = mutation.layout;
+        if (mutation.updateItemOrder) {
+            category->itemIds = mutation.itemIds;
+        }
+    }
+}
+
+void RemoveAppliedInteractionMutations(
+    const std::wstring& configPath,
+    const std::vector<InteractionMutation>& applied) {
+    std::lock_guard<std::mutex> lock(InteractionMutationMutex());
+    const auto byPath = PendingInteractionMutations().find(configPath);
+    if (byPath == PendingInteractionMutations().end()) {
+        return;
+    }
+    for (const InteractionMutation& mutation : applied) {
+        const auto current = byPath->second.find(mutation.categoryId);
+        if (current != byPath->second.end() && current->second.version == mutation.version) {
+            byPath->second.erase(current);
+        }
+    }
+    if (byPath->second.empty()) {
+        PendingInteractionMutations().erase(byPath);
+    }
+}
+
+class AsyncConfigWriter {
+public:
+    static AsyncConfigWriter& Instance() {
+        static AsyncConfigWriter writer;
+        return writer;
+    }
+
+    bool Enqueue(std::wstring key, std::function<bool()> task) {
+        if (key.empty() || !task) {
+            return false;
+        }
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (stopping_) {
+                return false;
+            }
+            for (Job& pending : jobs_) {
+                if (pending.key == key) {
+                    pending.task = std::move(task);
+                    return true;
+                }
+            }
+            if (jobs_.size() >= kCapacity) {
+                return false;
+            }
+            jobs_.push_back(Job{std::move(key), std::move(task)});
+        }
+        condition_.notify_one();
+        return true;
+    }
+
+    bool Drain(DWORD timeoutMilliseconds) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        const auto idle = [&]() { return jobs_.empty() && !active_; };
+        const bool completed = timeoutMilliseconds == INFINITE
+            ? (drained_.wait(lock, idle), true)
+            : drained_.wait_for(lock, std::chrono::milliseconds(timeoutMilliseconds), idle);
+        return completed && lastWriteSucceeded_;
+    }
+
+private:
+    struct Job {
+        std::wstring key;
+        std::function<bool()> task;
+    };
+    static constexpr size_t kCapacity = 32;
+
+    AsyncConfigWriter() : worker_(&AsyncConfigWriter::WorkerLoop, this) {}
+    ~AsyncConfigWriter() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stopping_ = true;
+        }
+        condition_.notify_all();
+        if (worker_.joinable()) {
+            worker_.join();
+        }
+    }
+
+    void WorkerLoop() {
+        for (;;) {
+            Job job;
+            {
+                std::unique_lock<std::mutex> lock(mutex_);
+                condition_.wait(lock, [&]() { return stopping_ || !jobs_.empty(); });
+                if (stopping_ && jobs_.empty()) {
+                    break;
+                }
+                job = std::move(jobs_.front());
+                jobs_.pop_front();
+                active_ = true;
+            }
+            bool succeeded = false;
+            try {
+                succeeded = job.task();
+            } catch (...) {
+                succeeded = false;
+            }
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                lastWriteSucceeded_ = succeeded;
+                active_ = false;
+                if (jobs_.empty()) {
+                    drained_.notify_all();
+                }
+            }
+        }
+        std::lock_guard<std::mutex> lock(mutex_);
+        active_ = false;
+        drained_.notify_all();
+    }
+
+    std::thread worker_;
+    std::mutex mutex_;
+    std::condition_variable condition_;
+    std::condition_variable drained_;
+    std::deque<Job> jobs_;
+    bool active_ = false;
+    bool stopping_ = false;
+    bool lastWriteSucceeded_ = true;
+};
+
 }  // namespace
 
 std::wstring CategoryStorageFolder(const AppConfig& config, const std::wstring& categoryId) {
@@ -289,6 +572,32 @@ bool ConfigStore::Save(const WindowConfig& config) const {
 }
 
 AppConfig ConfigStore::LoadAppConfig() const {
+    ConfigFileIdentity identityBefore{};
+    AppConfig config;
+    if (QueryConfigFileIdentity(configPath_, identityBefore) &&
+        TryLoadConfigSnapshot(configPath_, identityBefore, config)) {
+        ApplyInteractionMutations(SnapshotInteractionMutations(configPath_), config);
+        return config;
+    }
+
+    config = LoadAppConfigFromDisk();
+    ConfigFileIdentity identityAfter{};
+    if (QueryConfigFileIdentity(configPath_, identityAfter)) {
+        if (SameConfigFileIdentity(identityBefore, identityAfter)) {
+            PublishConfigSnapshot(configPath_, identityAfter, config);
+        } else {
+            config = LoadAppConfigFromDisk();
+            ConfigFileIdentity retryIdentity{};
+            if (QueryConfigFileIdentity(configPath_, retryIdentity)) {
+                PublishConfigSnapshot(configPath_, retryIdentity, config);
+            }
+        }
+    }
+    ApplyInteractionMutations(SnapshotInteractionMutations(configPath_), config);
+    return config;
+}
+
+AppConfig ConfigStore::LoadAppConfigFromDisk() const {
     AppConfig config;
     config.window = WindowConfig{};
     config.currentCategoryId = L"uncategorized";
@@ -504,6 +813,69 @@ AppConfig ConfigStore::LoadAppConfig() const {
 }
 
 bool ConfigStore::SaveAppConfig(const AppConfig& config) const {
+    std::lock_guard<std::mutex> fileLock(ConfigFileWriteMutex());
+    const std::vector<InteractionMutation> mutations =
+        SnapshotInteractionMutations(configPath_);
+    AppConfig merged = config;
+    ApplyInteractionMutations(mutations, merged);
+    if (!SaveAppConfigToDisk(merged)) {
+        return false;
+    }
+    RemoveAppliedInteractionMutations(configPath_, mutations);
+    return true;
+}
+
+bool ConfigStore::SaveInteractionStateAsync(
+    const std::wstring& categoryId,
+    const WindowConfig& layout,
+    const std::vector<std::wstring>& itemIds,
+    bool updateItemOrder) const {
+    if (categoryId.empty()) {
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(InteractionMutationMutex());
+        std::uint64_t& nextVersion = NextInteractionMutationVersion();
+        if (nextVersion == 0) {
+            ++nextVersion;
+        }
+        InteractionMutation mutation;
+        mutation.categoryId = categoryId;
+        mutation.layout = layout;
+        mutation.itemIds = itemIds;
+        mutation.updateItemOrder = updateItemOrder;
+        mutation.version = nextVersion++;
+        PendingInteractionMutations()[configPath_].insert_or_assign(
+            categoryId,
+            std::move(mutation));
+    }
+    const ConfigStore store = *this;
+    return AsyncConfigWriter::Instance().Enqueue(
+        configPath_,
+        [store]() { return store.FlushInteractionStateToDisk(); });
+}
+
+bool ConfigStore::DrainPendingWrites(unsigned long timeoutMilliseconds) {
+    return AsyncConfigWriter::Instance().Drain(timeoutMilliseconds);
+}
+
+bool ConfigStore::FlushInteractionStateToDisk() const {
+    std::lock_guard<std::mutex> fileLock(ConfigFileWriteMutex());
+    const std::vector<InteractionMutation> mutations =
+        SnapshotInteractionMutations(configPath_);
+    if (mutations.empty()) {
+        return true;
+    }
+    AppConfig config = LoadAppConfigFromDisk();
+    ApplyInteractionMutations(mutations, config);
+    if (!SaveAppConfigToDisk(config)) {
+        return false;
+    }
+    RemoveAppliedInteractionMutations(configPath_, mutations);
+    return true;
+}
+
+bool ConfigStore::SaveAppConfigToDisk(const AppConfig& config) const {
     std::ostringstream output;
     output << "schemaVersion=12\n";
     output << "settings.launchOnStartup=" << (config.settings.launchOnStartup ? 1 : 0) << "\n";
@@ -599,17 +971,27 @@ bool ConfigStore::SaveAppConfig(const AppConfig& config) const {
         }
     }
 
-    return AtomicWriteConfig(
+    const bool saved = AtomicWriteConfig(
         configDir_,
         configPath_,
         backupPath_,
         tempPath_,
         std::clamp(config.settings.backupCount, 1, 10),
         output.str());
+    if (saved) {
+        ConfigFileIdentity identity{};
+        if (QueryConfigFileIdentity(configPath_, identity)) {
+            PublishConfigSnapshot(configPath_, identity, config);
+        }
+    }
+    return saved;
 }
 
 bool ConfigStore::ExportAppConfig(const std::wstring& path) const {
     if (path.empty()) {
+        return false;
+    }
+    if (!DrainPendingWrites(5000) && !SaveAppConfig(LoadAppConfig())) {
         return false;
     }
     if (GetFileAttributesW(configPath_.c_str()) == INVALID_FILE_ATTRIBUTES) {
@@ -638,6 +1020,10 @@ bool ConfigStore::ImportAppConfig(const std::wstring& path) const {
     content << input.rdbuf();
     const auto backupIt = candidate.find(L"settings.backupCount");
     const int backupCount = backupIt == candidate.end() ? 3 : std::clamp(ParseInt(backupIt->second, 3), 1, 10);
+    if (!DrainPendingWrites(5000)) {
+        return false;
+    }
+    std::lock_guard<std::mutex> fileLock(ConfigFileWriteMutex());
     return AtomicWriteConfig(configDir_, configPath_, backupPath_, tempPath_, backupCount, content.str());
 }
 

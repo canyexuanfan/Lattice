@@ -91,6 +91,12 @@ public:
     bool Save(const WindowConfig& config) const;
     AppConfig LoadAppConfig() const;
     bool SaveAppConfig(const AppConfig& config) const;
+    bool SaveInteractionStateAsync(
+        const std::wstring& categoryId,
+        const WindowConfig& layout,
+        const std::vector<std::wstring>& itemIds,
+        bool updateItemOrder) const;
+    static bool DrainPendingWrites(unsigned long timeoutMilliseconds);
     bool ExportAppConfig(const std::wstring& path) const;
     bool ImportAppConfig(const std::wstring& path) const;
     bool ExportCategoryConfig(const CategoryConfig& category, const std::wstring& path) const;
@@ -100,6 +106,9 @@ public:
     std::wstring ConfigPath() const { return configPath_; }
 
 private:
+    AppConfig LoadAppConfigFromDisk() const;
+    bool SaveAppConfigToDisk(const AppConfig& config) const;
+    bool FlushInteractionStateToDisk() const;
     std::wstring configDir_;
     std::wstring configPath_;
     std::wstring backupPath_;

@@ -30,6 +30,7 @@ public:
         bool* usedPlaceholder = nullptr);
     bool IsIconReady(ID2D1RenderTarget* target, const std::wstring& path);
     ID2D1Bitmap* GetShortcutOverlay(ID2D1RenderTarget* target);
+    HICON CopyReadyIconForDrag(const std::wstring& path);
     void Preload(const std::wstring& path);
     void Alias(const std::wstring& sourcePath, const std::wstring& destinationPath);
     void Clear();
@@ -55,6 +56,7 @@ private:
     mutable std::mutex cacheMutex_;
     Microsoft::WRL::ComPtr<ID2D1RenderTarget> resourceTarget_;
     std::unordered_map<std::wstring, Microsoft::WRL::ComPtr<ID2D1Bitmap>> cache_;
+    std::unordered_map<std::wstring, HICON> dragIconCache_;
     Microsoft::WRL::ComPtr<ID2D1Bitmap> filePlaceholder_;
     Microsoft::WRL::ComPtr<ID2D1Bitmap> folderPlaceholder_;
     Microsoft::WRL::ComPtr<ID2D1Bitmap> shortcutOverlay_;

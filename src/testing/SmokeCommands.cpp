@@ -160,6 +160,10 @@ struct WidgetWindowSmokeAccess {
         widget.ToggleCollapsed();
     }
 
+    static bool FlushInteractionSave(WidgetWindow& widget) {
+        return widget.FlushPendingInteractionSave();
+    }
+
     static POINT InsertionScreenPoint(WidgetWindow& widget, size_t index) {
         const RECT cell = widget.iconGrid_.InsertionCellAt(index);
         POINT point{
@@ -546,6 +550,9 @@ struct SmokeDesktopPlacementOwnerState {
     DesktopPlacementRequest request;
     std::chrono::steady_clock::time_point releaseStarted{};
     double requestLatencyMilliseconds = -1.0;
+    bool collectionRequestCopied = false;
+    int collectionRequestCount = 0;
+    DesktopCollectionItemRequest collectionRequest;
 };
 
 LRESULT CALLBACK SmokeDesktopPlacementOwnerProc(
@@ -580,6 +587,17 @@ LRESULT CALLBACK SmokeDesktopPlacementOwnerProc(
         // The owner deliberately accepts the handoff without touching Explorer.
         // Returning nonzero keeps the production fallback path out of this isolated smoke test.
         return 1;
+    }
+    if (message == kDesktopCollectionRequestMessage && state != nullptr) {
+        const auto* request =
+            reinterpret_cast<const DesktopCollectionItemRequest*>(lParam);
+        ++state->collectionRequestCount;
+        if (request != nullptr) {
+            state->collectionRequest = *request;
+            state->collectionRequestCopied = true;
+            return 1;
+        }
+        return 0;
     }
     if (message == kOrganizerConfigSyncMessage && state != nullptr) {
         ++state->configSyncCount;
@@ -1453,6 +1471,7 @@ int RunSmokeWidgetAlignment(HINSTANCE instance) {
 
     const auto fail = [&](const std::wstring& message, int exitCode = 1) {
         std::wcerr << message << L"\n";
+        ConfigStore::DrainPendingWrites(5000);
         std::error_code cleanupError;
         std::filesystem::remove_all(testRoot, cleanupError);
         return exitCode;
@@ -1634,6 +1653,9 @@ int RunSmokeWidgetAlignment(HINSTANCE instance) {
     SendMessageW(firstWindow, WM_EXITSIZEMOVE, 0, 0);
     first.Close();
     second.Close();
+    if (!ConfigStore::DrainPendingWrites(5000)) {
+        return fail(L"Widget alignment async persistence did not drain", 27);
+    }
     std::filesystem::remove_all(testRoot, fileError);
     if (fileError) {
         std::wcerr << L"Widget alignment smoke cleanup failed\n";
@@ -1977,6 +1999,10 @@ int RunSmokeWidgetDesktopLayer(HINSTANCE instance) {
         return fail(L"Desktop-hosted widget coordinate or activation behavior failed", 73);
     }
 
+    if (!WidgetWindowSmokeAccess::FlushInteractionSave(*widget) ||
+        !ConfigStore::DrainPendingWrites(5000)) {
+        return fail(L"Widget desktop layer pending state did not drain before close snapshot", 74);
+    }
     const std::optional<std::string> configBeforeClose =
         ReadFileBytes(configStore.ConfigPath());
     if (!configBeforeClose.has_value()) {
@@ -2082,6 +2108,13 @@ int RunSmokeWidgetInteraction(HINSTANCE instance) {
     config.items.push_back(ItemConfig{L"widget-uncategorized", uncategorizedPath.wstring(), L"未分类项"});
     config.items.push_back(ItemConfig{L"widget-first", firstPath.wstring(), L"第一项"});
     config.items.push_back(ItemConfig{L"widget-second", secondPath.wstring(), L"第二项"});
+    for (int index = 0; index < 219; ++index) {
+        config.desktopLayout.push_back(DesktopPlacementConfig{
+            (desktopRoot / (L"交互性能规模填充-" + std::to_wstring(index) +
+                L"-abcdefghijklmnopqrstuvwxyz-ABCDEFGHIJKLMNOPQRSTUVWXYZ-0123456789.txt")).wstring(),
+            index * 11,
+            index * 7});
+    }
     CategoryConfig category;
     category.id = L"widget-category";
     category.name = L"交互测试";
@@ -2176,8 +2209,11 @@ int RunSmokeWidgetInteraction(HINSTANCE instance) {
         cleanup();
         return 51;
     }
+    const auto collapseStart = std::chrono::steady_clock::now();
     SendMessageW(categoryWindow, WM_LBUTTONDOWN, MK_LBUTTON, collapsePoint);
     SendMessageW(categoryWindow, WM_LBUTTONUP, 0, collapsePoint);
+    const auto collapseMilliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - collapseStart).count();
     RECT collapsedRect{};
     GetWindowRect(categoryWindow, &collapsedRect);
     if (collapsedRect.bottom - collapsedRect.top != dip(32)) {
@@ -2196,8 +2232,11 @@ int RunSmokeWidgetInteraction(HINSTANCE instance) {
         cleanup();
         return 52;
     }
+    const auto expandStart = std::chrono::steady_clock::now();
     SendMessageW(categoryWindow, WM_LBUTTONDOWN, MK_LBUTTON, collapsePoint);
     SendMessageW(categoryWindow, WM_LBUTTONUP, 0, collapsePoint);
+    const auto expandMilliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - expandStart).count();
     RECT restoredExpandedRect{};
     GetWindowRect(categoryWindow, &restoredExpandedRect);
     if (restoredExpandedRect.bottom - restoredExpandedRect.top != expandedRect.bottom - expandedRect.top) {
@@ -2219,6 +2258,12 @@ int RunSmokeWidgetInteraction(HINSTANCE instance) {
     }
     SendMessageW(categoryWindow, WM_LBUTTONDOWN, MK_LBUTTON, lockPoint);
     SendMessageW(categoryWindow, WM_LBUTTONUP, 0, lockPoint);
+    if (!WidgetWindowSmokeAccess::FlushInteractionSave(
+            *const_cast<WidgetWindow*>(categoryWidget))) {
+        DestroyWindow(mainWindow);
+        app.Run();
+        return fail(L"Widget deferred lock persistence failed", 36);
+    }
     AppConfig lockedConfig = configStore.LoadAppConfig();
     const auto lockedCategory = std::find_if(
         lockedConfig.categories.begin(),
@@ -2239,8 +2284,14 @@ int RunSmokeWidgetInteraction(HINSTANCE instance) {
     }
     const LPARAM sourcePoint = MAKELPARAM(dip(43), dip(89));
     const LPARAM targetPoint = MAKELPARAM(dip(123), dip(89));
+    const auto dragPrepareStart = std::chrono::steady_clock::now();
     SendMessageW(categoryWindow, WM_LBUTTONDOWN, MK_LBUTTON, sourcePoint);
+    const auto dragPrepareMilliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - dragPrepareStart).count();
+    const auto dragStart = std::chrono::steady_clock::now();
     SendMessageW(categoryWindow, WM_MOUSEMOVE, MK_LBUTTON, targetPoint);
+    const auto dragStartMilliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - dragStart).count();
     HWND ghostWindow = FindWindowW(L"Lattice.DragGhostWindow", nullptr);
     if (ghostWindow == nullptr || !IsWindowVisible(ghostWindow) ||
         (GetWindowLongPtrW(ghostWindow, GWL_EXSTYLE) & WS_EX_TOPMOST) == 0) {
@@ -2249,8 +2300,24 @@ int RunSmokeWidgetInteraction(HINSTANCE instance) {
         app.Run();
         return fail(L"Widget drag ghost was not visible and topmost", 37);
     }
+    const auto reorderStart = std::chrono::steady_clock::now();
     SendMessageW(categoryWindow, WM_LBUTTONUP, 0, targetPoint);
+    const auto reorderMilliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - reorderStart).count();
+    const auto persistStart = std::chrono::steady_clock::now();
+    if (!WidgetWindowSmokeAccess::FlushInteractionSave(
+            *const_cast<WidgetWindow*>(categoryWidget))) {
+        DestroyWindow(mainWindow);
+        app.Run();
+        return fail(L"Widget deferred reorder persistence failed", 38);
+    }
+    const auto persistMilliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - persistStart).count();
+    const auto configLoadStart = std::chrono::steady_clock::now();
     AppConfig reorderedConfig = configStore.LoadAppConfig();
+    const auto configLoadMilliseconds =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - configLoadStart).count();
     const auto reorderedCategory = std::find_if(
         reorderedConfig.categories.begin(),
         reorderedConfig.categories.end(),
@@ -2264,6 +2331,12 @@ int RunSmokeWidgetInteraction(HINSTANCE instance) {
     }
     SendMessageW(categoryWindow, WM_LBUTTONDOWN, MK_LBUTTON, lockPoint);
     SendMessageW(categoryWindow, WM_LBUTTONUP, 0, lockPoint);
+    if (!WidgetWindowSmokeAccess::FlushInteractionSave(
+            *const_cast<WidgetWindow*>(categoryWidget))) {
+        DestroyWindow(mainWindow);
+        app.Run();
+        return fail(L"Widget deferred unlock persistence failed", 45);
+    }
     const AppConfig unlockedConfig = configStore.LoadAppConfig();
     const auto unlockedCategory = std::find_if(
         unlockedConfig.categories.begin(),
@@ -2281,6 +2354,76 @@ int RunSmokeWidgetInteraction(HINSTANCE instance) {
     SetWindowScreenBounds(categoryWindow, categoryX, categoryY, 0, 0,
                           SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOSIZE);
     SendMessageW(categoryWindow, WM_EXITSIZEMOVE, 0, 0);
+    auto* uncategorizedWidget = reinterpret_cast<WidgetWindow*>(
+        GetWindowLongPtrW(uncategorizedWindow, GWLP_USERDATA));
+    if (uncategorizedWidget == nullptr ||
+        !WidgetWindowSmokeAccess::FlushInteractionSave(*uncategorizedWidget) ||
+        !WidgetWindowSmokeAccess::FlushInteractionSave(
+            *const_cast<WidgetWindow*>(categoryWidget))) {
+        DestroyWindow(mainWindow);
+        app.Run();
+        return fail(L"Widget deferred position persistence failed", 43);
+    }
+    std::wcout << L"WIDGET_INTERACTION_TIMING_MS collapse=" << collapseMilliseconds
+               << L" expand=" << expandMilliseconds
+               << L" dragPrepare=" << dragPrepareMilliseconds
+               << L" dragStart=" << dragStartMilliseconds
+               << L" reorder=" << reorderMilliseconds
+               << L" persist=" << persistMilliseconds
+               << L" configLoad=" << configLoadMilliseconds << L"\n";
+    {
+        std::ofstream timingFile(
+            std::filesystem::path(baseValue) / L"widget-interaction-timing.txt",
+            std::ios::binary | std::ios::trunc);
+        timingFile << "collapse=" << collapseMilliseconds << "\n"
+                   << "expand=" << expandMilliseconds << "\n"
+                   << "dragPrepare=" << dragPrepareMilliseconds << "\n"
+                   << "dragStart=" << dragStartMilliseconds << "\n"
+                   << "reorder=" << reorderMilliseconds << "\n"
+                   << "persist=" << persistMilliseconds << "\n"
+                   << "configLoad=" << configLoadMilliseconds << "\n";
+    }
+    if (collapseMilliseconds > 16) {
+        DestroyWindow(mainWindow);
+        app.Run();
+        std::wcerr << L"Widget collapse handler exceeded the 16 ms interaction budget\n";
+        return 54;
+    }
+    if (expandMilliseconds > 16) {
+        DestroyWindow(mainWindow);
+        app.Run();
+        std::wcerr << L"Widget expand handler exceeded the 16 ms interaction budget\n";
+        return 55;
+    }
+    if (dragPrepareMilliseconds > 16) {
+        DestroyWindow(mainWindow);
+        app.Run();
+        std::wcerr << L"Widget drag preparation exceeded the 16 ms interaction budget\n";
+        return 59;
+    }
+    if (dragStartMilliseconds > 16) {
+        DestroyWindow(mainWindow);
+        app.Run();
+        std::wcerr << L"Widget drag start exceeded the 16 ms interaction budget\n";
+        return 57;
+    }
+    if (reorderMilliseconds > 16) {
+        DestroyWindow(mainWindow);
+        app.Run();
+        std::wcerr << L"Widget reorder handler exceeded the 16 ms interaction budget\n";
+        return 56;
+    }
+    if (configLoadMilliseconds > 16) {
+        DestroyWindow(mainWindow);
+        app.Run();
+        std::wcerr << L"Widget config synchronization exceeded the 16 ms interaction budget\n";
+        return 60;
+    }
+    if (!ConfigStore::DrainPendingWrites(5000)) {
+        DestroyWindow(mainWindow);
+        app.Run();
+        return fail(L"Widget interaction async persistence did not drain", 58);
+    }
     const std::optional<std::string> configBeforeUpdateExit =
         ReadFileBytes(configStore.ConfigPath());
     const UINT updateExitMessage =
@@ -2586,6 +2729,22 @@ int RunSmokeWidgetDropLatency(HINSTANCE instance) {
     item.displayName = L"延迟测试";
     item.originalDesktopPath = desktopPath.wstring();
     config.items.push_back(item);
+    for (int index = 0; index < 163; ++index) {
+        ItemConfig filler;
+        filler.id = L"widget-drop-latency-filler-" + std::to_wstring(index);
+        filler.path =
+            (dataRoot / (L"大配置填充-" + std::to_wstring(index) +
+                L"-abcdefghijklmnopqrstuvwxyz-ABCDEFGHIJKLMNOPQRSTUVWXYZ-0123456789.txt")).wstring();
+        filler.displayName = L"大配置填充项目-" + std::to_wstring(index);
+        config.items.push_back(std::move(filler));
+    }
+    for (int index = 0; index < 219; ++index) {
+        config.desktopLayout.push_back(DesktopPlacementConfig{
+            (desktopRoot / (L"释放延迟布局填充-" + std::to_wstring(index) +
+                L"-abcdefghijklmnopqrstuvwxyz-ABCDEFGHIJKLMNOPQRSTUVWXYZ-0123456789.txt")).wstring(),
+            index * 13,
+            index * 9});
+    }
     CategoryConfig category;
     category.id = categoryId;
     category.name = categoryName;
@@ -2702,8 +2861,8 @@ int RunSmokeWidgetDropLatency(HINSTANCE instance) {
     if (!ownerState.requestReceived || !ownerState.requestCopied || ownerState.requestCount != 1) {
         return fail(L"Widget drop latency placement handoff was not copied exactly once", 62);
     }
-    if (ownerState.configSyncCount != 1) {
-        return fail(L"Widget drop latency config-only synchronization was not posted exactly once", 71);
+    if (ownerState.configSyncCount != 0) {
+        return fail(L"Widget drop latency handoff performed an eager config synchronization", 71);
     }
     if (ownerState.fullRefreshCount != 0) {
         return fail(L"Widget drop latency queued handoff triggered an eager full refresh", 72);
@@ -2720,6 +2879,14 @@ int RunSmokeWidgetDropLatency(HINSTANCE instance) {
     }
     if (ownerState.request.dragGhostGeneration != dragGhostGeneration ||
         ownerState.request.sourceWindow != widgetWindow ||
+        !ownerState.request.commitMoveOut ||
+        ownerState.request.itemId != item.id ||
+        CompareStringOrdinal(
+            ownerState.request.sourcePath.c_str(),
+            -1,
+            managedPath.c_str(),
+            -1,
+            TRUE) != CSTR_EQUAL ||
         CompareStringOrdinal(
             ownerState.request.path.c_str(),
             -1,
@@ -2728,10 +2895,33 @@ int RunSmokeWidgetDropLatency(HINSTANCE instance) {
             TRUE) != CSTR_EQUAL) {
         return fail(L"Widget drop latency placement request metadata mismatch", 65);
     }
+    {
+        std::ofstream timing(
+            std::filesystem::path(baseValue) / L"widget-drop-latency-timing.txt",
+            std::ios::binary | std::ios::trunc);
+        timing << "request=" << ownerState.requestLatencyMilliseconds << "\n"
+               << "release=" << releaseDurationMilliseconds << "\n";
+    }
     if (ownerState.requestLatencyMilliseconds < 0.0 ||
         ownerState.requestLatencyMilliseconds > kMaximumReleaseLatencyMilliseconds ||
         releaseDurationMilliseconds > kMaximumReleaseLatencyMilliseconds) {
         return fail(L"Widget drop latency exceeded the 50 ms synchronous release budget", 66);
+    }
+    std::wstring committedDesktopPath;
+    std::wstring commitError;
+    if (!CommitDesktopMoveOutTransaction(
+            ownerState.request,
+            committedDesktopPath,
+            commitError) ||
+        CompareStringOrdinal(
+            committedDesktopPath.c_str(),
+            -1,
+            desktopPath.c_str(),
+            -1,
+            TRUE) != CSTR_EQUAL) {
+        return fail(
+            L"Widget drop latency background transaction failed: " + commitError,
+            73);
     }
     if (std::filesystem::exists(managedPath) || !std::filesystem::exists(desktopPath)) {
         return fail(L"Widget drop latency fixture was not moved to the isolated desktop", 67);
@@ -3010,6 +3200,22 @@ int RunSmokeWidgetDropPlacement(HINSTANCE instance) {
             (desktopRoot / basePaths[index].filename()).wstring();
         config.items.push_back(std::move(item));
     }
+    for (int index = 0; index < 160; ++index) {
+        ItemConfig filler;
+        filler.id = L"widget-drop-placement-filler-" + std::to_wstring(index);
+        filler.path =
+            (dataRoot / (L"入格性能规模填充-" + std::to_wstring(index) +
+                L"-abcdefghijklmnopqrstuvwxyz-ABCDEFGHIJKLMNOPQRSTUVWXYZ-0123456789.txt")).wstring();
+        filler.displayName = L"入格性能规模填充项目-" + std::to_wstring(index);
+        config.items.push_back(std::move(filler));
+    }
+    for (int index = 0; index < 219; ++index) {
+        config.desktopLayout.push_back(DesktopPlacementConfig{
+            (desktopRoot / (L"入格布局规模填充-" + std::to_wstring(index) +
+                L"-abcdefghijklmnopqrstuvwxyz-ABCDEFGHIJKLMNOPQRSTUVWXYZ-0123456789.txt")).wstring(),
+            index * 17,
+            index * 12});
+    }
     CategoryConfig category;
     category.id = categoryId;
     category.name = categoryName;
@@ -3157,7 +3363,7 @@ int RunSmokeWidgetDropPlacement(HINSTANCE instance) {
         WidgetWindowSmokeAccess::LastPlaceholderDrawCount(widget) != 0) {
         return fail(
             L"Widget drop placement base icon warmup did not stabilize",
-            96);
+            114);
     }
 
     DesktopScanner scanner;
@@ -3176,6 +3382,13 @@ int RunSmokeWidgetDropPlacement(HINSTANCE instance) {
         dropPaths,
         insertionPoint,
         false);
+    if (!RedrawWindow(
+            widgetWindow,
+            nullptr,
+            nullptr,
+            RDW_INVALIDATE | RDW_UPDATENOW)) {
+        return fail(L"Widget drop placement preview frame was not painted", 115);
+    }
     const std::uint64_t loadGenerationBefore =
         WidgetWindowSmokeAccess::LoadItemsGeneration(widget);
     const std::uint64_t gridGenerationBefore =
@@ -3187,6 +3400,7 @@ int RunSmokeWidgetDropPlacement(HINSTANCE instance) {
             insertionPoint)) {
         return fail(L"Widget drop placement batch queue returned false", 87);
     }
+    const ULONGLONG queueDurationMs = GetTickCount64() - dropStartedAt;
     if (!WidgetWindowSmokeAccess::DropQueued(widget) ||
         !WidgetWindowSmokeAccess::DropBusy(widget) ||
         !WidgetWindowSmokeAccess::DropProjectionActive(widget)) {
@@ -3212,27 +3426,75 @@ int RunSmokeWidgetDropPlacement(HINSTANCE instance) {
         WidgetWindowSmokeAccess::PendingShowError(widget)) {
         return fail(L"Widget drop placement second queue changed pending payload", 107);
     }
+    const ULONGLONG dispatchStartedAt = GetTickCount64();
     if (!WidgetWindowSmokeAccess::DispatchQueuedDrop(widget)) {
         return fail(L"Widget drop placement commit message was not dispatched", 108);
     }
+    const ULONGLONG dispatchDurationMs = GetTickCount64() - dispatchStartedAt;
     if (WidgetWindowSmokeAccess::DropQueued(widget) ||
+        !WidgetWindowSmokeAccess::DropBusy(widget) ||
+        !WidgetWindowSmokeAccess::DropProjectionActive(widget) ||
+        WidgetWindowSmokeAccess::PendingPaths(widget) != dropPaths ||
+        WidgetWindowSmokeAccess::PendingIndex(widget) != 2 ||
+        WidgetWindowSmokeAccess::PendingShowError(widget) ||
+        !ownerState.collectionRequestCopied ||
+        ownerState.collectionRequestCount != 1) {
+        return fail(L"Widget drop placement async handoff state mismatch", 109);
+    }
+    const ULONGLONG dropDurationMs = GetTickCount64() - dropStartedAt;
+    {
+        std::ofstream timing(
+            std::filesystem::path(baseValue) / L"widget-drop-placement-timing.txt",
+            std::ios::binary | std::ios::trunc);
+        timing << "queue=" << queueDurationMs << "\n";
+        timing << "dispatch=" << dispatchDurationMs << "\n";
+        timing << "queue_and_commit=" << dropDurationMs << "\n";
+    }
+    if (dropDurationMs > 50) {
+        return fail(
+            L"Widget drop placement exceeded the 50 ms UI-thread commit budget",
+            110);
+    }
+    constexpr size_t kUniqueIncomingCount = 4;
+    for (size_t index = 0; index < kUniqueIncomingCount; ++index) {
+        if (!ownerState.collectionRequestCopied) {
+            return fail(L"Widget drop placement did not queue the next atomic item", 111);
+        }
+        const DesktopCollectionItemRequest request = ownerState.collectionRequest;
+        ownerState.collectionRequestCopied = false;
+        DesktopCollectionItemResult result =
+            CommitDesktopCollectionItemTransaction(request);
+        SendMessageW(
+            widgetWindow,
+            kDesktopCollectionResultMessage,
+            0,
+            reinterpret_cast<LPARAM>(&result));
+        if (!result.succeeded) {
+            return fail(
+                L"Widget drop placement atomic background transaction failed: " +
+                    result.errorMessage,
+                112);
+        }
+    }
+    if (ownerState.collectionRequestCount !=
+            static_cast<int>(kUniqueIncomingCount) ||
+        WidgetWindowSmokeAccess::DropQueued(widget) ||
         WidgetWindowSmokeAccess::DropBusy(widget) ||
         WidgetWindowSmokeAccess::DropProjectionActive(widget) ||
         !WidgetWindowSmokeAccess::PendingPaths(widget).empty() ||
         WidgetWindowSmokeAccess::PendingIndex(widget) != -1 ||
         !WidgetWindowSmokeAccess::PendingShowError(widget)) {
-        return fail(L"Widget drop placement post-dispatch state mismatch", 109);
+        return fail(L"Widget drop placement async completion state mismatch", 113);
     }
-    const ULONGLONG dropDurationMs = GetTickCount64() - dropStartedAt;
     if (WidgetWindowSmokeAccess::LoadItemsGeneration(widget) !=
         loadGenerationBefore) {
         return fail(L"Widget drop placement batch called LoadItems", 88);
     }
     if (WidgetWindowSmokeAccess::GridItemsGeneration(widget) !=
-        gridGenerationBefore + 1) {
+            gridGenerationBefore) {
         return fail(
-            L"Widget drop placement replaced the visible grid more than once",
-            96);
+            L"Widget drop placement rebuilt the already-painted projection",
+            116);
     }
     const std::uint64_t committedGridGeneration =
         WidgetWindowSmokeAccess::GridItemsGeneration(widget);
@@ -3405,7 +3667,7 @@ int RunSmokeWidgetDropPlacement(HINSTANCE instance) {
     }
 
     if (!writeFixture(collisionOriginalPath, "reappeared original-path fixture")) {
-        return fail(L"Widget drop placement live collision fixture creation failed", 95);
+        return fail(L"Widget drop placement live collision fixture creation failed", 117);
     }
     const std::wstring collisionId =
         scanner.CreateItemFromPath(collisionOriginalPath.wstring()).id;
@@ -3420,12 +3682,12 @@ int RunSmokeWidgetDropPlacement(HINSTANCE instance) {
         persisted.categories.end(),
         [&](const CategoryConfig& value) { return value.id == categoryId; });
     if (persistedCategory == persisted.categories.end()) {
-        return fail(L"Widget drop placement collision category missing", 95);
+        return fail(L"Widget drop placement collision category missing", 118);
     }
     persistedCategory->itemIds.push_back(collisionId);
     persisted.uncategorizedItemIds.push_back(collisionLiveId);
     if (!configStore.SaveAppConfig(persisted)) {
-        return fail(L"Widget drop placement collision setup save failed", 95);
+        return fail(L"Widget drop placement collision setup save failed", 119);
     }
     widget.RefreshFromConfig();
     while (PeekMessageW(
@@ -3458,14 +3720,37 @@ int RunSmokeWidgetDropPlacement(HINSTANCE instance) {
     const std::vector<std::wstring> collisionDropPaths{
         collisionOriginalPath.wstring(),
     };
+    const int collectionRequestCountBeforeCollision =
+        ownerState.collectionRequestCount;
     if (!WidgetWindowSmokeAccess::QueuePaths(
             widget,
             collisionDropPaths,
             collisionInsertionPoint)) {
-        return fail(L"Widget drop placement reappeared-path queue returned false", 95);
+        return fail(L"Widget drop placement reappeared-path queue returned false", 120);
     }
     if (!WidgetWindowSmokeAccess::DispatchQueuedDrop(widget)) {
-        return fail(L"Widget drop placement collision commit message missing", 95);
+        return fail(L"Widget drop placement collision commit message missing", 121);
+    }
+    if (!ownerState.collectionRequestCopied ||
+        ownerState.collectionRequestCount !=
+            collectionRequestCountBeforeCollision + 1) {
+        return fail(L"Widget drop placement collision async handoff missing", 122);
+    }
+    const DesktopCollectionItemRequest collisionRequest =
+        ownerState.collectionRequest;
+    ownerState.collectionRequestCopied = false;
+    DesktopCollectionItemResult collisionResult =
+        CommitDesktopCollectionItemTransaction(collisionRequest);
+    SendMessageW(
+        widgetWindow,
+        kDesktopCollectionResultMessage,
+        0,
+        reinterpret_cast<LPARAM>(&collisionResult));
+    if (!collisionResult.succeeded) {
+        return fail(
+            L"Widget drop placement collision background transaction failed: " +
+                collisionResult.errorMessage,
+            123);
     }
     if (WidgetWindowSmokeAccess::LoadItemsGeneration(widget) !=
         collisionLoadGeneration) {
@@ -3545,9 +3830,43 @@ int RunSmokeWidgetDropPlacement(HINSTANCE instance) {
         !samePath(newCollisionItem->path, collisionOriginalPath.wstring()) ||
         samePath(newCollisionItem->path, collisionManagedPath.wstring()) ||
         !std::filesystem::exists(collisionOriginalPath)) {
+        std::wofstream diagnostic(
+            std::filesystem::path(baseValue) /
+                L"widget-drop-placement-collision.txt",
+            std::ios::trunc);
+        diagnostic << L"category_found="
+                   << (collisionCategory != collisionPersisted.categories.end())
+                   << L"\nnew_id_count=" << newCollisionIds.size()
+                   << L"\nold_found="
+                   << (oldCollisionItem != collisionPersisted.items.end())
+                   << L"\nnew_found="
+                   << (newCollisionItem != collisionPersisted.items.end())
+                   << L"\nmanaged_exists="
+                   << std::filesystem::exists(collisionManagedPath)
+                   << L"\noriginal_exists="
+                   << std::filesystem::exists(collisionOriginalPath)
+                   << L"\nlive_referenced=" << liveCollisionIdStillReferenced
+                   << L"\n";
+        if (oldCollisionItem != collisionPersisted.items.end()) {
+            diagnostic << L"old_id=" << oldCollisionItem->id
+                       << L"\nold_path=" << oldCollisionItem->path
+                       << L"\nold_original=" << oldCollisionItem->originalDesktopPath
+                       << L"\n";
+        }
+        if (newCollisionItem != collisionPersisted.items.end()) {
+            diagnostic << L"new_id=" << newCollisionItem->id
+                       << L"\nnew_path=" << newCollisionItem->path
+                       << L"\nnew_original=" << newCollisionItem->originalDesktopPath
+                       << L"\n";
+        }
+        if (collisionCategory != collisionPersisted.categories.end()) {
+            for (const std::wstring& id : collisionCategory->itemIds) {
+                diagnostic << L"category_id=" << id << L"\n";
+            }
+        }
         return fail(
             L"Widget drop placement reused an ID for a live reference path collision",
-            95);
+            124);
     }
 
     WidgetWindowSmokeAccess::MoveItemToCategory(
@@ -3568,11 +3887,11 @@ int RunSmokeWidgetDropPlacement(HINSTANCE instance) {
             incomingIds.front()) != 1 ||
         !std::filesystem::exists(incomingPaths.front()) ||
         std::filesystem::exists(managedRoot / incomingPaths.front().filename())) {
-        return fail(L"Widget reference category move touched the original item", 95);
+        return fail(L"Widget reference category move touched the original item", 125);
     }
     const std::wstring removedReferenceId = incomingIds[1];
     if (!WidgetWindowSmokeAccess::MoveItemOut(widget, removedReferenceId)) {
-        return fail(L"Widget reference removal returned false", 95);
+        return fail(L"Widget reference removal returned false", 126);
     }
     const AppConfig removedReferenceConfig = configStore.LoadAppConfig();
     const bool removedReferenceStillRegistered = std::any_of(
@@ -3584,7 +3903,7 @@ int RunSmokeWidgetDropPlacement(HINSTANCE instance) {
     if (removedReferenceStillRegistered ||
         !std::filesystem::exists(incomingPaths[1]) ||
         std::filesystem::exists(managedRoot / incomingPaths[1].filename())) {
-        return fail(L"Widget reference removal touched the original item", 95);
+        return fail(L"Widget reference removal touched the original item", 127);
     }
 
     if (!cleanup()) {

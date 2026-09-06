@@ -43,8 +43,10 @@ constexpr UINT_PTR kBackdropRefreshTimerId = 4;
 constexpr UINT kBackdropRefreshDelayMilliseconds = 80;
 constexpr UINT_PTR kIconDragTimerId = 5;
 constexpr UINT kIconDragPollMilliseconds = 16;
+constexpr UINT_PTR kInteractionSaveTimerId = 6;
+constexpr UINT kInteractionSaveDelayMilliseconds = 240;
 constexpr wchar_t kAlignmentGuideClassName[] = L"Lattice.AlignmentGuide";
-constexpr wchar_t kCurrentVersion[] = L"0.4.35";
+constexpr wchar_t kCurrentVersion[] = L"0.4.36";
 constexpr UINT kShellNewCommandFirst = 0x5000;
 constexpr UINT kShellNewCommandLast = 0x5FFF;
 
@@ -96,94 +98,57 @@ HWND FindDesktopWidgetHost() {
     return nullptr;
 }
 
-struct WidgetRectangleEnumerationState {
-    HWND current = nullptr;
-    DWORD processId = 0;
-    std::vector<RECT>* rectangles = nullptr;
-};
+std::vector<HWND>& RegisteredWidgetWindows() {
+    static std::vector<HWND> windows;
+    return windows;
+}
 
-void CollectWidgetRectangle(
-    HWND candidate,
-    WidgetRectangleEnumerationState& state) {
-    if (candidate == state.current || !IsWindowVisible(candidate)) {
+void CompactWidgetWindowRegistry() {
+    std::erase_if(
+        RegisteredWidgetWindows(),
+        [](HWND window) { return window == nullptr || IsWindow(window) == FALSE; });
+}
+
+void RegisterWidgetWindow(HWND window) {
+    if (window == nullptr) {
         return;
     }
-    DWORD processId = 0;
-    GetWindowThreadProcessId(candidate, &processId);
-    wchar_t className[64]{};
-    GetClassNameW(candidate, className, ARRAYSIZE(className));
-    if (processId != state.processId ||
-        wcscmp(className, kWindowClassName) != 0) {
-        return;
-    }
-    RECT rect{};
-    if (GetWindowRect(candidate, &rect)) {
-        state.rectangles->push_back(rect);
+    CompactWidgetWindowRegistry();
+    auto& windows = RegisteredWidgetWindows();
+    if (std::find(windows.begin(), windows.end(), window) == windows.end()) {
+        windows.push_back(window);
     }
 }
 
-BOOL CALLBACK CollectWidgetChildRectangle(HWND candidate, LPARAM parameter) {
-    auto* state = reinterpret_cast<WidgetRectangleEnumerationState*>(parameter);
-    CollectWidgetRectangle(candidate, *state);
-    return TRUE;
-}
-
-BOOL CALLBACK CollectWidgetTopLevelRectangle(HWND candidate, LPARAM parameter) {
-    auto* state = reinterpret_cast<WidgetRectangleEnumerationState*>(parameter);
-    CollectWidgetRectangle(candidate, *state);
-    EnumChildWindows(candidate, CollectWidgetChildRectangle, parameter);
-    return TRUE;
+void UnregisterWidgetWindow(HWND window) {
+    auto& windows = RegisteredWidgetWindows();
+    std::erase(windows, window);
+    CompactWidgetWindowRegistry();
 }
 
 std::vector<RECT> CollectOtherWidgetRectangles(HWND current) {
     std::vector<RECT> rectangles;
-    WidgetRectangleEnumerationState state{
-        current,
-        GetCurrentProcessId(),
-        &rectangles};
-    EnumWindows(
-        CollectWidgetTopLevelRectangle,
-        reinterpret_cast<LPARAM>(&state));
+    CompactWidgetWindowRegistry();
+    for (HWND candidate : RegisteredWidgetWindows()) {
+        if (candidate == current || IsWindowVisible(candidate) == FALSE) {
+            continue;
+        }
+        RECT rect{};
+        if (GetWindowRect(candidate, &rect)) {
+            rectangles.push_back(rect);
+        }
+    }
     return rectangles;
-}
-
-struct WidgetHandleEnumerationState {
-    HWND current = nullptr;
-    DWORD processId = 0;
-    std::vector<HWND>* windows = nullptr;
-};
-
-void CollectSiblingWidgetHandle(
-    HWND candidate,
-    WidgetHandleEnumerationState& state) {
-    if (candidate == state.current || IsWindowVisible(candidate) == FALSE) {
-        return;
-    }
-    DWORD processId = 0;
-    GetWindowThreadProcessId(candidate, &processId);
-    wchar_t className[64]{};
-    GetClassNameW(candidate, className, ARRAYSIZE(className));
-    if (processId == state.processId &&
-        wcscmp(className, kWindowClassName) == 0) {
-        state.windows->push_back(candidate);
-    }
-}
-
-BOOL CALLBACK CollectSiblingWidgetTopLevel(HWND candidate, LPARAM parameter) {
-    auto* state = reinterpret_cast<WidgetHandleEnumerationState*>(parameter);
-    CollectSiblingWidgetHandle(candidate, *state);
-    return TRUE;
 }
 
 std::vector<HWND> CollectOtherWidgetWindows(HWND current) {
     std::vector<HWND> windows;
-    WidgetHandleEnumerationState state{
-        current,
-        GetCurrentProcessId(),
-        &windows};
-    EnumWindows(
-        CollectSiblingWidgetTopLevel,
-        reinterpret_cast<LPARAM>(&state));
+    CompactWidgetWindowRegistry();
+    for (HWND candidate : RegisteredWidgetWindows()) {
+        if (candidate != current && IsWindowVisible(candidate) != FALSE) {
+            windows.push_back(candidate);
+        }
+    }
     return windows;
 }
 
@@ -450,6 +415,7 @@ bool WidgetWindow::Create() {
         hwnd_ = createWindow(nullptr);
     }
     if (hwnd_ != nullptr) {
+        RegisterWidgetWindow(hwnd_);
         windowConfig_.dpi = GetDpiForWindow(hwnd_);
         if (windowConfig_.collapsed) {
             windowConfig_.height = DipToPixels(kTitleHeight);
@@ -463,8 +429,12 @@ bool WidgetWindow::Create() {
         MaintainDesktopLayer();
         ConfigureDeskGoWindowChrome(hwnd_);
         EnsureWindowVisible();
-        RefreshWallpaperBackdrop();
         RedrawWindow(hwnd_, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_ERASE | RDW_FRAME);
+        DragGhostWindow::Instance().Prepare(
+            instance_,
+            hwnd_,
+            windowConfig_.iconSize,
+            iconGrid_.SlotSize());
     }
     return hwnd_ != nullptr;
 }
@@ -666,7 +636,9 @@ LRESULT WidgetWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) 
         case WM_SIZE:
             d2d_.Resize(LOWORD(lParam), HIWORD(lParam));
             iconGrid_.SetBounds(GridBounds());
-            ScheduleWallpaperBackdropRefresh();
+            if (!wallpaperBackdrop_.CoversPixels(LOWORD(lParam), HIWORD(lParam))) {
+                ScheduleWallpaperBackdropRefresh();
+            }
             InvalidateRect(hwnd_, nullptr, FALSE);
             return 0;
 
@@ -805,6 +777,18 @@ LRESULT WidgetWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) 
                     draggingItemId_ = dragItem->id;
                     dragTargetIndex_ = iconIndex;
                     dragStartPoint_ = point;
+                    const bool shortcut =
+                        dragItem->kind == DesktopItemKind::Shortcut ||
+                        dragItem->kind == DesktopItemKind::UrlShortcut;
+                    DragGhostWindow::Instance().Stage(
+                        instance_,
+                        hwnd_,
+                        dragItem->path,
+                        iconCache_.CopyReadyIconForDrag(dragItem->path),
+                        dragItem->displayName,
+                        shortcut,
+                        windowConfig_.iconSize,
+                        iconGrid_.SlotSize());
                     SetCapture(hwnd_);
                     SetTimer(hwnd_, kIconDragTimerId, kIconDragPollMilliseconds, nullptr);
                     return 0;
@@ -940,7 +924,7 @@ LRESULT WidgetWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) 
         case WM_EXITSIZEMOVE:
             AlignmentGuideOverlay::Hide();
             SaveLayout();
-            RefreshWallpaperBackdrop();
+            ScheduleWallpaperBackdropRefresh();
             return 0;
 
         case WM_TIMER:
@@ -964,29 +948,38 @@ LRESULT WidgetWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) 
                 RefreshWallpaperBackdrop();
                 return 0;
             }
+            if (wParam == kInteractionSaveTimerId) {
+                KillTimer(hwnd_, kInteractionSaveTimerId);
+                FlushPendingInteractionSave();
+                return 0;
+            }
             break;
 
         case kWidgetShellDropCommitMessage: {
             if (!shellDropQueued_) {
                 return 0;
             }
-            std::vector<std::wstring> paths =
-                std::move(pendingShellDropPaths_);
-            std::vector<DesktopDropPosition> desktopPositions =
-                std::move(pendingShellDropDesktopPositions_);
-            const int insertionIndex = pendingShellDropInsertionIndex_;
-            const bool showError = pendingShellDropShowError_;
-            pendingShellDropPaths_.clear();
-            pendingShellDropDesktopPositions_.clear();
-            pendingShellDropInsertionIndex_ = -1;
-            pendingShellDropShowError_ = true;
             shellDropQueued_ = false;
-            AddDroppedPaths(
-                paths,
-                nullptr,
-                showError,
-                &insertionIndex,
-                &desktopPositions);
+            shellDropCommitActive_ = true;
+            desktopCollectionPathIndex_ = 0;
+            desktopCollectionCommittedCount_ = 0;
+            desktopCollectionBaseInsertionIndex_ = pendingShellDropInsertionIndex_;
+            shellDropCommittedItems_ = currentItems_;
+            ClearShellDropPreview(false);
+            if (!QueueNextDesktopCollectionItem()) {
+                FinishDesktopCollectionBatch(
+                    false,
+                    L"无法把桌面项目交给后台收纳任务。请稍后重试。");
+            }
+            return 0;
+        }
+
+        case kDesktopCollectionResultMessage: {
+            const auto* result =
+                reinterpret_cast<const DesktopCollectionItemResult*>(lParam);
+            if (result != nullptr) {
+                HandleDesktopCollectionResult(*result);
+            }
             return 0;
         }
 
@@ -1000,6 +993,7 @@ LRESULT WidgetWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) 
                 refreshPending_ = true;
                 return 0;
             }
+            FlushPendingInteractionSave();
             refreshPending_ = false;
             LoadConfig();
             LoadItems();
@@ -1022,8 +1016,13 @@ LRESULT WidgetWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) 
             return 0;
 
         case WM_DESTROY:
+            FlushPendingInteractionSave();
+            UnregisterWidgetWindow(hwnd_);
             iconCache_.SetInvalidateCallback(nullptr);
             pendingShellDropPaths_.clear();
+            pendingShellDropDesktopPositions_.clear();
+            shellDropProjectedItems_.clear();
+            shellDropCommittedItems_.clear();
             pendingShellDropInsertionIndex_ = -1;
             pendingShellDropShowError_ = true;
             shellDropQueued_ = false;
@@ -1034,6 +1033,7 @@ LRESULT WidgetWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) 
             AlignmentGuideOverlay::Hide();
             KillTimer(hwnd_, kIconDragTimerId);
             KillTimer(hwnd_, kBackdropRefreshTimerId);
+            KillTimer(hwnd_, kInteractionSaveTimerId);
             if (shellDropTargetRegistered_) {
                 UnregisterShellDropTarget(hwnd_);
                 shellDropTargetRegistered_ = false;
@@ -1123,6 +1123,7 @@ void WidgetWindow::EnsureWindowVisible() {
 void WidgetWindow::LoadItems() {
     ++loadItemsGeneration_;
     const AppConfig appConfig = configStore_.LoadAppConfig();
+    registeredItems_ = appConfig.items;
     DesktopScanner scanner;
     items_ = scanner.Scan(appConfig.settings.showPublicDesktopItems);
     for (const ItemConfig& registered : appConfig.items) {
@@ -1288,6 +1289,7 @@ bool WidgetWindow::QueueDroppedPaths(
     // last DragOver. Project the final path sequence at the final release point
     // before the queued frame is painted and any file I/O starts.
     ApplyShellDropProjection(paths, insertionIndex);
+    const bool finalProjectionAlreadyPainted = shellDropProjectionPainted_;
 
     pendingShellDropPaths_ = paths;
     pendingShellDropDesktopPositions_ = std::move(desktopPositions);
@@ -1300,11 +1302,13 @@ bool WidgetWindow::QueueDroppedPaths(
         : -1;
     iconGrid_.SetHoverIndex(hoverIconIndex_);
     iconGrid_.SetSelectedIndex(-1);
-    RedrawWindow(
-        hwnd_,
-        nullptr,
-        nullptr,
-        RDW_INVALIDATE | RDW_UPDATENOW);
+    if (!finalProjectionAlreadyPainted) {
+        RedrawWindow(
+            hwnd_,
+            nullptr,
+            nullptr,
+            RDW_INVALIDATE | RDW_UPDATENOW);
+    }
 
     if (PostMessageW(hwnd_, kWidgetShellDropCommitMessage, 0, 0) == FALSE) {
         pendingShellDropPaths_.clear();
@@ -1315,6 +1319,7 @@ bool WidgetWindow::QueueDroppedPaths(
         if (shellDropProjectionActive_) {
             iconGrid_.SetItems(currentItems_);
             shellDropProjectionActive_ = false;
+            shellDropProjectionPainted_ = false;
         }
         RedrawWindow(
             hwnd_,
@@ -1418,7 +1423,9 @@ void WidgetWindow::ApplyShellDropProjection(
     iconGrid_.SetSelectedIndex(-1);
     shellDropPreviewActive_ = true;
     shellDropProjectionActive_ = true;
+    shellDropProjectionPainted_ = false;
     shellDropPreviewPaths_ = std::move(projectedPaths);
+    shellDropProjectedItems_ = projectedItems;
     shellDropInsertionIndex_ = insertionIndex;
     iconGrid_.SetItems(std::move(projectedItems));
     InvalidateRect(hwnd_, nullptr, FALSE);
@@ -1436,6 +1443,8 @@ void WidgetWindow::ClearShellDropPreview(bool flushDeferredRefresh) {
         !shellDropQueued_) {
         iconGrid_.SetItems(currentItems_);
         shellDropProjectionActive_ = false;
+        shellDropProjectionPainted_ = false;
+        shellDropProjectedItems_.clear();
         changed = true;
     }
     if (changed && hwnd_ != nullptr) {
@@ -1443,6 +1452,195 @@ void WidgetWindow::ClearShellDropPreview(bool flushDeferredRefresh) {
     }
     if (flushDeferredRefresh) {
         FlushDeferredRefresh();
+    }
+}
+
+bool WidgetWindow::QueueNextDesktopCollectionItem() {
+    while (desktopCollectionPathIndex_ < pendingShellDropPaths_.size()) {
+        const size_t index = desktopCollectionPathIndex_;
+        const std::wstring& path = pendingShellDropPaths_[index];
+        const bool duplicate = std::any_of(
+            pendingShellDropPaths_.begin(),
+            pendingShellDropPaths_.begin() + static_cast<std::ptrdiff_t>(index),
+            [&](const std::wstring& previous) {
+                return CompareStringOrdinal(
+                           previous.c_str(), -1,
+                           path.c_str(), -1,
+                           TRUE) == CSTR_EQUAL;
+            });
+        if (duplicate) {
+            ++desktopCollectionPathIndex_;
+            continue;
+        }
+
+        DesktopCollectionItemRequest request;
+        request.categoryId = categoryId_;
+        request.path = path;
+        request.insertionIndex = static_cast<size_t>(std::max(
+            0,
+            desktopCollectionBaseInsertionIndex_ +
+                static_cast<int>(desktopCollectionCommittedCount_)));
+        request.showError = pendingShellDropShowError_;
+        request.sourceWindow = hwnd_;
+        const auto visibleItem = std::find_if(
+            items_.begin(),
+            items_.end(),
+            [&](const DesktopItem& value) {
+                return CompareStringOrdinal(
+                           value.path.c_str(), -1,
+                           path.c_str(), -1,
+                           TRUE) == CSTR_EQUAL;
+            });
+        if (visibleItem != items_.end()) {
+            request.sourceVisibleId = visibleItem->id;
+        }
+        const auto desktopPosition = std::find_if(
+            pendingShellDropDesktopPositions_.begin(),
+            pendingShellDropDesktopPositions_.end(),
+            [&](const DesktopDropPosition& value) {
+                return CompareStringOrdinal(
+                           value.path.c_str(), -1,
+                           path.c_str(), -1,
+                           TRUE) == CSTR_EQUAL;
+            });
+        if (desktopPosition != pendingShellDropDesktopPositions_.end()) {
+            request.desktopPoint = desktopPosition->point;
+            request.hasDesktopPoint = true;
+        }
+        return owner_ != nullptr && IsWindow(owner_) != FALSE &&
+               SendMessageW(
+                   owner_,
+                   kDesktopCollectionRequestMessage,
+                   0,
+                   reinterpret_cast<LPARAM>(&request)) != 0;
+    }
+    return false;
+}
+
+void WidgetWindow::HandleDesktopCollectionResult(
+    const DesktopCollectionItemResult& result) {
+    if (!shellDropCommitActive_ ||
+        desktopCollectionPathIndex_ >= pendingShellDropPaths_.size()) {
+        return;
+    }
+    if (!result.succeeded) {
+        FinishDesktopCollectionBatch(false, result.errorMessage);
+        return;
+    }
+
+    if (CompareStringOrdinal(
+            result.sourcePath.c_str(), -1,
+            result.destinationPath.c_str(), -1,
+            TRUE) != CSTR_EQUAL) {
+        iconCache_.Alias(result.sourcePath, result.destinationPath);
+    }
+    DesktopItem committedItem;
+    bool foundProjectedItem = false;
+    for (DesktopItem& item : shellDropProjectedItems_) {
+        if (CompareStringOrdinal(
+                item.path.c_str(), -1,
+                result.sourcePath.c_str(), -1,
+                TRUE) == CSTR_EQUAL) {
+            item.id = result.itemId;
+            item.path = result.destinationPath;
+            committedItem = item;
+            foundProjectedItem = true;
+            break;
+        }
+    }
+    if (foundProjectedItem) {
+        const auto eraseMatching = [&](std::vector<DesktopItem>& values) {
+            values.erase(
+                std::remove_if(
+                    values.begin(),
+                    values.end(),
+                    [&](const DesktopItem& value) {
+                        return value.id == result.itemId ||
+                               CompareStringOrdinal(
+                                   value.path.c_str(), -1,
+                                   result.sourcePath.c_str(), -1,
+                                   TRUE) == CSTR_EQUAL;
+                    }),
+                values.end());
+        };
+        eraseMatching(items_);
+        eraseMatching(shellDropCommittedItems_);
+        items_.push_back(committedItem);
+        const size_t insertionIndex = (std::min)(
+            static_cast<size_t>(std::max(0, desktopCollectionBaseInsertionIndex_)) +
+                desktopCollectionCommittedCount_,
+            shellDropCommittedItems_.size());
+        shellDropCommittedItems_.insert(
+            shellDropCommittedItems_.begin() +
+                static_cast<std::ptrdiff_t>(insertionIndex),
+            committedItem);
+    }
+    iconGrid_.UpdateItemIdentity(
+        result.sourcePath,
+        result.itemId,
+        result.destinationPath);
+    const auto registered = std::find_if(
+        registeredItems_.begin(),
+        registeredItems_.end(),
+        [&](const ItemConfig& value) { return value.id == result.itemId; });
+    if (registered == registeredItems_.end()) {
+        registeredItems_.push_back(result.itemState);
+    } else {
+        *registered = result.itemState;
+    }
+
+    ++desktopCollectionCommittedCount_;
+    ++desktopCollectionPathIndex_;
+    if (QueueNextDesktopCollectionItem()) {
+        return;
+    }
+    if (desktopCollectionPathIndex_ >= pendingShellDropPaths_.size()) {
+        FinishDesktopCollectionBatch(true, {});
+    } else {
+        FinishDesktopCollectionBatch(
+            false,
+            L"无法把后续桌面项目交给后台收纳任务。已完成的项目保持安全收纳状态。");
+    }
+}
+
+void WidgetWindow::FinishDesktopCollectionBatch(
+    bool allSucceeded,
+    const std::wstring& errorMessage) {
+    const bool showError = pendingShellDropShowError_;
+    const bool anyCommitted = desktopCollectionCommittedCount_ != 0;
+    if (allSucceeded && anyCommitted) {
+        currentItems_ = shellDropProjectedItems_;
+    } else if (anyCommitted) {
+        currentItems_ = shellDropCommittedItems_;
+        iconGrid_.SetItems(currentItems_);
+    } else {
+        iconGrid_.SetItems(currentItems_);
+    }
+    shellDropProjectedItems_.clear();
+    shellDropCommittedItems_.clear();
+    shellDropProjectionActive_ = false;
+    shellDropProjectionPainted_ = false;
+    shellDropCommitActive_ = false;
+    shellDropQueued_ = false;
+    pendingShellDropPaths_.clear();
+    pendingShellDropDesktopPositions_.clear();
+    pendingShellDropInsertionIndex_ = -1;
+    pendingShellDropShowError_ = true;
+    desktopCollectionPathIndex_ = 0;
+    desktopCollectionCommittedCount_ = 0;
+    desktopCollectionBaseInsertionIndex_ = 0;
+    if (anyCommitted && owner_ != nullptr && IsWindow(owner_) != FALSE) {
+        PostMessageW(owner_, kOrganizerConfigSyncMessage, 0, 0);
+    }
+    RedrawWindow(hwnd_, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW);
+    FlushDeferredRefresh();
+    if (!allSucceeded && showError && !errorMessage.empty()) {
+        MessageDialog::Show(
+            instance_,
+            hwnd_,
+            errorMessage.c_str(),
+            L"桌面项目收纳失败",
+            MB_OK | MB_ICONERROR);
     }
 }
 
@@ -1493,6 +1691,7 @@ bool WidgetWindow::AddDroppedPaths(
             iconGrid_.SetItems(currentItems_);
         }
         shellDropProjectionActive_ = false;
+        shellDropProjectionPainted_ = false;
         shellDropCommitActive_ = false;
         redrawCommittedFrame();
         FlushDeferredRefresh();
@@ -1992,20 +2191,43 @@ void WidgetWindow::SaveLayout() {
         windowConfig_.monitorId = monitorInfo.szDevice;
     }
 
-    AppConfig appConfig = configStore_.LoadAppConfig();
-    if (categoryId_ == kUncategorizedCategoryId) {
-        appConfig.window = windowConfig_;
-    } else {
-        for (CategoryConfig& category : appConfig.categories) {
-            if (category.id == categoryId_) {
-                category.layout = windowConfig_;
-                break;
-            }
-        }
+    pendingLayout_ = windowConfig_;
+    interactionSavePending_ = true;
+    ScheduleInteractionSave();
+}
+
+void WidgetWindow::ScheduleInteractionSave() {
+    if (hwnd_ != nullptr && IsWindow(hwnd_) != FALSE) {
+        KillTimer(hwnd_, kInteractionSaveTimerId);
+        SetTimer(hwnd_, kInteractionSaveTimerId, kInteractionSaveDelayMilliseconds, nullptr);
     }
-    if (configStore_.SaveAppConfig(appConfig) && owner_ != nullptr && IsWindow(owner_)) {
-        SendMessageW(owner_, kOrganizerConfigChangedMessage, 0, 0);
+}
+
+bool WidgetWindow::FlushPendingInteractionSave() {
+    if (!interactionSavePending_) {
+        return true;
     }
+    if (hwnd_ != nullptr && IsWindow(hwnd_) != FALSE) {
+        KillTimer(hwnd_, kInteractionSaveTimerId);
+    }
+    const WindowConfig layout = pendingLayout_;
+    const bool saveOrder = pendingOrderValid_;
+    const std::vector<std::wstring> order = pendingOrderIds_;
+    if (!configStore_.SaveInteractionStateAsync(
+            categoryId_,
+            layout,
+            order,
+            saveOrder)) {
+        ScheduleInteractionSave();
+        return false;
+    }
+    interactionSavePending_ = false;
+    pendingOrderValid_ = false;
+    pendingOrderIds_.clear();
+    if (owner_ != nullptr && IsWindow(owner_)) {
+        PostMessageW(owner_, kOrganizerConfigSyncMessage, 0, 0);
+    }
+    return true;
 }
 
 void WidgetWindow::ReorderItem(size_t fromIndex, size_t toIndex) {
@@ -2014,35 +2236,21 @@ void WidgetWindow::ReorderItem(size_t fromIndex, size_t toIndex) {
     }
     windowConfig_.autoArrange = false;
     windowConfig_.sortMode = 0;
-    AppConfig appConfig = configStore_.LoadAppConfig();
-    std::vector<std::wstring>* itemIds = &appConfig.uncategorizedItemIds;
-    WindowConfig* storedLayout = &appConfig.window;
-    for (CategoryConfig& category : appConfig.categories) {
-        if (category.id == categoryId_) {
-            itemIds = &category.itemIds;
-            storedLayout = &category.layout;
-            break;
-        }
+    DesktopItem moving = currentItems_[fromIndex];
+    currentItems_.erase(currentItems_.begin() + static_cast<std::ptrdiff_t>(fromIndex));
+    currentItems_.insert(
+        currentItems_.begin() + static_cast<std::ptrdiff_t>(std::min(toIndex, currentItems_.size())),
+        std::move(moving));
+    iconGrid_.SetItems(currentItems_);
+    pendingLayout_ = windowConfig_;
+    pendingOrderIds_.clear();
+    pendingOrderIds_.reserve(currentItems_.size());
+    for (const DesktopItem& item : currentItems_) {
+        pendingOrderIds_.push_back(item.id);
     }
-    storedLayout->autoArrange = false;
-    storedLayout->sortMode = 0;
-    if (itemIds != nullptr) {
-        const std::wstring movingId = currentItems_[fromIndex].id;
-        const std::wstring targetId = currentItems_[toIndex].id;
-        auto fromIt = std::find(itemIds->begin(), itemIds->end(), movingId);
-        auto targetIt = std::find(itemIds->begin(), itemIds->end(), targetId);
-        if (fromIt == itemIds->end() || targetIt == itemIds->end()) {
-            return;
-        }
-        const size_t targetPosition = static_cast<size_t>(std::distance(itemIds->begin(), targetIt));
-        itemIds->erase(fromIt);
-        itemIds->insert(
-            itemIds->begin() + static_cast<std::ptrdiff_t>(std::min(targetPosition, itemIds->size())),
-            movingId);
-    }
-    configStore_.SaveAppConfig(appConfig);
-    RefreshCurrentItems();
-    PostMessageW(owner_, kOrganizerConfigChangedMessage, 0, 0);
+    pendingOrderValid_ = true;
+    interactionSavePending_ = true;
+    ScheduleInteractionSave();
     InvalidateRect(hwnd_, nullptr, FALSE);
 }
 
@@ -3363,11 +3571,64 @@ bool WidgetWindow::MoveItemOut(
         return false;
     }
     const std::wstring sourcePath = item->path;
-    const AppConfig beforeRemoval = configStore_.LoadAppConfig();
-    const auto registeredBeforeRemoval = std::find_if(beforeRemoval.items.begin(), beforeRemoval.items.end(), [&](const ItemConfig& value) {
+    auto registeredBeforeRemoval = std::find_if(registeredItems_.begin(), registeredItems_.end(), [&](const ItemConfig& value) {
         return value.id == itemId;
     });
-    ItemConfig placement = registeredBeforeRemoval == beforeRemoval.items.end() ? ItemConfig{} : *registeredBeforeRemoval;
+    bool placementCached = registeredBeforeRemoval != registeredItems_.end();
+    ItemConfig placement = placementCached ? *registeredBeforeRemoval : ItemConfig{};
+    if (dropScreenPoint != nullptr) {
+        const bool sourceIsManaged = shortcutStore_.IsManagedPath(sourcePath);
+        const bool hasValidOriginalDesktopPath =
+            !placement.originalDesktopPath.empty() &&
+            shortcutStore_.IsDesktopPath(placement.originalDesktopPath);
+        const std::wstring targetPath = sourceIsManaged
+            ? (hasValidOriginalDesktopPath
+                ? placement.originalDesktopPath
+                : JoinPath(shortcutStore_.DesktopPath(), FileNameFromPath(sourcePath)))
+            : sourcePath;
+        if (shortcutStore_.IsDesktopPath(targetPath) &&
+            owner_ != nullptr && IsWindow(owner_) != FALSE) {
+            DesktopPlacementRequest request;
+            request.path = targetPath;
+            request.screenPoint = *dropScreenPoint;
+            request.dragGhostGeneration = dragGhostGeneration;
+            request.showError = showError;
+            request.sourceWindow = hwnd_;
+            request.commitMoveOut = true;
+            request.itemId = itemId;
+            request.sourcePath = sourcePath;
+            request.itemState = placement;
+            if (SendMessageW(
+                    owner_,
+                    kDesktopPlacementRequestMessage,
+                    0,
+                    reinterpret_cast<LPARAM>(&request)) != 0) {
+                items_.erase(
+                    std::remove_if(items_.begin(), items_.end(), [&](const DesktopItem& value) {
+                        return value.id == itemId;
+                    }),
+                    items_.end());
+                currentItems_.erase(
+                    std::remove_if(currentItems_.begin(), currentItems_.end(), [&](const DesktopItem& value) {
+                        return value.id == itemId;
+                    }),
+                    currentItems_.end());
+                iconGrid_.SetItems(currentItems_);
+                InvalidateRect(hwnd_, nullptr, FALSE);
+                return true;
+            }
+        }
+    }
+    if (!placementCached) {
+        const AppConfig beforeRemoval = configStore_.LoadAppConfig();
+        const auto loadedPlacement = std::find_if(
+            beforeRemoval.items.begin(),
+            beforeRemoval.items.end(),
+            [&](const ItemConfig& value) { return value.id == itemId; });
+        if (loadedPlacement != beforeRemoval.items.end()) {
+            placement = *loadedPlacement;
+        }
+    }
     const auto removeFromConfig = [&]() {
         AppConfig config = configStore_.LoadAppConfig();
         config.uncategorizedItemIds.erase(
@@ -3532,7 +3793,14 @@ void WidgetWindow::RefreshWallpaperBackdrop() {
     if (hwnd_ == nullptr || d2d_.Target() == nullptr) {
         return;
     }
-    wallpaperBackdrop_.Refresh(hwnd_, d2d_.Target());
+    const int minimumHeight = windowConfig_.collapsed
+        ? (std::max)(windowConfig_.normalHeight, windowConfig_.height)
+        : windowConfig_.height;
+    wallpaperBackdrop_.Refresh(
+        hwnd_,
+        d2d_.Target(),
+        windowConfig_.width,
+        minimumHeight);
     InvalidateRect(hwnd_, nullptr, FALSE);
 }
 
@@ -3740,9 +4008,12 @@ void WidgetWindow::Render() {
     }
     const HRESULT hr = d2d_.EndDraw();
     if (hr == D2DERR_RECREATE_TARGET) {
+        shellDropProjectionPainted_ = false;
         iconCache_.Clear();
         d2d_.RecreateTarget(hwnd_);
         RefreshWallpaperBackdrop();
+    } else if (SUCCEEDED(hr) && shellDropProjectionActive_) {
+        shellDropProjectionPainted_ = true;
     }
     EndPaint(hwnd_, &paint);
 }

@@ -23,6 +23,7 @@ constexpr UINT kOrganizerConfigSyncMessage = WM_APP + 19;
 constexpr UINT kWidgetShellDropCommitMessage = WM_APP + 20;
 
 struct WidgetWindowSmokeAccess;
+struct DesktopCollectionItemResult;
 
 enum class WidgetHostCommand : UINT {
     CreateCategory = 1,
@@ -81,6 +82,8 @@ private:
     void RefreshWallpaperBackdrop();
     void ScheduleWallpaperBackdropRefresh();
     void SaveLayout();
+    bool FlushPendingInteractionSave();
+    void ScheduleInteractionSave();
     bool AddDroppedPaths(
         const std::vector<std::wstring>& paths,
         const POINT* dropScreenPoint = nullptr,
@@ -104,6 +107,10 @@ private:
         const std::vector<std::wstring>& paths,
         int insertionIndex);
     void ClearShellDropPreview(bool flushDeferredRefresh = false);
+    bool QueueNextDesktopCollectionItem();
+    void HandleDesktopCollectionResult(
+        const DesktopCollectionItemResult& result);
+    void FinishDesktopCollectionBatch(bool allSucceeded, const std::wstring& errorMessage);
     void RefreshCurrentItems();
     void ReorderItem(size_t fromIndex, size_t toIndex);
     void ShowBackgroundMenu(POINT screenPoint);
@@ -174,6 +181,7 @@ private:
     ShellLauncher launcher_;
     std::vector<DesktopItem> items_;
     std::vector<DesktopItem> currentItems_;
+    std::vector<ItemConfig> registeredItems_;
     int draggingIconIndex_ = -1;
     int dragTargetIndex_ = -1;
     POINT dragStartPoint_{};
@@ -188,6 +196,7 @@ private:
     bool shellDropTargetRegistered_ = false;
     bool shellDropPreviewActive_ = false;
     bool shellDropProjectionActive_ = false;
+    bool shellDropProjectionPainted_ = false;
     bool shellDropQueued_ = false;
     bool shellDropCommitActive_ = false;
     std::vector<std::wstring> pendingShellDropPaths_;
@@ -195,6 +204,15 @@ private:
     int pendingShellDropInsertionIndex_ = -1;
     bool pendingShellDropShowError_ = true;
     std::vector<std::wstring> shellDropPreviewPaths_;
+    std::vector<DesktopItem> shellDropProjectedItems_;
+    std::vector<DesktopItem> shellDropCommittedItems_;
     int shellDropInsertionIndex_ = -1;
+    size_t desktopCollectionPathIndex_ = 0;
+    size_t desktopCollectionCommittedCount_ = 0;
+    int desktopCollectionBaseInsertionIndex_ = 0;
     std::uint64_t loadItemsGeneration_ = 0;
+    bool interactionSavePending_ = false;
+    bool pendingOrderValid_ = false;
+    WindowConfig pendingLayout_{};
+    std::vector<std::wstring> pendingOrderIds_;
 };

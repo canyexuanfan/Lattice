@@ -1,11 +1,5 @@
 #include "ui/DragGhostWindow.h"
 
-#include <commctrl.h>
-#include <commoncontrols.h>
-#include <shellapi.h>
-#include <shobjidl.h>
-#include <wrl/client.h>
-
 #include <algorithm>
 
 namespace {
@@ -14,43 +8,6 @@ constexpr wchar_t kDragGhostClassName[] = L"Lattice.DragGhostWindow";
 constexpr COLORREF kTransparentColor = RGB(1, 2, 3);
 constexpr BYTE kDraggingAlpha = 255;
 constexpr BYTE kCommittedAlpha = 255;
-
-HICON LoadShellIcon(const std::wstring& path) {
-    SHFILEINFOW fileInfo{};
-    if (SHGetFileInfoW(
-            path.c_str(),
-            0,
-            &fileInfo,
-            sizeof(fileInfo),
-            SHGFI_ICON | SHGFI_SYSICONINDEX) == 0) {
-        return nullptr;
-    }
-
-    const int imageIndex = fileInfo.iIcon & 0x00FFFFFF;
-    Microsoft::WRL::ComPtr<IImageList> imageList;
-    HICON icon = nullptr;
-    if (SUCCEEDED(SHGetImageList(SHIL_EXTRALARGE, IID_PPV_ARGS(imageList.GetAddressOf()))) &&
-        imageList != nullptr) {
-        imageList->GetIcon(imageIndex, ILD_TRANSPARENT, &icon);
-    }
-    if (icon == nullptr && fileInfo.hIcon != nullptr) {
-        icon = fileInfo.hIcon;
-        fileInfo.hIcon = nullptr;
-    }
-    if (fileInfo.hIcon != nullptr) {
-        DestroyIcon(fileInfo.hIcon);
-    }
-    return icon;
-}
-
-HICON LoadShortcutOverlay() {
-    SHSTOCKICONINFO info{};
-    info.cbSize = sizeof(info);
-    if (FAILED(SHGetStockIconInfo(SIID_LINK, SHGSI_ICON | SHGSI_SMALLICON, &info))) {
-        return nullptr;
-    }
-    return info.hIcon;
-}
 
 }  // namespace
 
@@ -61,6 +18,7 @@ DragGhostWindow& DragGhostWindow::Instance() {
 
 DragGhostWindow::~DragGhostWindow() {
     ReleaseIcons();
+    ReleaseLabelFont();
     ReleaseSurface();
     if (hwnd_ != nullptr) {
         DestroyWindow(hwnd_);
@@ -68,45 +26,94 @@ DragGhostWindow::~DragGhostWindow() {
     }
 }
 
+void DragGhostWindow::Prepare(
+    HINSTANCE instance,
+    HWND sourceWindow,
+    int iconSizeDip,
+    SIZE slotSizeDip) {
+    ConfigureGeometry(sourceWindow, iconSizeDip, slotSizeDip);
+    if (!EnsureWindow(instance)) {
+        return;
+    }
+    EnsureSurface();
+    EnsureLabelFont();
+}
+
+void DragGhostWindow::Stage(
+    HINSTANCE instance,
+    HWND sourceWindow,
+    const std::wstring& contentKey,
+    HICON preparedIcon,
+    const std::wstring& displayName,
+    bool shortcut,
+    int iconSizeDip,
+    SIZE slotSizeDip) {
+    End();
+    ConfigureGeometry(sourceWindow, iconSizeDip, slotSizeDip);
+    if (!EnsureWindow(instance)) {
+        if (preparedIcon != nullptr) {
+            DestroyIcon(preparedIcon);
+        }
+        return;
+    }
+    icon_ = preparedIcon;
+    if (icon_ == nullptr) {
+        icon_ = CopyIcon(LoadIconW(nullptr, IDI_APPLICATION));
+    }
+    displayName_ = displayName;
+    shortcut_ = shortcut;
+    Render();
+    stagedContentKey_ = contentKey;
+    staged_ = true;
+}
+
 std::uint64_t DragGhostWindow::Begin(
     HINSTANCE instance,
     HWND sourceWindow,
-    const std::wstring& path,
+    const std::wstring& contentKey,
     const std::wstring& displayName,
     bool shortcut,
     int iconSizeDip,
     SIZE slotSizeDip,
     POINT grabOffsetDip,
     POINT cursorScreenPoint) {
-    End();
+    active_ = false;
+    committed_ = false;
+    hasPresented_ = false;
+    if (hwnd_ != nullptr) {
+        ShowWindow(hwnd_, SW_HIDE);
+    }
     ++generation_;
     if (generation_ == 0) {
         ++generation_;
     }
+    const SIZE stagedSize = windowSizePixels_;
+    const UINT stagedDpi = dpi_;
+    ConfigureGeometry(sourceWindow, iconSizeDip, slotSizeDip);
     if (!EnsureWindow(instance)) {
         return generation_;
     }
-    committed_ = false;
-
-    dpi_ = sourceWindow == nullptr ? 96 : GetDpiForWindow(sourceWindow);
-    if (dpi_ == 0) {
-        dpi_ = 96;
-    }
-    iconSizePixels_ = std::max(24, MulDiv(iconSizeDip, static_cast<int>(dpi_), 96));
-    windowSizePixels_.cx = std::max(
-        iconSizePixels_ + MulDiv(16, static_cast<int>(dpi_), 96),
-        MulDiv(slotSizeDip.cx, static_cast<int>(dpi_), 96));
-    windowSizePixels_.cy = std::max(
-        iconSizePixels_ + MulDiv(42, static_cast<int>(dpi_), 96),
-        MulDiv(slotSizeDip.cy, static_cast<int>(dpi_), 96));
     grabOffsetPixels_.x = MulDiv(grabOffsetDip.x, static_cast<int>(dpi_), 96);
     grabOffsetPixels_.y = MulDiv(grabOffsetDip.y, static_cast<int>(dpi_), 96);
-    displayName_ = displayName;
-    icon_ = LoadShellIcon(path);
-    shortcutOverlay_ = shortcut ? LoadShortcutOverlay() : nullptr;
+    const bool useStagedContent =
+        staged_ &&
+        stagedContentKey_ == contentKey &&
+        displayName_ == displayName &&
+        shortcut_ == shortcut &&
+        stagedDpi == dpi_ &&
+        stagedSize.cx == windowSizePixels_.cx &&
+        stagedSize.cy == windowSizePixels_.cy;
+    if (!useStagedContent) {
+        ReleaseIcons();
+        displayName_ = displayName;
+        icon_ = CopyIcon(LoadIconW(nullptr, IDI_APPLICATION));
+        shortcut_ = shortcut;
+        Render();
+    }
+    staged_ = false;
+    stagedContentKey_.clear();
     active_ = true;
 
-    Render();
     Update(cursorScreenPoint);
     return generation_;
 }
@@ -134,10 +141,13 @@ void DragGhostWindow::Commit(POINT cursorScreenPoint) {
 void DragGhostWindow::End() {
     active_ = false;
     committed_ = false;
+    hasPresented_ = false;
     if (hwnd_ != nullptr) {
         ShowWindow(hwnd_, SW_HIDE);
     }
     displayName_.clear();
+    staged_ = false;
+    stagedContentKey_.clear();
     ReleaseIcons();
 }
 
@@ -179,6 +189,23 @@ LRESULT CALLBACK DragGhostWindow::WindowProc(HWND hwnd, UINT message, WPARAM wPa
     return DefWindowProcW(hwnd, message, wParam, lParam);
 }
 
+void DragGhostWindow::ConfigureGeometry(
+    HWND sourceWindow,
+    int iconSizeDip,
+    SIZE slotSizeDip) {
+    dpi_ = sourceWindow == nullptr ? 96 : GetDpiForWindow(sourceWindow);
+    if (dpi_ == 0) {
+        dpi_ = 96;
+    }
+    iconSizePixels_ = std::max(24, MulDiv(iconSizeDip, static_cast<int>(dpi_), 96));
+    windowSizePixels_.cx = std::max(
+        iconSizePixels_ + MulDiv(16, static_cast<int>(dpi_), 96),
+        MulDiv(slotSizeDip.cx, static_cast<int>(dpi_), 96));
+    windowSizePixels_.cy = std::max(
+        iconSizePixels_ + MulDiv(42, static_cast<int>(dpi_), 96),
+        MulDiv(slotSizeDip.cy, static_cast<int>(dpi_), 96));
+}
+
 bool DragGhostWindow::EnsureWindow(HINSTANCE instance) {
     if (hwnd_ != nullptr) {
         return true;
@@ -213,6 +240,24 @@ bool DragGhostWindow::EnsureWindow(HINSTANCE instance) {
         return false;
     }
     return true;
+}
+
+bool DragGhostWindow::EnsureLabelFont() {
+    if (labelFont_ != nullptr && labelFontDpi_ == dpi_) {
+        return true;
+    }
+    ReleaseLabelFont();
+    LOGFONTW font{};
+    SystemParametersInfoW(SPI_GETICONTITLELOGFONT, sizeof(font), &font, 0);
+    if (font.lfFaceName[0] == 0) {
+        wcscpy_s(font.lfFaceName, L"Microsoft YaHei UI");
+    }
+    font.lfHeight = -MulDiv(12, static_cast<int>(dpi_), 96);
+    labelFont_ = CreateFontIndirectW(&font);
+    if (labelFont_ != nullptr) {
+        labelFontDpi_ = dpi_;
+    }
+    return labelFont_ != nullptr;
 }
 
 bool DragGhostWindow::EnsureSurface() {
@@ -283,6 +328,13 @@ bool DragGhostWindow::Present(POINT topLeftScreen, BYTE alpha) {
         surfaceBitmap_ == nullptr) {
         return false;
     }
+    if (hasPresented_ &&
+        topLeftScreen_.x == topLeftScreen.x &&
+        topLeftScreen_.y == topLeftScreen.y &&
+        presentedAlpha_ == alpha &&
+        IsWindowVisible(hwnd_) != FALSE) {
+        return true;
+    }
 
     HDC screenDc = GetDC(nullptr);
     if (screenDc == nullptr) {
@@ -310,6 +362,8 @@ bool DragGhostWindow::Present(POINT topLeftScreen, BYTE alpha) {
     }
 
     topLeftScreen_ = topLeftScreen;
+    presentedAlpha_ = alpha;
+    hasPresented_ = true;
     SetWindowPos(
         hwnd_,
         HWND_TOPMOST,
@@ -336,28 +390,44 @@ void DragGhostWindow::Render() {
     if (icon_ != nullptr) {
         DrawIconEx(dc, iconLeft, iconTop, icon_, iconSizePixels_, iconSizePixels_, 0, nullptr, DI_NORMAL);
     }
-    if (shortcutOverlay_ != nullptr) {
+    if (shortcut_) {
         const int overlaySize = std::max(12, MulDiv(16, static_cast<int>(dpi_), 96));
-        DrawIconEx(
-            dc,
-            iconLeft - MulDiv(1, static_cast<int>(dpi_), 96),
-            iconTop + iconSizePixels_ - overlaySize + MulDiv(1, static_cast<int>(dpi_), 96),
-            shortcutOverlay_,
-            overlaySize,
-            overlaySize,
-            0,
-            nullptr,
-            DI_NORMAL);
+        const int overlayLeft = iconLeft - MulDiv(1, static_cast<int>(dpi_), 96);
+        const int overlayTop =
+            iconTop + iconSizePixels_ - overlaySize + MulDiv(1, static_cast<int>(dpi_), 96);
+        const auto scaled = [overlaySize](int value) {
+            return MulDiv(value, overlaySize, 16);
+        };
+        HBRUSH darkBrush = CreateSolidBrush(RGB(36, 49, 58));
+        HBRUSH lightBrush = CreateSolidBrush(RGB(248, 250, 252));
+        RECT part{
+            overlayLeft + scaled(2), overlayTop + scaled(9),
+            overlayLeft + scaled(11), overlayTop + scaled(14)};
+        FillRect(dc, &part, darkBrush);
+        part = RECT{
+            overlayLeft + scaled(9), overlayTop + scaled(3),
+            overlayLeft + scaled(14), overlayTop + scaled(12)};
+        FillRect(dc, &part, darkBrush);
+        part = RECT{
+            overlayLeft + scaled(4), overlayTop + scaled(10),
+            overlayLeft + scaled(11), overlayTop + scaled(12)};
+        FillRect(dc, &part, lightBrush);
+        part = RECT{
+            overlayLeft + scaled(10), overlayTop + scaled(5),
+            overlayLeft + scaled(12), overlayTop + scaled(11)};
+        FillRect(dc, &part, lightBrush);
+        part = RECT{
+            overlayLeft + scaled(7), overlayTop + scaled(5),
+            overlayLeft + scaled(13), overlayTop + scaled(7)};
+        FillRect(dc, &part, lightBrush);
+        DeleteObject(lightBrush);
+        DeleteObject(darkBrush);
     }
 
-    LOGFONTW font{};
-    SystemParametersInfoW(SPI_GETICONTITLELOGFONT, sizeof(font), &font, 0);
-    if (font.lfFaceName[0] == 0) {
-        wcscpy_s(font.lfFaceName, L"Microsoft YaHei UI");
-    }
-    font.lfHeight = -MulDiv(12, static_cast<int>(dpi_), 96);
-    HFONT labelFont = CreateFontIndirectW(&font);
-    HGDIOBJ oldFont = SelectObject(dc, labelFont);
+    EnsureLabelFont();
+    HGDIOBJ oldFont = labelFont_ == nullptr
+        ? nullptr
+        : SelectObject(dc, labelFont_);
     SetBkMode(dc, TRANSPARENT);
     RECT labelRect{
         0,
@@ -380,8 +450,9 @@ void DragGhostWindow::Render() {
         -1,
         &labelRect,
         DT_CENTER | DT_TOP | DT_WORDBREAK | DT_END_ELLIPSIS | DT_NOPREFIX);
-    SelectObject(dc, oldFont);
-    DeleteObject(labelFont);
+    if (oldFont != nullptr && oldFont != HGDI_ERROR) {
+        SelectObject(dc, oldFont);
+    }
     GdiFlush();
 }
 
@@ -406,8 +477,13 @@ void DragGhostWindow::ReleaseIcons() {
         DestroyIcon(icon_);
         icon_ = nullptr;
     }
-    if (shortcutOverlay_ != nullptr) {
-        DestroyIcon(shortcutOverlay_);
-        shortcutOverlay_ = nullptr;
+    shortcut_ = false;
+}
+
+void DragGhostWindow::ReleaseLabelFont() {
+    if (labelFont_ != nullptr) {
+        DeleteObject(labelFont_);
+        labelFont_ = nullptr;
     }
+    labelFontDpi_ = 0;
 }

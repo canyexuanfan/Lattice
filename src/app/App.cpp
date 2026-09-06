@@ -64,6 +64,14 @@ int App::Run() {
         TranslateMessage(&message);
         DispatchMessageW(&message);
     }
+    if (!ConfigStore::DrainPendingWrites(5000) &&
+        !configStore_.SaveAppConfig(configStore_.LoadAppConfig())) {
+        MessageDialog::Show(instance_,
+            nullptr,
+            L"Lattice 无法在退出前保存最新的格子位置或图标顺序。现有配置文件已保留，请检查磁盘或目录权限后重试。",
+            L"Lattice 配置保存",
+            MB_OK | MB_ICONWARNING);
+    }
     if (mainWindow_ != nullptr) {
         mainWindow_->FinishPendingDesktopPlacements();
     }

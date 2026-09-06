@@ -232,6 +232,29 @@ void DestroyCompletedIcons(std::unordered_map<std::wstring, CompletedIcon>& icon
     icons.clear();
 }
 
+void DestroyCachedDragIcons(std::unordered_map<std::wstring, HICON>& icons) {
+    for (const auto& [path, icon] : icons) {
+        (void)path;
+        if (icon != nullptr) {
+            DestroyIcon(icon);
+        }
+    }
+    icons.clear();
+}
+
+void EraseCachedDragIcon(
+    std::unordered_map<std::wstring, HICON>& icons,
+    const std::wstring& path) {
+    const auto found = icons.find(path);
+    if (found == icons.end()) {
+        return;
+    }
+    if (found->second != nullptr) {
+        DestroyIcon(found->second);
+    }
+    icons.erase(found);
+}
+
 class SharedIconLoader {
 public:
     static SharedIconLoader& Instance() {
@@ -421,7 +444,7 @@ IconCache::IconCache()
 }
 
 IconCache::~IconCache() {
-    std::lock_guard<std::mutex> lock(asyncState_->mutex);
+    std::scoped_lock lock(cacheMutex_, asyncState_->mutex);
     asyncState_->active = false;
     ++asyncState_->generation;
     asyncState_->invalidateCallback = nullptr;
@@ -430,6 +453,7 @@ IconCache::~IconCache() {
     asyncState_->failedByPath.clear();
     asyncState_->invalidatePosted = false;
     DestroyCompletedIcons(asyncState_->completed);
+    DestroyCachedDragIcons(dragIconCache_);
 }
 
 ID2D1Bitmap* IconCache::GetIcon(
@@ -493,6 +517,30 @@ ID2D1Bitmap* IconCache::GetShortcutOverlay(ID2D1RenderTarget* target) {
     return shortcutOverlay_.Get();
 }
 
+HICON IconCache::CopyReadyIconForDrag(const std::wstring& path) {
+    if (path.empty()) {
+        return nullptr;
+    }
+    {
+        std::lock_guard<std::mutex> lock(cacheMutex_);
+        const auto found = dragIconCache_.find(path);
+        if (found != dragIconCache_.end() && found->second != nullptr) {
+            return CopyIcon(found->second);
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(asyncState_->mutex);
+        const auto found = asyncState_->completed.find(path);
+        if (found != asyncState_->completed.end() &&
+            found->second.icon != nullptr &&
+            found->second.generation == asyncState_->generation) {
+            return CopyIcon(found->second.icon);
+        }
+    }
+    Enqueue(path);
+    return nullptr;
+}
+
 void IconCache::Preload(const std::wstring& path) {
     if (path.empty()) {
         return;
@@ -519,6 +567,7 @@ void IconCache::Alias(const std::wstring& sourcePath, const std::wstring& destin
         }
 
         cache_.erase(destinationPath);
+        EraseCachedDragIcon(dragIconCache_, destinationPath);
         asyncState_->completed.erase(destinationPath);
         asyncState_->failedByPath.erase(destinationPath);
         const auto destinationPending =
@@ -528,6 +577,12 @@ void IconCache::Alias(const std::wstring& sourcePath, const std::wstring& destin
             asyncState_->pendingIdByPath.erase(destinationPending);
         }
         asyncState_->failedByPath.erase(sourcePath);
+
+        const auto dragSource = dragIconCache_.find(sourcePath);
+        if (dragSource != dragIconCache_.end()) {
+            dragIconCache_[destinationPath] = dragSource->second;
+            dragIconCache_.erase(dragSource);
+        }
 
         const auto cachedSource = cache_.find(sourcePath);
         if (cachedSource != cache_.end()) {
@@ -570,6 +625,7 @@ void IconCache::Alias(const std::wstring& sourcePath, const std::wstring& destin
 void IconCache::Clear() {
     std::scoped_lock lock(cacheMutex_, asyncState_->mutex);
     cache_.clear();
+    DestroyCachedDragIcons(dragIconCache_);
     filePlaceholder_.Reset();
     folderPlaceholder_.Reset();
     shortcutOverlay_.Reset();
@@ -592,6 +648,13 @@ void IconCache::SetCapacity(size_t capacity) {
     capacity_ = std::max<size_t>(64, capacity);
     while (cache_.size() > capacity_) {
         cache_.erase(cache_.begin());
+    }
+    while (dragIconCache_.size() > capacity_) {
+        const auto icon = dragIconCache_.begin();
+        if (icon->second != nullptr) {
+            DestroyIcon(icon->second);
+        }
+        dragIconCache_.erase(icon);
     }
     asyncState_->asyncCapacity = capacity_;
     while (asyncState_->completed.size() > asyncState_->asyncCapacity) {
@@ -754,13 +817,22 @@ void IconCache::ProcessCompleted(ID2D1RenderTarget* target) {
         const std::uint64_t completedGeneration = completedIcon.generation;
         Microsoft::WRL::ComPtr<ID2D1Bitmap> bitmap =
             LoadIconBitmap(target, completedIcon.icon);
+        HICON dragIcon = completedIcon.icon == nullptr
+            ? nullptr
+            : CopyIcon(completedIcon.icon);
         completedIcon.Reset();
         std::scoped_lock lock(cacheMutex_, asyncState_->mutex);
         if (!asyncState_->active ||
             completedGeneration != asyncState_->generation) {
+            if (dragIcon != nullptr) {
+                DestroyIcon(dragIcon);
+            }
             continue;
         }
         if (bitmap == nullptr) {
+            if (dragIcon != nullptr) {
+                DestroyIcon(dragIcon);
+            }
             RecordFailedIconLoadLocked(
                 *asyncState_,
                 path,
@@ -768,6 +840,18 @@ void IconCache::ProcessCompleted(ID2D1RenderTarget* target) {
             continue;
         }
         asyncState_->failedByPath.erase(path);
+        if (dragIcon != nullptr) {
+            EraseCachedDragIcon(dragIconCache_, path);
+            while (dragIconCache_.size() >= capacity_ &&
+                   !dragIconCache_.empty()) {
+                const auto evicted = dragIconCache_.begin();
+                if (evicted->second != nullptr) {
+                    DestroyIcon(evicted->second);
+                }
+                dragIconCache_.erase(evicted);
+            }
+            dragIconCache_[path] = dragIcon;
+        }
         const auto existing = cache_.find(path);
         if (existing != cache_.end()) {
             existing->second = std::move(bitmap);

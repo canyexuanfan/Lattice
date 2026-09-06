@@ -12,6 +12,10 @@
 class IconGrid {
 public:
     void SetItems(std::vector<DesktopItem> items);
+    bool UpdateItemIdentity(
+        const std::wstring& sourcePath,
+        const std::wstring& itemId,
+        const std::wstring& destinationPath);
     void SetBounds(RECT bounds);
     void SetIconSize(int iconSize);
     void SetDensity(int density);

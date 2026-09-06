@@ -52,6 +52,27 @@ void IconGrid::SetItems(std::vector<DesktopItem> items) {
     RecalculateLayout();
 }
 
+bool IconGrid::UpdateItemIdentity(
+    const std::wstring& sourcePath,
+    const std::wstring& itemId,
+    const std::wstring& destinationPath) {
+    const auto item = std::find_if(
+        items_.begin(),
+        items_.end(),
+        [&](const DesktopItem& value) {
+            return CompareStringOrdinal(
+                       value.path.c_str(), -1,
+                       sourcePath.c_str(), -1,
+                       TRUE) == CSTR_EQUAL;
+        });
+    if (item == items_.end()) {
+        return false;
+    }
+    item->id = itemId;
+    item->path = destinationPath;
+    return true;
+}
+
 void IconGrid::SetBounds(RECT bounds) {
     bounds_ = bounds;
     RecalculateLayout();

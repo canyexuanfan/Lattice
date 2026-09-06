@@ -1,5 +1,6 @@
 #include "desktop/DesktopPlacementCoordinator.h"
 
+#include <algorithm>
 #include <chrono>
 #include <condition_variable>
 #include <deque>
@@ -7,14 +8,392 @@
 #include <utility>
 
 #include "desktop/DesktopLayout.h"
+#include "desktop/DesktopScanner.h"
+#include "desktop/ManagedShortcutStore.h"
 #include "util/ComInit.h"
+
+namespace {
+
+bool RemoveItemFromPersistedConfig(
+    ConfigStore& configStore,
+    const std::wstring& itemId) {
+    AppConfig config = configStore.LoadAppConfig();
+    config.uncategorizedItemIds.erase(
+        std::remove(
+            config.uncategorizedItemIds.begin(),
+            config.uncategorizedItemIds.end(),
+            itemId),
+        config.uncategorizedItemIds.end());
+    for (CategoryConfig& category : config.categories) {
+        category.itemIds.erase(
+            std::remove(category.itemIds.begin(), category.itemIds.end(), itemId),
+            category.itemIds.end());
+    }
+    config.items.erase(
+        std::remove_if(
+            config.items.begin(),
+            config.items.end(),
+            [&](const ItemConfig& value) { return value.id == itemId; }),
+        config.items.end());
+    return configStore.SaveAppConfig(config);
+}
+
+bool SamePath(const std::wstring& left, const std::wstring& right) {
+    return CompareStringOrdinal(
+               left.c_str(), -1, right.c_str(), -1, TRUE) == CSTR_EQUAL;
+}
+
+void PersistDesktopPlacementSnapshot(
+    const std::wstring& path,
+    POINT point,
+    std::wstring& warningMessage) {
+    ConfigStore configStore;
+    AppConfig config = configStore.LoadAppConfig();
+    auto placement = std::find_if(
+        config.desktopLayout.begin(),
+        config.desktopLayout.end(),
+        [&](const DesktopPlacementConfig& value) {
+            return SamePath(value.path, path);
+        });
+    if (placement == config.desktopLayout.end()) {
+        config.desktopLayout.push_back(
+            DesktopPlacementConfig{path, point.x, point.y});
+    } else {
+        placement->x = point.x;
+        placement->y = point.y;
+    }
+    if (!configStore.SaveAppConfig(config)) {
+        warningMessage =
+            L"图标已放到鼠标释放位置，但无法把新位置写入桌面布局快照。";
+    }
+}
+
+}  // namespace
+
+bool CommitDesktopMoveOutTransaction(
+    const DesktopPlacementRequest& request,
+    std::wstring& desktopPath,
+    std::wstring& errorMessage) {
+    desktopPath = request.path;
+    errorMessage.clear();
+    if (!request.commitMoveOut) {
+        return !desktopPath.empty();
+    }
+    if (request.itemId.empty() || request.sourcePath.empty() || request.path.empty()) {
+        errorMessage = L"移出格子的后台事务参数不完整。";
+        return false;
+    }
+
+    ConfigStore configStore;
+    ManagedShortcutStore shortcutStore;
+    const auto persistRemoval = [&]() {
+        return RemoveItemFromPersistedConfig(configStore, request.itemId);
+    };
+    if (!shortcutStore.IsManagedPath(request.sourcePath)) {
+        bool restoredVisibility = true;
+        if (request.itemState.desktopVisibilityMode != 0) {
+            restoredVisibility = shortcutStore.RestoreDesktopVisibility(
+                request.itemState,
+                errorMessage,
+                &request.screenPoint);
+        }
+        if (restoredVisibility && persistRemoval()) {
+            return true;
+        }
+        if (restoredVisibility) {
+            std::wstring rollbackError;
+            ItemConfig rollbackState = request.itemState;
+            shortcutStore.SuppressDesktopVisibility(rollbackState, rollbackError);
+            errorMessage = L"项目原件未发生改变，但无法保存移出格子的配置。";
+        }
+        return false;
+    }
+
+    std::wstring destinationPath;
+    const bool moved = shortcutStore.MoveToOriginalDesktop(
+        request.itemId,
+        request.sourcePath,
+        request.path,
+        [&](const std::wstring&) { return persistRemoval(); },
+        destinationPath,
+        errorMessage,
+        request.sourceWindow);
+    if (moved) {
+        desktopPath = std::move(destinationPath);
+    }
+    return moved;
+}
+
+DesktopCollectionItemResult CommitDesktopCollectionItemTransaction(
+    const DesktopCollectionItemRequest& request) {
+    DesktopCollectionItemResult result;
+    result.sourcePath = request.path;
+    if (request.categoryId.empty() || request.path.empty()) {
+        result.errorMessage = L"桌面项目收纳参数不完整。";
+        return result;
+    }
+
+    ConfigStore configStore;
+    ManagedShortcutStore shortcutStore;
+    DesktopScanner scanner;
+    AppConfig config = configStore.LoadAppConfig();
+    const auto targetItemIds = [&](AppConfig& value) -> std::vector<std::wstring>* {
+        if (request.categoryId == L"uncategorized") {
+            return &value.uncategorizedItemIds;
+        }
+        const auto category = std::find_if(
+            value.categories.begin(),
+            value.categories.end(),
+            [&](const CategoryConfig& candidate) {
+                return candidate.id == request.categoryId;
+            });
+        return category == value.categories.end() ? nullptr : &category->itemIds;
+    };
+    const auto targetLayout = [&](AppConfig& value) -> WindowConfig* {
+        if (request.categoryId == L"uncategorized") {
+            return &value.window;
+        }
+        const auto category = std::find_if(
+            value.categories.begin(),
+            value.categories.end(),
+            [&](const CategoryConfig& candidate) {
+                return candidate.id == request.categoryId;
+            });
+        return category == value.categories.end() ? nullptr : &category->layout;
+    };
+    std::vector<std::wstring>* destinationIds = targetItemIds(config);
+    WindowConfig* destinationLayout = targetLayout(config);
+    if (destinationIds == nullptr || destinationLayout == nullptr) {
+        result.errorMessage = L"目标格子已经不存在，未移动任何内容。";
+        return result;
+    }
+
+    DesktopItem item = scanner.CreateItemFromPath(request.path, false);
+    const std::wstring sourceDerivedId = item.id;
+    if (!request.sourceVisibleId.empty()) {
+        item.id = request.sourceVisibleId;
+    }
+    if (!shortcutStore.IsSupportedDesktopItem(item.path)) {
+        result.errorMessage = L"该文件、文件夹或快捷方式当前不可访问，未移动该项目。";
+        return result;
+    }
+
+    const std::wstring sourcePath = item.path;
+    const bool physicallyManaged = shortcutStore.RequiresManagedStorage(sourcePath);
+    std::wstring originalDesktopPath;
+    POINT originalDesktopPoint = request.desktopPoint;
+    bool hasOriginalDesktopPoint = request.hasDesktopPoint;
+    if (shortcutStore.IsDesktopPath(sourcePath)) {
+        originalDesktopPath = sourcePath;
+        if (!hasOriginalDesktopPoint) {
+            DesktopLayout desktopLayout;
+            std::wstring captureError;
+            hasOriginalDesktopPoint = desktopLayout.CapturePosition(
+                sourcePath,
+                originalDesktopPoint,
+                captureError);
+            if (!hasOriginalDesktopPoint && physicallyManaged) {
+                result.errorMessage = captureError;
+                return result;
+            }
+        }
+    }
+
+    const auto existingByPath = std::find_if(
+        config.items.begin(),
+        config.items.end(),
+        [&](const ItemConfig& existing) {
+            return SamePath(existing.path, item.path);
+        });
+    if (existingByPath != config.items.end()) {
+        item.id = existingByPath->id;
+    } else if (!scanner.TryCreateManagedItemId(
+                   [&](const std::wstring& candidate) {
+                       return std::any_of(
+                           config.items.begin(),
+                           config.items.end(),
+                           [&](const ItemConfig& value) {
+                               return value.id == candidate;
+                           });
+                   },
+                   item.id)) {
+        result.errorMessage = L"无法为该项目创建安全的唯一标识，未移动该项目。";
+        return result;
+    }
+
+    ItemConfig visibilityState;
+    visibilityState.id = item.id;
+    visibilityState.path = sourcePath;
+    if (existingByPath != config.items.end()) {
+        visibilityState = *existingByPath;
+    }
+    if (physicallyManaged) {
+        if (!shortcutStore.PrepareForManagedStorage(
+                visibilityState,
+                result.errorMessage)) {
+            return result;
+        }
+    } else if (visibilityState.desktopVisibilityMode == 0) {
+        if (!shortcutStore.CaptureAndSuppressDesktopVisibility(
+                sourcePath,
+                visibilityState,
+                result.errorMessage)) {
+            return result;
+        }
+    } else if (!shortcutStore.SuppressDesktopVisibility(
+                   visibilityState,
+                   result.errorMessage)) {
+        return result;
+    }
+    const bool capturedNewVisibility =
+        !physicallyManaged && visibilityState.desktopVisibilityMode != 0;
+
+    const auto persistCollectedItem = [&](const std::wstring& storedPath) {
+        auto registered = std::find_if(
+            config.items.begin(),
+            config.items.end(),
+            [&](const ItemConfig& value) { return value.id == item.id; });
+        if (registered == config.items.end()) {
+            config.items.push_back(ItemConfig{item.id, storedPath, item.displayName});
+            registered = std::prev(config.items.end());
+        } else {
+            registered->path = storedPath;
+        }
+        registered->originalDesktopPath = originalDesktopPath;
+        registered->desktopX = originalDesktopPoint.x;
+        registered->desktopY = originalDesktopPoint.y;
+        registered->hasDesktopPosition = hasOriginalDesktopPoint;
+        registered->desktopVisibilityMode = physicallyManaged ? 0 : visibilityState.desktopVisibilityMode;
+        registered->desktopVisibilityOriginalFlags = physicallyManaged ? 0 : visibilityState.desktopVisibilityOriginalFlags;
+        registered->desktopVisibilityNewStartValue = physicallyManaged ? -1 : visibilityState.desktopVisibilityNewStartValue;
+        registered->desktopVisibilityClassicValue = physicallyManaged ? -1 : visibilityState.desktopVisibilityClassicValue;
+        if (hasOriginalDesktopPoint) {
+            auto position = std::find_if(
+                config.desktopLayout.begin(),
+                config.desktopLayout.end(),
+                [&](const DesktopPlacementConfig& value) {
+                    return SamePath(value.path, originalDesktopPath);
+                });
+            if (position == config.desktopLayout.end()) {
+                config.desktopLayout.push_back(DesktopPlacementConfig{
+                    originalDesktopPath,
+                    originalDesktopPoint.x,
+                    originalDesktopPoint.y});
+            } else {
+                position->x = originalDesktopPoint.x;
+                position->y = originalDesktopPoint.y;
+            }
+        }
+
+        destinationIds = targetItemIds(config);
+        if (destinationIds == nullptr) {
+            return false;
+        }
+        size_t insertionIndex = (std::min)(request.insertionIndex, destinationIds->size());
+        std::vector<std::wstring> removalIds{item.id};
+        const auto appendRemovableAlias = [&](const std::wstring& aliasId) {
+            if (aliasId.empty() ||
+                std::find(removalIds.begin(), removalIds.end(), aliasId) !=
+                    removalIds.end()) {
+                return;
+            }
+            const auto registeredAlias = std::find_if(
+                config.items.begin(),
+                config.items.end(),
+                [&](const ItemConfig& value) { return value.id == aliasId; });
+            if (registeredAlias != config.items.end() &&
+                !SamePath(registeredAlias->path, sourcePath)) {
+                return;
+            }
+            removalIds.push_back(aliasId);
+        };
+        appendRemovableAlias(sourceDerivedId);
+        appendRemovableAlias(request.sourceVisibleId);
+        for (const std::wstring& removalId : removalIds) {
+            for (auto found = std::find(destinationIds->begin(), destinationIds->end(), removalId);
+                 found != destinationIds->end();
+                 found = std::find(destinationIds->begin(), destinationIds->end(), removalId)) {
+                if (static_cast<size_t>(std::distance(destinationIds->begin(), found)) < insertionIndex) {
+                    --insertionIndex;
+                }
+                destinationIds->erase(found);
+            }
+        }
+        for (CategoryConfig& category : config.categories) {
+            for (const std::wstring& removalId : removalIds) {
+                category.itemIds.erase(
+                    std::remove(category.itemIds.begin(), category.itemIds.end(), removalId),
+                    category.itemIds.end());
+            }
+        }
+        for (const std::wstring& removalId : removalIds) {
+            config.uncategorizedItemIds.erase(
+                std::remove(
+                    config.uncategorizedItemIds.begin(),
+                    config.uncategorizedItemIds.end(),
+                    removalId),
+                config.uncategorizedItemIds.end());
+        }
+        destinationIds = targetItemIds(config);
+        if (destinationIds == nullptr) {
+            return false;
+        }
+        destinationIds->insert(
+            destinationIds->begin() + static_cast<std::ptrdiff_t>(
+                (std::min)(insertionIndex, destinationIds->size())),
+            item.id);
+        destinationLayout = targetLayout(config);
+        if (destinationLayout != nullptr) {
+            destinationLayout->autoArrange = false;
+            destinationLayout->sortMode = 0;
+        }
+        return configStore.SaveAppConfig(config);
+    };
+
+    std::wstring destinationPath;
+    bool collected = false;
+    if (physicallyManaged) {
+        collected = shortcutStore.MoveIntoCategory(
+            item.id,
+            sourcePath,
+            CategoryStorageFolder(config, request.categoryId),
+            persistCollectedItem,
+            destinationPath,
+            result.errorMessage,
+            request.sourceWindow);
+    } else {
+        destinationPath = sourcePath;
+        collected = persistCollectedItem(destinationPath);
+        if (!collected) {
+            result.errorMessage = L"无法保存该文件或文件夹的收纳配置，原件未发生改变。";
+        }
+    }
+    if (!collected) {
+        if (capturedNewVisibility) {
+            std::wstring rollbackError;
+            shortcutStore.RestoreDesktopVisibility(visibilityState, rollbackError);
+        }
+        return result;
+    }
+    result.succeeded = true;
+    result.itemId = item.id;
+    result.destinationPath = std::move(destinationPath);
+    const auto committedItem = std::find_if(
+        config.items.begin(),
+        config.items.end(),
+        [&](const ItemConfig& value) { return value.id == item.id; });
+    if (committedItem != config.items.end()) {
+        result.itemState = *committedItem;
+    }
+    return result;
+}
 
 struct DesktopPlacementCoordinator::State {
     std::mutex mutex;
     std::condition_variable workAvailable;
     std::condition_variable drained;
     std::condition_variable workerExited;
-    std::deque<QueuedPlacement> pending;
+    std::deque<QueuedOperation> pending;
     std::deque<Event> events;
     HWND notificationWindow = nullptr;
     DWORD workerThreadId = 0;
@@ -73,7 +452,37 @@ DesktopPlacementCoordinator::PlaceAtScreenAsync(const DesktopPlacementRequest& r
         if (state->nextOperationId == 0) {
             state->nextOperationId = 1;
         }
-        state->pending.push_back(QueuedPlacement{id, request});
+        QueuedOperation operation;
+        operation.id = id;
+        operation.placementRequest = request;
+        state->pending.push_back(std::move(operation));
+    }
+    state->workAvailable.notify_one();
+    return id;
+}
+
+DesktopPlacementCoordinator::OperationId
+DesktopPlacementCoordinator::CollectItemAsync(
+    const DesktopCollectionItemRequest& request) {
+    if (request.categoryId.empty() || request.path.empty()) {
+        return 0;
+    }
+    const std::shared_ptr<State> state = state_;
+    OperationId id = 0;
+    {
+        std::lock_guard lock(state->mutex);
+        if (state->stopping || state->pending.size() >= 32) {
+            return 0;
+        }
+        id = state->nextOperationId++;
+        if (state->nextOperationId == 0) {
+            state->nextOperationId = 1;
+        }
+        QueuedOperation operation;
+        operation.id = id;
+        operation.collection = true;
+        operation.collectionRequest = request;
+        state->pending.push_back(std::move(operation));
     }
     state->workAvailable.notify_one();
     return id;
@@ -158,7 +567,7 @@ void DesktopPlacementCoordinator::WorkerLoop(
     }
 
     for (;;) {
-        QueuedPlacement placement;
+        QueuedOperation operation;
         {
             std::unique_lock lock(state->mutex);
             state->workAvailable.wait(lock, [&]() {
@@ -167,56 +576,96 @@ void DesktopPlacementCoordinator::WorkerLoop(
             if (state->stopping && state->pending.empty()) {
                 break;
             }
-            placement = std::move(state->pending.front());
+            operation = std::move(state->pending.front());
             state->pending.pop_front();
             ++state->activeOperations;
         }
 
+        if (operation.collection) {
+            Event completed;
+            completed.id = operation.id;
+            completed.stage = EventStage::Completed;
+            completed.collection = true;
+            completed.sourceWindow = operation.collectionRequest.sourceWindow;
+            completed.showError = operation.collectionRequest.showError;
+            try {
+                completed.collectionResult =
+                    CommitDesktopCollectionItemTransaction(
+                        operation.collectionRequest);
+            } catch (...) {
+                completed.collectionResult.errorMessage =
+                    L"后台收纳桌面项目时发生异常。";
+            }
+            completed.succeeded = completed.collectionResult.succeeded;
+            Publish(state, std::move(completed));
+            {
+                std::lock_guard lock(state->mutex);
+                --state->activeOperations;
+                if (state->pending.empty() && state->activeOperations == 0) {
+                    state->drained.notify_all();
+                }
+            }
+            continue;
+        }
+
+        const DesktopPlacementRequest& request = operation.placementRequest;
         POINT finalPoint{};
         std::wstring errorMessage;
+        std::wstring desktopPath = request.path;
         bool visiblePublished = false;
         bool succeeded = false;
         try {
-            DesktopLayout desktopLayout;
-            succeeded = desktopLayout.RestoreScreenPosition(
-                placement.request.path,
-                placement.request.screenPoint,
-                finalPoint,
-                errorMessage,
-                [&]() {
-                    if (visiblePublished) {
-                        return;
-                    }
-                    visiblePublished = true;
-                    Event visible;
-                    visible.id = placement.id;
-                    visible.stage = EventStage::Visible;
-                    visible.path = placement.request.path;
-                    visible.dragGhostGeneration =
-                        placement.request.dragGhostGeneration;
-                    visible.showError = placement.request.showError;
-                    visible.sourceWindow = placement.request.sourceWindow;
-                    visible.succeeded = true;
-                    Publish(state, std::move(visible));
-                },
-                [state]() {
-                    std::lock_guard lock(state->mutex);
-                    return state->stopping;
-                });
+            if (CommitDesktopMoveOutTransaction(
+                    request,
+                    desktopPath,
+                    errorMessage)) {
+                DesktopLayout desktopLayout;
+                succeeded = desktopLayout.RestoreScreenPosition(
+                    desktopPath,
+                    request.screenPoint,
+                    finalPoint,
+                    errorMessage,
+                    [&]() {
+                        if (visiblePublished) {
+                            return;
+                        }
+                        visiblePublished = true;
+                        Event visible;
+                        visible.id = operation.id;
+                        visible.stage = EventStage::Visible;
+                        visible.path = desktopPath;
+                        visible.dragGhostGeneration =
+                            request.dragGhostGeneration;
+                        visible.showError = request.showError;
+                        visible.sourceWindow = request.sourceWindow;
+                        visible.succeeded = true;
+                        Publish(state, std::move(visible));
+                    },
+                    [state]() {
+                        std::lock_guard lock(state->mutex);
+                        return state->stopping;
+                    });
+                if (succeeded) {
+                    PersistDesktopPlacementSnapshot(
+                        desktopPath,
+                        finalPoint,
+                        errorMessage);
+                }
+            }
         } catch (...) {
             errorMessage =
-                L"文件已安全归还桌面，但后台桌面定位发生异常。";
+                L"后台归还桌面或图标定位发生异常；移动日志将在下次启动继续恢复。";
         }
 
         Event completed;
-        completed.id = placement.id;
+        completed.id = operation.id;
         completed.stage = EventStage::Completed;
-        completed.path = placement.request.path;
+        completed.path = desktopPath;
         completed.finalPoint = finalPoint;
         completed.dragGhostGeneration =
-            placement.request.dragGhostGeneration;
-        completed.showError = placement.request.showError;
-        completed.sourceWindow = placement.request.sourceWindow;
+            request.dragGhostGeneration;
+        completed.showError = request.showError;
+        completed.sourceWindow = request.sourceWindow;
         completed.succeeded = succeeded;
         completed.errorMessage = std::move(errorMessage);
         Publish(state, std::move(completed));
