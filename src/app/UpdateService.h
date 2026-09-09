@@ -22,7 +22,7 @@ struct UpdateServiceResult {
 
 class UpdateService {
 public:
-    static constexpr wchar_t kCurrentVersion[] = L"0.4.38";
+    static constexpr wchar_t kCurrentVersion[] = L"0.4.46";
 
     static bool Start(HWND notificationWindow, bool manual, HWND dialogOwner = nullptr);
     static int CompareVersions(const std::wstring& left, const std::wstring& right);

@@ -3,11 +3,9 @@
 #include <string>
 
 #include "config/ConfigStore.h"
-#include "desktop/ManagedShortcutStore.h"
-
 class CategoryStorageManager {
 public:
-    CategoryStorageManager(ConfigStore& configStore, ManagedShortcutStore& managedStore);
+    explicit CategoryStorageManager(ConfigStore& configStore);
 
     bool CanUseName(
         const std::wstring& categoryId,
@@ -29,5 +27,4 @@ private:
         std::wstring& errorMessage) const;
 
     ConfigStore& configStore_;
-    ManagedShortcutStore& managedStore_;
 };

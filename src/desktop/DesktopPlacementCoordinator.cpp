@@ -89,39 +89,17 @@ bool CommitDesktopMoveOutTransaction(
     const auto persistRemoval = [&]() {
         return RemoveItemFromPersistedConfig(configStore, request.itemId);
     };
-    if (!shortcutStore.IsManagedPath(request.sourcePath)) {
-        bool restoredVisibility = true;
-        if (request.itemState.desktopVisibilityMode != 0) {
-            restoredVisibility = shortcutStore.RestoreDesktopVisibility(
-                request.itemState,
-                errorMessage,
-                &request.screenPoint);
-        }
-        if (restoredVisibility && persistRemoval()) {
-            return true;
-        }
-        if (restoredVisibility) {
-            std::wstring rollbackError;
-            ItemConfig rollbackState = request.itemState;
-            shortcutStore.SuppressDesktopVisibility(rollbackState, rollbackError);
-            errorMessage = L"项目原件未发生改变，但无法保存移出格子的配置。";
-        }
+    if (shortcutStore.IsManagedPath(request.sourcePath)) {
+        errorMessage =
+            L"该项目仍处于旧版受管目录，请先完成一次性历史迁移。";
         return false;
     }
-
-    std::wstring destinationPath;
-    const bool moved = shortcutStore.MoveToOriginalDesktop(
-        request.itemId,
-        request.sourcePath,
-        request.path,
-        [&](const std::wstring&) { return persistRemoval(); },
-        destinationPath,
-        errorMessage,
-        request.sourceWindow);
-    if (moved) {
-        desktopPath = std::move(destinationPath);
+    if (!persistRemoval()) {
+        errorMessage =
+            L"项目原件未发生改变，但无法保存移出格子的显示归属。";
+        return false;
     }
-    return moved;
+    return true;
 }
 
 DesktopCollectionItemResult CommitDesktopCollectionItemTransaction(
@@ -164,7 +142,7 @@ DesktopCollectionItemResult CommitDesktopCollectionItemTransaction(
     std::vector<std::wstring>* destinationIds = targetItemIds(config);
     WindowConfig* destinationLayout = targetLayout(config);
     if (destinationIds == nullptr || destinationLayout == nullptr) {
-        result.errorMessage = L"目标格子已经不存在，未移动任何内容。";
+        result.errorMessage = L"目标格子已经不存在，未改变项目的显示归属。";
         return result;
     }
 
@@ -174,12 +152,30 @@ DesktopCollectionItemResult CommitDesktopCollectionItemTransaction(
         item.id = request.sourceVisibleId;
     }
     if (!shortcutStore.IsSupportedDesktopItem(item.path)) {
-        result.errorMessage = L"该文件、文件夹或快捷方式当前不可访问，未移动该项目。";
+        result.errorMessage =
+            L"只能收纳 Explorer 桌面当前显示的文件、文件夹、快捷方式或系统图标；原件未发生改变。";
         return result;
     }
 
+    if (GetFileAttributesW(item.path.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        DesktopLayout desktopLayout;
+        POINT ignoredPoint{};
+        std::wstring identityError;
+        if (!desktopLayout.CapturePosition(
+                item.path, ignoredPoint, identityError)) {
+            result.errorMessage =
+                L"该 Shell 项目不在当前桌面显示层中，未改变其显示归属。";
+            return result;
+        }
+    }
+
     const std::wstring sourcePath = item.path;
-    const bool physicallyManaged = shortcutStore.RequiresManagedStorage(sourcePath);
+    const bool legacyManaged = shortcutStore.IsManagedPath(sourcePath);
+    if (legacyManaged) {
+        result.errorMessage =
+            L"该项目仍处于旧版受管目录，请先完成一次性历史迁移。";
+        return result;
+    }
     std::wstring originalDesktopPath;
     POINT originalDesktopPoint = request.desktopPoint;
     bool hasOriginalDesktopPoint = request.hasDesktopPoint;
@@ -192,10 +188,6 @@ DesktopCollectionItemResult CommitDesktopCollectionItemTransaction(
                 sourcePath,
                 originalDesktopPoint,
                 captureError);
-            if (!hasOriginalDesktopPoint && physicallyManaged) {
-                result.errorMessage = captureError;
-                return result;
-            }
         }
     }
 
@@ -217,36 +209,9 @@ DesktopCollectionItemResult CommitDesktopCollectionItemTransaction(
                            });
                    },
                    item.id)) {
-        result.errorMessage = L"无法为该项目创建安全的唯一标识，未移动该项目。";
+        result.errorMessage = L"无法为该项目创建安全的唯一标识，未改变其显示归属。";
         return result;
     }
-
-    ItemConfig visibilityState;
-    visibilityState.id = item.id;
-    visibilityState.path = sourcePath;
-    if (existingByPath != config.items.end()) {
-        visibilityState = *existingByPath;
-    }
-    if (physicallyManaged) {
-        if (!shortcutStore.PrepareForManagedStorage(
-                visibilityState,
-                result.errorMessage)) {
-            return result;
-        }
-    } else if (visibilityState.desktopVisibilityMode == 0) {
-        if (!shortcutStore.CaptureAndSuppressDesktopVisibility(
-                sourcePath,
-                visibilityState,
-                result.errorMessage)) {
-            return result;
-        }
-    } else if (!shortcutStore.SuppressDesktopVisibility(
-                   visibilityState,
-                   result.errorMessage)) {
-        return result;
-    }
-    const bool capturedNewVisibility =
-        !physicallyManaged && visibilityState.desktopVisibilityMode != 0;
 
     const auto persistCollectedItem = [&](const std::wstring& storedPath) {
         auto registered = std::find_if(
@@ -263,10 +228,10 @@ DesktopCollectionItemResult CommitDesktopCollectionItemTransaction(
         registered->desktopX = originalDesktopPoint.x;
         registered->desktopY = originalDesktopPoint.y;
         registered->hasDesktopPosition = hasOriginalDesktopPoint;
-        registered->desktopVisibilityMode = physicallyManaged ? 0 : visibilityState.desktopVisibilityMode;
-        registered->desktopVisibilityOriginalFlags = physicallyManaged ? 0 : visibilityState.desktopVisibilityOriginalFlags;
-        registered->desktopVisibilityNewStartValue = physicallyManaged ? -1 : visibilityState.desktopVisibilityNewStartValue;
-        registered->desktopVisibilityClassicValue = physicallyManaged ? -1 : visibilityState.desktopVisibilityClassicValue;
+        registered->desktopVisibilityMode = 0;
+        registered->desktopVisibilityOriginalFlags = 0;
+        registered->desktopVisibilityNewStartValue = -1;
+        registered->desktopVisibilityClassicValue = -1;
         if (hasOriginalDesktopPoint) {
             auto position = std::find_if(
                 config.desktopLayout.begin(),
@@ -350,29 +315,13 @@ DesktopCollectionItemResult CommitDesktopCollectionItemTransaction(
         return configStore.SaveAppConfig(config);
     };
 
-    std::wstring destinationPath;
-    bool collected = false;
-    if (physicallyManaged) {
-        collected = shortcutStore.MoveIntoCategory(
-            item.id,
-            sourcePath,
-            CategoryStorageFolder(config, request.categoryId),
-            persistCollectedItem,
-            destinationPath,
-            result.errorMessage,
-            request.sourceWindow);
-    } else {
-        destinationPath = sourcePath;
-        collected = persistCollectedItem(destinationPath);
-        if (!collected) {
-            result.errorMessage = L"无法保存该文件或文件夹的收纳配置，原件未发生改变。";
-        }
+    std::wstring destinationPath = sourcePath;
+    const bool collected = persistCollectedItem(destinationPath);
+    if (!collected) {
+        result.errorMessage =
+            L"无法保存该桌面项目的显示归属，原件未发生改变。";
     }
     if (!collected) {
-        if (capturedNewVisibility) {
-            std::wstring rollbackError;
-            shortcutStore.RestoreDesktopVisibility(visibilityState, rollbackError);
-        }
         return result;
     }
     result.succeeded = true;
@@ -619,6 +568,18 @@ void DesktopPlacementCoordinator::WorkerLoop(
                     request,
                     desktopPath,
                     errorMessage)) {
+                visiblePublished = true;
+                Event visible;
+                visible.id = operation.id;
+                visible.stage = EventStage::Visible;
+                visible.path = desktopPath;
+                visible.finalPoint = request.screenPoint;
+                visible.dragGhostGeneration =
+                    request.dragGhostGeneration;
+                visible.showError = request.showError;
+                visible.sourceWindow = request.sourceWindow;
+                visible.succeeded = true;
+                Publish(state, std::move(visible));
                 DesktopLayout desktopLayout;
                 succeeded = desktopLayout.RestoreScreenPosition(
                     desktopPath,
@@ -654,7 +615,7 @@ void DesktopPlacementCoordinator::WorkerLoop(
             }
         } catch (...) {
             errorMessage =
-                L"后台归还桌面或图标定位发生异常；移动日志将在下次启动继续恢复。";
+                L"后台桌面显示归属提交或图标定位发生异常；原件路径没有改变。";
         }
 
         Event completed;

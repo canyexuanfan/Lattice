@@ -17,6 +17,27 @@ std::vector<std::wstring> ExtractShellDropPaths(IDataObject* dataObject) {
     if (FAILED(SHCreateShellItemArrayFromDataObject(
             dataObject,
             IID_PPV_ARGS(items.GetAddressOf()))) || items == nullptr) {
+        FORMATETC format{CF_HDROP, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
+        STGMEDIUM medium{};
+        if (FAILED(dataObject->GetData(&format, &medium))) {
+            return paths;
+        }
+        if (medium.tymed == TYMED_HGLOBAL && medium.hGlobal != nullptr) {
+            const HDROP drop = reinterpret_cast<HDROP>(medium.hGlobal);
+            const UINT count = DragQueryFileW(drop, 0xFFFFFFFFU, nullptr, 0);
+            for (UINT index = 0; index < count; ++index) {
+                const UINT length = DragQueryFileW(drop, index, nullptr, 0);
+                if (length == 0) { paths.clear(); break; }
+                std::wstring path(static_cast<size_t>(length) + 1, L'\0');
+                if (DragQueryFileW(drop, index, path.data(), length + 1) != length) {
+                    paths.clear();
+                    break;
+                }
+                path.resize(length);
+                paths.push_back(std::move(path));
+            }
+        }
+        ReleaseStgMedium(&medium);
         return paths;
     }
 

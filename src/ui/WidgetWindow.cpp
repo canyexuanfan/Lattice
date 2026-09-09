@@ -46,7 +46,7 @@ constexpr UINT kIconDragPollMilliseconds = 16;
 constexpr UINT_PTR kInteractionSaveTimerId = 6;
 constexpr UINT kInteractionSaveDelayMilliseconds = 240;
 constexpr wchar_t kAlignmentGuideClassName[] = L"Lattice.AlignmentGuide";
-constexpr wchar_t kCurrentVersion[] = L"0.4.38";
+constexpr wchar_t kCurrentVersion[] = L"0.4.46";
 constexpr UINT kShellNewCommandFirst = 0x5000;
 constexpr UINT kShellNewCommandLast = 0x5FFF;
 
@@ -1228,7 +1228,8 @@ void WidgetWindow::RefreshCurrentItems() {
 bool WidgetWindow::QueueDroppedPaths(
     const std::vector<std::wstring>& paths,
     POINT screenPoint,
-    bool showError) {
+    bool showError,
+    const std::vector<DesktopDropPosition>* suppliedDesktopPositions) {
     if (paths.empty() ||
         IsWindow(hwnd_) == FALSE ||
         shellDropQueued_ ||
@@ -1254,35 +1255,40 @@ bool WidgetWindow::QueueDroppedPaths(
         0,
         static_cast<int>(currentItems_.size()));
 
-    std::vector<DesktopDropPosition> desktopPositions;
-    DesktopLayout desktopLayout;
-    for (const std::wstring& path : paths) {
-        if (!shortcutStore_.IsDesktopPath(path)) {
-            continue;
-        }
-        const bool duplicate = std::any_of(
-            desktopPositions.begin(),
-            desktopPositions.end(),
-            [&](const DesktopDropPosition& value) {
-                return CompareStringOrdinal(
-                           value.path.c_str(),
-                           -1,
-                           path.c_str(),
-                           -1,
-                           TRUE) == CSTR_EQUAL;
-            });
-        if (duplicate) {
-            continue;
-        }
-        POINT point{};
-        std::wstring captureError;
-        if (!desktopLayout.CapturePosition(path, point, captureError)) {
-            if (shortcutStore_.RequiresManagedStorage(path)) {
-                return false;
+    std::vector<DesktopDropPosition> desktopPositions =
+        suppliedDesktopPositions == nullptr
+        ? std::vector<DesktopDropPosition>{}
+        : *suppliedDesktopPositions;
+    if (suppliedDesktopPositions == nullptr) {
+        DesktopLayout desktopLayout;
+        for (const std::wstring& path : paths) {
+            if (!shortcutStore_.IsDesktopPath(path)) {
+                continue;
             }
-            continue;
+            const bool duplicate = std::any_of(
+                desktopPositions.begin(),
+                desktopPositions.end(),
+                [&](const DesktopDropPosition& value) {
+                    return CompareStringOrdinal(
+                               value.path.c_str(),
+                               -1,
+                               path.c_str(),
+                               -1,
+                               TRUE) == CSTR_EQUAL;
+                });
+            if (duplicate) {
+                continue;
+            }
+            POINT point{};
+            std::wstring captureError;
+            if (!desktopLayout.CapturePosition(path, point, captureError)) {
+                if (shortcutStore_.RequiresManagedStorage(path)) {
+                    return false;
+                }
+                continue;
+            }
+            desktopPositions.push_back(DesktopDropPosition{path, point});
         }
-        desktopPositions.push_back(DesktopDropPosition{path, point});
     }
 
     // Drop can provide a new IDataObject or a newer cursor coordinate than the
@@ -1741,7 +1747,7 @@ bool WidgetWindow::AddDroppedPaths(
             MessageDialog::Show(
                 instance_,
                 hwnd_,
-                L"目标格子已经不存在，未移动任何内容。",
+                L"目标格子已经不存在，未改变项目的显示归属。",
                 L"桌面项目收纳失败",
                 MB_OK | MB_ICONERROR);
         }
@@ -1815,14 +1821,19 @@ bool WidgetWindow::AddDroppedPaths(
         if (!shortcutStore_.IsSupportedDesktopItem(item.path)) {
             if (firstError.empty()) {
                 firstError =
-                    L"该文件、文件夹或快捷方式当前不可访问，未移动该项目。";
+                    L"该文件、文件夹或快捷方式当前不可访问，未改变其显示归属。";
             }
             continue;
         }
 
         const std::wstring sourcePath = item.path;
-        const bool physicallyManagedShortcut =
-            shortcutStore_.RequiresManagedStorage(sourcePath);
+        if (shortcutStore_.IsManagedPath(sourcePath)) {
+            if (firstError.empty()) {
+                firstError =
+                    L"该项目仍处于旧版受管目录，请先完成一次性历史迁移。";
+            }
+            continue;
+        }
         std::wstring originalDesktopPath;
         POINT originalDesktopPoint{};
         bool hasOriginalDesktopPoint = false;
@@ -1851,12 +1862,6 @@ bool WidgetWindow::AddDroppedPaths(
                         item.path,
                         originalDesktopPoint,
                         captureError)) {
-                    if (physicallyManagedShortcut) {
-                        if (firstError.empty()) {
-                            firstError = captureError;
-                        }
-                        continue;
-                    }
                 } else {
                     hasOriginalDesktopPoint = true;
                 }
@@ -1891,45 +1896,9 @@ bool WidgetWindow::AddDroppedPaths(
                        item.id)) {
             if (firstError.empty()) {
                 firstError =
-                    L"无法为该项目创建安全的唯一标识，未移动该项目。";
+                    L"无法为该项目创建安全的唯一标识，未改变其显示归属。";
             }
             continue;
-        }
-
-        ItemConfig visibilityState;
-        visibilityState.id = item.id;
-        visibilityState.path = sourcePath;
-        if (existingByPath != appConfig.items.end()) {
-            visibilityState = *existingByPath;
-        }
-        if (physicallyManagedShortcut) {
-            std::wstring visibilityError;
-            if (!shortcutStore_.PrepareForManagedStorage(
-                    visibilityState, visibilityError)) {
-                if (firstError.empty()) {
-                    firstError = visibilityError;
-                }
-                continue;
-            }
-        }
-        bool capturedNewVisibility = false;
-        if (!physicallyManagedShortcut) {
-            std::wstring visibilityError;
-            if (visibilityState.desktopVisibilityMode == 0) {
-                if (!shortcutStore_.CaptureAndSuppressDesktopVisibility(
-                        sourcePath, visibilityState, visibilityError)) {
-                    if (firstError.empty()) {
-                        firstError = visibilityError;
-                    }
-                    continue;
-                }
-                capturedNewVisibility = visibilityState.desktopVisibilityMode != 0;
-            } else if (!shortcutStore_.SuppressDesktopVisibility(visibilityState, visibilityError)) {
-                if (firstError.empty()) {
-                    firstError = visibilityError;
-                }
-                continue;
-            }
         }
 
         const AppConfig beforeItemConfig = appConfig;
@@ -1953,18 +1922,10 @@ bool WidgetWindow::AddDroppedPaths(
                 registered->desktopX = originalDesktopPoint.x;
                 registered->desktopY = originalDesktopPoint.y;
                 registered->hasDesktopPosition = hasOriginalDesktopPoint;
-                registered->desktopVisibilityMode = physicallyManagedShortcut
-                    ? 0
-                    : visibilityState.desktopVisibilityMode;
-                registered->desktopVisibilityOriginalFlags = physicallyManagedShortcut
-                    ? 0
-                    : visibilityState.desktopVisibilityOriginalFlags;
-                registered->desktopVisibilityNewStartValue = physicallyManagedShortcut
-                    ? -1
-                    : visibilityState.desktopVisibilityNewStartValue;
-                registered->desktopVisibilityClassicValue = physicallyManagedShortcut
-                    ? -1
-                    : visibilityState.desktopVisibilityClassicValue;
+                registered->desktopVisibilityMode = 0;
+                registered->desktopVisibilityOriginalFlags = 0;
+                registered->desktopVisibilityNewStartValue = -1;
+                registered->desktopVisibilityClassicValue = -1;
                 if (hasOriginalDesktopPoint) {
                     auto placement = std::find_if(
                         appConfig.desktopLayout.begin(),
@@ -2063,29 +2024,13 @@ bool WidgetWindow::AddDroppedPaths(
                 const bool saved = configStore_.SaveAppConfig(appConfig);
                 return saved;
             };
-        bool collected = false;
-        if (physicallyManagedShortcut) {
-            collected = shortcutStore_.MoveIntoCategory(
-                item.id,
-                sourcePath,
-                CategoryStorageFolder(appConfig, categoryId_),
-                persistCollectedItem,
-                destinationPath,
-                errorMessage,
-                hwnd_);
-        } else {
-            destinationPath = sourcePath;
-            collected = persistCollectedItem(destinationPath);
-            if (!collected) {
-                errorMessage = L"无法保存该文件或文件夹的收纳配置，原件未发生改变。";
-            }
+        destinationPath = sourcePath;
+        const bool collected = persistCollectedItem(destinationPath);
+        if (!collected) {
+            errorMessage = L"无法保存该项目的显示归属，原件未发生改变。";
         }
         if (!collected) {
             appConfig = beforeItemConfig;
-            if (capturedNewVisibility) {
-                std::wstring rollbackError;
-                shortcutStore_.RestoreDesktopVisibility(visibilityState, rollbackError);
-            }
             if (firstError.empty()) {
                 firstError = errorMessage;
             }
@@ -2334,10 +2279,7 @@ void WidgetWindow::SetFixedExpanded(bool enabled) {
 }
 
 void WidgetWindow::OpenCategoryLocation() {
-    const std::wstring storageFolder = CategoryStorageFolder(configStore_.LoadAppConfig(), categoryId_);
-    if (shortcutStore_.EnsureCategoryDirectory(storageFolder)) {
-        launcher_.OpenPath(shortcutStore_.CategoryPath(storageFolder));
-    }
+    launcher_.OpenPath(L"shell:desktop");
 }
 
 void WidgetWindow::ApplyMovingSnap(RECT& movingRect) const {
@@ -2709,14 +2651,12 @@ void WidgetWindow::ShowBackgroundMenu(POINT screenPoint) {
     AppendMenuW(menu, pasteState, kPasteShortcutCommand, L"粘贴快捷方式(S)");
 
     bool shellNewMenuAdded = false;
-    const std::wstring storageFolder = CategoryStorageFolder(configStore_.LoadAppConfig(), categoryId_);
-    if (shortcutStore_.EnsureCategoryDirectory(storageFolder)) {
-        Microsoft::WRL::ComPtr<IShellItem> folderItem;
+    {
         Microsoft::WRL::ComPtr<IShellFolder> folder;
-        if (SUCCEEDED(SHCreateItemFromParsingName(
-                shortcutStore_.CategoryPath(storageFolder).c_str(), nullptr, IID_PPV_ARGS(&folderItem))) &&
-            SUCCEEDED(folderItem->BindToHandler(nullptr, BHID_SFObject, IID_PPV_ARGS(&folder))) &&
-            SUCCEEDED(folder->CreateViewObject(hwnd_, IID_PPV_ARGS(&shellContextMenu)))) {
+        if (SUCCEEDED(SHGetDesktopFolder(folder.GetAddressOf())) &&
+            folder != nullptr &&
+            SUCCEEDED(folder->CreateViewObject(
+                hwnd_, IID_PPV_ARGS(&shellContextMenu)))) {
             shellRootMenu = CreatePopupMenu();
             if (SUCCEEDED(shellContextMenu->QueryContextMenu(
                     shellRootMenu,
@@ -2817,9 +2757,9 @@ void WidgetWindow::ShowBackgroundMenu(POINT screenPoint) {
         if (shellRootMenu != nullptr) {
             DestroyMenu(shellRootMenu);
         }
-        RegisterUntrackedCategoryItems();
-        LoadItems();
-        InvalidateRect(hwnd_, nullptr, FALSE);
+        if (owner_ != nullptr && IsWindow(owner_) != FALSE) {
+            PostMessageW(owner_, kOrganizerConfigChangedMessage, 0, 0);
+        }
         return;
     }
     DestroyMenu(menu);
@@ -2906,7 +2846,7 @@ void WidgetWindow::DissolveCategory() {
     }
     if (MessageDialog::Show(instance_,
             hwnd_,
-            L"解散格子后，其中的桌面项目会移回原桌面位置。是否继续？",
+            L"解散格子后，其中项目会取消格子显示归属并重新显示在桌面；原件路径不会改变。是否继续？",
             L"确认解散",
             MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) {
         return;
@@ -2923,7 +2863,7 @@ void WidgetWindow::DissolveCategory() {
         if (!MoveItemOut(itemId, false)) {
             MessageDialog::Show(instance_,
                 hwnd_,
-                L"至少一个桌面项目无法安全移回桌面。已经移出的项目不会重复显示；格子会保留，方便继续处理剩余项目。",
+                L"至少一个桌面项目无法保存取消归属。已经成功取消归属的项目会显示在桌面；格子会保留，方便继续处理剩余项目。",
                 L"未能完全解散格子",
                 MB_OK | MB_ICONERROR);
             return;
@@ -2936,7 +2876,7 @@ void WidgetWindow::DissolveCategory() {
     if (refreshedCategory == appConfig.categories.end()) {
         return;
     }
-    CategoryStorageManager storageManager(configStore_, shortcutStore_);
+    CategoryStorageManager storageManager(configStore_);
     std::wstring storageError;
     if (!storageManager.RemoveEmpty(categoryId_, storageError)) {
         MessageDialog::Show(instance_, hwnd_, storageError.c_str(), L"未能完全解散格子", MB_OK | MB_ICONWARNING);
@@ -2944,7 +2884,7 @@ void WidgetWindow::DissolveCategory() {
     }
     appConfig.categories.erase(refreshedCategory);
     if (!configStore_.SaveAppConfig(appConfig)) {
-        MessageDialog::Show(instance_, hwnd_, L"桌面项目已移回桌面，但格子配置保存失败。", L"解散格子失败", MB_OK | MB_ICONERROR);
+        MessageDialog::Show(instance_, hwnd_, L"桌面项目的格子归属已清除，但格子配置保存失败；原件路径没有改变。", L"解散格子失败", MB_OK | MB_ICONERROR);
         return;
     }
     PostMessageW(owner_, kOrganizerConfigChangedMessage, 0, 0);
@@ -2956,7 +2896,7 @@ void WidgetWindow::RenameCategory() {
     if (!name.has_value() || name->empty()) {
         return;
     }
-    CategoryStorageManager storageManager(configStore_, shortcutStore_);
+    CategoryStorageManager storageManager(configStore_);
     std::wstring errorMessage;
     if (!storageManager.Rename(categoryId_, *name, errorMessage)) {
         MessageDialog::Show(instance_, hwnd_, errorMessage.c_str(), L"重命名格子失败", MB_OK | MB_ICONWARNING);
@@ -2967,43 +2907,6 @@ void WidgetWindow::RenameCategory() {
     LoadItems();
     PostMessageW(owner_, kOrganizerConfigChangedMessage, 0, 0);
     InvalidateRect(hwnd_, nullptr, FALSE);
-}
-
-void WidgetWindow::RegisterUntrackedCategoryItems() {
-    AppConfig config = configStore_.LoadAppConfig();
-    const std::wstring directory = shortcutStore_.CategoryPath(CategoryStorageFolder(config, categoryId_));
-    DesktopScanner scanner;
-    bool changed = false;
-    std::error_code error;
-    for (const std::filesystem::directory_entry& entry : std::filesystem::directory_iterator(directory, error)) {
-        if (error) {
-            break;
-        }
-        const std::wstring path = entry.path().wstring();
-        const auto existing = std::find_if(config.items.begin(), config.items.end(), [&](const ItemConfig& item) {
-            return CompareStringOrdinal(item.path.c_str(), -1, path.c_str(), -1, TRUE) == CSTR_EQUAL;
-        });
-        if (existing != config.items.end()) {
-            continue;
-        }
-        const DesktopItem desktopItem = scanner.CreateItemFromPath(path);
-        config.items.push_back(ItemConfig{desktopItem.id, path, desktopItem.displayName});
-        if (categoryId_ == kUncategorizedCategoryId) {
-            config.uncategorizedItemIds.push_back(desktopItem.id);
-        } else {
-            const auto category = std::find_if(config.categories.begin(), config.categories.end(), [&](const CategoryConfig& value) {
-                return value.id == categoryId_;
-            });
-            if (category != config.categories.end()) {
-                category->itemIds.push_back(desktopItem.id);
-            }
-        }
-        changed = true;
-    }
-    if (changed) {
-        configStore_.SaveAppConfig(config);
-        PostMessageW(owner_, kOrganizerConfigChangedMessage, 0, 0);
-    }
 }
 
 RECT WidgetWindow::GridBounds() const {
@@ -3514,27 +3417,14 @@ void WidgetWindow::MoveItemToCategory(const std::wstring& itemId, const std::wst
             }
             return configStore_.SaveAppConfig(savedConfig);
         };
-    const bool requiresPhysicalMove =
-        shortcutStore_.RequiresManagedStorage(sourcePath);
-    bool moved = false;
-    if (requiresPhysicalMove) {
-        moved = shortcutStore_.MoveIntoCategory(
-            itemId,
-            sourcePath,
-            CategoryStorageFolder(savedConfig, targetCategoryId),
-            persistCategoryMove,
-            destinationPath,
-            errorMessage,
-            hwnd_);
-    } else {
-        destinationPath = sourcePath;
-        moved = persistCategoryMove(destinationPath);
-        if (!moved) {
-            errorMessage = L"无法保存该文件或文件夹的分类，原件未发生改变。";
-        }
+    destinationPath = sourcePath;
+    const bool moved = persistCategoryMove(destinationPath);
+    if (!moved) {
+        errorMessage =
+            L"无法保存该桌面项目的分类，原件未发生改变。";
     }
     if (!moved) {
-        MessageDialog::Show(instance_, hwnd_, errorMessage.c_str(), L"移动桌面项目失败", MB_OK | MB_ICONERROR);
+        MessageDialog::Show(instance_, hwnd_, errorMessage.c_str(), L"更改桌面项目归属失败", MB_OK | MB_ICONERROR);
         return;
     }
     LoadItems();
@@ -3598,15 +3488,7 @@ bool WidgetWindow::MoveItemOut(
     bool placementCached = registeredBeforeRemoval != registeredItems_.end();
     ItemConfig placement = placementCached ? *registeredBeforeRemoval : ItemConfig{};
     if (dropScreenPoint != nullptr) {
-        const bool sourceIsManaged = shortcutStore_.IsManagedPath(sourcePath);
-        const bool hasValidOriginalDesktopPath =
-            !placement.originalDesktopPath.empty() &&
-            shortcutStore_.IsDesktopPath(placement.originalDesktopPath);
-        const std::wstring targetPath = sourceIsManaged
-            ? (hasValidOriginalDesktopPath
-                ? placement.originalDesktopPath
-                : JoinPath(shortcutStore_.DesktopPath(), FileNameFromPath(sourcePath)))
-            : sourcePath;
+        const std::wstring targetPath = sourcePath;
         if (shortcutStore_.IsDesktopPath(targetPath) &&
             owner_ != nullptr && IsWindow(owner_) != FALSE) {
             DesktopPlacementRequest request;
@@ -3671,49 +3553,14 @@ bool WidgetWindow::MoveItemOut(
     bool moved = false;
     std::wstring desktopPath = sourcePath;
     std::wstring errorMessage;
-    if (!shortcutStore_.IsManagedPath(sourcePath)) {
-        bool restoredVisibility = true;
-        if (placement.desktopVisibilityMode != 0) {
-            restoredVisibility = shortcutStore_.RestoreDesktopVisibility(
-                placement,
-                errorMessage,
-                dropScreenPoint);
-        }
-        moved = restoredVisibility && removeFromConfig();
-        if (!moved) {
-            if (restoredVisibility) {
-                std::wstring rollbackError;
-                shortcutStore_.SuppressDesktopVisibility(placement, rollbackError);
-                errorMessage = L"项目原件未发生改变，但无法保存移出格子的配置。";
-            }
-        }
+    if (shortcutStore_.IsManagedPath(sourcePath)) {
+        errorMessage =
+            L"该项目仍处于旧版受管目录，请先完成一次性历史迁移。";
     } else {
-        std::wstring destinationPath;
-        const bool hasValidOriginalDesktopPath =
-            !placement.originalDesktopPath.empty() &&
-            shortcutStore_.IsDesktopPath(placement.originalDesktopPath);
-        const std::wstring targetPath = hasValidOriginalDesktopPath
-            ? placement.originalDesktopPath
-            : JoinPath(shortcutStore_.DesktopPath(), FileNameFromPath(sourcePath));
-        moved = shortcutStore_.MoveToOriginalDesktop(
-            itemId,
-            sourcePath,
-            targetPath,
-            [&](const std::wstring&) { return removeFromConfig(); },
-            destinationPath,
-            errorMessage,
-            hwnd_);
-        if (moved) {
-            desktopPath = destinationPath;
-        }
-        if (moved && placement.hasDesktopPosition && dropScreenPoint == nullptr) {
-            DesktopLayout desktopLayout;
-            std::wstring restoreError;
-            if (!desktopLayout.RestorePositions(
-                    {DesktopPosition{destinationPath, POINT{placement.desktopX, placement.desktopY}}},
-                    restoreError) && showError) {
-                MessageDialog::Show(instance_, hwnd_, restoreError.c_str(), L"桌面坐标恢复", MB_OK | MB_ICONWARNING);
-            }
+        moved = removeFromConfig();
+        if (!moved) {
+            errorMessage =
+                L"项目原件未发生改变，但无法保存移出格子的显示归属。";
         }
     }
     if (!moved) {
@@ -3868,7 +3715,10 @@ void WidgetWindow::Render() {
             D2D1::ColorF(lightTheme ? 0x4AAFCB : 0x8ADDF6, lightTheme ? 0.38f : 0.42f), headerPressedBrush.GetAddressOf());
 
         const D2D1_SIZE_F size = target->GetSize();
-        wallpaperBackdrop_.Draw(target, D2D1::RectF(0.0f, 0.0f, size.width, size.height));
+        wallpaperBackdrop_.Draw(
+            target,
+            D2D1::RectF(0.0f, 0.0f, size.width, size.height),
+            kWallpaperDrawMode);
         if (backgroundTintBrush != nullptr) {
             target->FillRectangle(D2D1::RectF(0.0f, 0.0f, size.width, size.height), backgroundTintBrush.Get());
         }
@@ -4028,6 +3878,10 @@ void WidgetWindow::Render() {
         }
     }
     const HRESULT hr = d2d_.EndDraw();
+#ifndef NDEBUG
+    lastRenderResult_ = hr;
+    ++renderCount_;
+#endif
     if (hr == D2DERR_RECREATE_TARGET) {
         shellDropProjectionPainted_ = false;
         iconCache_.Clear();

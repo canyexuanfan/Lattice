@@ -63,6 +63,14 @@ public:
 
 private:
     friend struct WidgetWindowSmokeAccess;
+#ifndef NDEBUG
+    HRESULT lastRenderResult_ = E_PENDING;
+    unsigned int renderCount_ = 0;
+#endif
+
+    static constexpr WallpaperBackdropDrawMode
+        kWallpaperDrawMode =
+            WallpaperBackdropDrawMode::CropTopLeft;
 
     struct DesktopDropPosition {
         std::wstring path;
@@ -94,7 +102,8 @@ private:
     bool QueueDroppedPaths(
         const std::vector<std::wstring>& paths,
         POINT screenPoint,
-        bool showError = true);
+        bool showError = true,
+        const std::vector<DesktopDropPosition>* desktopPositions = nullptr);
     bool IsShellDropBusy() const noexcept {
         return shellDropProjectionActive_ ||
                shellDropQueued_ ||
@@ -116,7 +125,6 @@ private:
     void ReorderItem(size_t fromIndex, size_t toIndex);
     void ShowBackgroundMenu(POINT screenPoint);
     bool RequestApplicationExit();
-    void RegisterUntrackedCategoryItems();
     void ApplyMovingSnap(RECT& movingRect) const;
     void ApplySizingSnap(RECT& sizingRect, WPARAM sizingEdge) const;
     void ShowSortMenu(POINT screenPoint);

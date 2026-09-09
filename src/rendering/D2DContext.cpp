@@ -1,18 +1,49 @@
 #include "rendering/D2DContext.h"
 
+namespace {
+
+struct SharedRenderFactories {
+    SharedRenderFactories() {
+        d2dResult = D2D1CreateFactory(
+            D2D1_FACTORY_TYPE_SINGLE_THREADED,
+            d2dFactory.GetAddressOf());
+        if (SUCCEEDED(d2dResult)) {
+            writeResult = DWriteCreateFactory(
+                DWRITE_FACTORY_TYPE_SHARED,
+                __uuidof(IDWriteFactory),
+                reinterpret_cast<IUnknown**>(
+                    writeFactory.GetAddressOf()));
+        }
+    }
+
+    HRESULT d2dResult = E_FAIL;
+    HRESULT writeResult = E_FAIL;
+    Microsoft::WRL::ComPtr<ID2D1Factory> d2dFactory;
+    Microsoft::WRL::ComPtr<IDWriteFactory> writeFactory;
+};
+
+SharedRenderFactories& RenderFactories() {
+    static SharedRenderFactories factories;
+    return factories;
+}
+
+}  // namespace
+
 bool D2DContext::Initialize(HWND hwnd, bool premultipliedAlpha) {
     hwnd_ = hwnd;
     premultipliedAlpha_ = premultipliedAlpha;
 
-    if (FAILED(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, factory_.GetAddressOf()))) {
+    SharedRenderFactories& factories = RenderFactories();
+    if (FAILED(factories.d2dResult) ||
+        factories.d2dFactory == nullptr) {
         return false;
     }
-    if (FAILED(DWriteCreateFactory(
-            DWRITE_FACTORY_TYPE_SHARED,
-            __uuidof(IDWriteFactory),
-            reinterpret_cast<IUnknown**>(writeFactory_.GetAddressOf())))) {
+    if (FAILED(factories.writeResult) ||
+        factories.writeFactory == nullptr) {
         return false;
     }
+    factory_ = factories.d2dFactory;
+    writeFactory_ = factories.writeFactory;
 
     RecreateTarget(hwnd);
     return renderTarget_ != nullptr;

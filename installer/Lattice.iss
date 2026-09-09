@@ -2,7 +2,7 @@
 ; 先运行 scripts\package.ps1 构建 Release 并调用 ISCC.exe。
 
 #define MyAppName "Lattice"
-#define MyAppVersion "0.4.38"
+#define MyAppVersion "0.4.46"
 #define MyAppPublisher "Lattice"
 #define MyAppExeName "Lattice.exe"
 #define MyAppFolderName "Lattice"
@@ -45,7 +45,7 @@ Name: "chinesesimplified"; MessagesFile: "compiler:Languages\ChineseSimplified.i
 
 [Messages]
 WelcomeLabel1=欢迎进入 [name] 安装向导
-WelcomeLabel2=把散落在桌面的文件、文件夹、快捷方式和系统图标，整理成清晰的分类。%n%n桌面文件系统项目会由 Lattice 安全托管，桌面不再重复显示；移出、解散格子或正常退出时会归还原位置。
+WelcomeLabel2=把散落在桌面的文件、文件夹、快捷方式和系统图标，整理成清晰的分类。%n%n桌面项目始终保留在原始路径；Lattice 只接管显示归属，退出后 Explorer 原生图标会立即恢复。
 WizardSelectDir=选择安装位置
 SelectDirDesc=选择 [name] 的安装位置
 SelectDirLabel3=请输入或选择上级目录；点击“下一步”时，安装器会自动补齐 Lattice 子文件夹。
@@ -68,7 +68,6 @@ Name: "{app}\Data"; Permissions: users-modify
 
 [Tasks]
 Name: "startup"; Description: "随 Windows 启动"; GroupDescription: "附加选项："
-Name: "shortcutoverlay"; Description: "统一为 DeskGo 风格的快捷方式箭头"; GroupDescription: "附加选项："
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
@@ -511,10 +510,7 @@ begin
   begin
     RestoreProductConfigSnapshot;
     MigrateLegacyStartupState;
-    if WizardIsTaskSelected('shortcutoverlay') then
-      ApplyShortcutOverlay
-    else
-      RestoreShortcutOverlay;
+    ApplyShortcutOverlay;
   end;
 end;
 

@@ -2,8 +2,7 @@
 #include <commctrl.h>
 #include <commoncontrols.h>
 #include <dwmapi.h>
-#include <d3d11.h>
-#include <dxgi1_2.h>
+#include <d2d1helper.h>
 #include <process.h>
 #include <shellapi.h>
 #include <ShlObj.h>
@@ -17,8 +16,10 @@
 #include <cstdlib>
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstring>
 #include <cwctype>
 #include <fstream>
 #include <iostream>
@@ -28,6 +29,7 @@
 #include <optional>
 #include <string>
 #include <tuple>
+#include <thread>
 #include <vector>
 
 #include "app/App.h"
@@ -36,24 +38,70 @@
 #include "config/ConfigStore.h"
 #include "desktop/DesktopScanner.h"
 #include "desktop/DesktopLayout.h"
+#include "desktop/LegacyStorageMigrator.h"
 #include "desktop/DesktopPlacementCoordinator.h"
 #include "desktop/CategoryStorageManager.h"
 #include "desktop/ManagedShortcutStore.h"
 #include "desktop/DesktopSession.h"
 #include "rendering/IconCache.h"
+#include "rendering/WallpaperBackdrop.h"
+#include "shell/ShellDragDrop.h"
 #include "shell/ShellDropTarget.h"
 #include "ui/InputDialog.h"
 #include "ui/DragGhostWindow.h"
+#include "ui/DesktopSurfaceWindow.h"
 #include "ui/MessageDialog.h"
 #include "ui/SettingsDialog.h"
 #include "ui/WidgetWindow.h"
 #include "testing/SmokeCommands.h"
 
-#pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dwmapi.lib")
-#pragma comment(lib, "dxgi.lib")
+
+namespace {
+
+std::string Utf8Text(const std::wstring& value) {
+    const int required = WideCharToMultiByte(
+        CP_UTF8, 0, value.c_str(), static_cast<int>(value.size()),
+        nullptr, 0, nullptr, nullptr);
+    std::string result(static_cast<size_t>((std::max)(required, 0)), char{});
+    if (required > 0) {
+        WideCharToMultiByte(
+            CP_UTF8, 0, value.c_str(), static_cast<int>(value.size()),
+            result.data(), required, nullptr, nullptr);
+    }
+    return result;
+}
+
+}  // namespace
 
 struct WidgetWindowSmokeAccess {
+    static void WriteRenderState(WidgetWindow& widget, std::wostream& output) {
+        output << L"renderCount=" << widget.renderCount_
+               << L" lastRenderResult=" << widget.lastRenderResult_ << L"\n";
+        auto* target = widget.d2d_.Target();
+        output << L"renderTarget=" << target << L" factory=" << widget.d2d_.Factory() << L"\n";
+        if (target != nullptr) {
+            const auto pixels = target->GetPixelSize();
+            const auto size = target->GetSize();
+            output << L"targetPixels=" << pixels.width << L"," << pixels.height
+                   << L" targetDips=" << size.width << L"," << size.height
+                   << L" windowState=" << target->CheckWindowState() << L"\n";
+        }
+    }
+
+    static bool PrepareWallpaper(WidgetWindow& widget) {
+        widget.RefreshWallpaperBackdrop();
+        RECT client{};
+        return GetClientRect(widget.hwnd_, &client) &&
+            widget.wallpaperBackdrop_.CoversPixels(
+                client.right, client.bottom);
+    }
+
+    static constexpr WallpaperBackdropDrawMode
+    WallpaperDrawMode() {
+        return WidgetWindow::kWallpaperDrawMode;
+    }
+
     static bool RequestApplicationExit(WidgetWindow& widget) {
         return widget.RequestApplicationExit();
     }
@@ -71,6 +119,25 @@ struct WidgetWindowSmokeAccess {
         POINT screenPoint,
         bool showError = false) {
         return widget.QueueDroppedPaths(paths, screenPoint, showError);
+    }
+
+    static bool QueuePathsWithDesktopPositions(
+        WidgetWindow& widget,
+        const std::vector<std::wstring>& paths,
+        POINT screenPoint,
+        const std::vector<std::pair<std::wstring, POINT>>& suppliedPositions,
+        bool showError = false) {
+        std::vector<WidgetWindow::DesktopDropPosition> desktopPositions;
+        desktopPositions.reserve(suppliedPositions.size());
+        for (const auto& supplied : suppliedPositions) {
+            desktopPositions.push_back(
+                WidgetWindow::DesktopDropPosition{supplied.first, supplied.second});
+        }
+        return widget.QueueDroppedPaths(
+            paths,
+            screenPoint,
+            showError,
+            &desktopPositions);
     }
 
     static bool DropQueued(const WidgetWindow& widget) {
@@ -239,6 +306,372 @@ struct WidgetWindowSmokeAccess {
     }
 };
 
+struct DesktopSurfaceWindowSmokeAccess {
+    static constexpr WallpaperBackdropDrawMode
+    WallpaperDrawMode() {
+        return DesktopSurfaceWindow::kWallpaperDrawMode;
+    }
+
+    static IDropTarget* DropTarget(DesktopSurfaceWindow& surface) {
+        return surface.desktopDropTarget_.Get();
+    }
+
+    static int CellWidth(const DesktopSurfaceWindow& surface) {
+        return surface.cellWidth_;
+    }
+
+    static int CellHeight(const DesktopSurfaceWindow& surface) {
+        return surface.cellHeight_;
+    }
+
+    static int IconSize(const DesktopSurfaceWindow& surface) {
+        return surface.iconSize_;
+    }
+
+    static bool UsesPhysicalPixelGeometry(
+        DesktopSurfaceWindow& surface) {
+        UINT viewDpi = 96;
+        if (surface.snapshot_.listViewWindow != nullptr) {
+            const UINT reportedDpi = GetDpiForWindow(
+                surface.snapshot_.listViewWindow);
+            if (reportedDpi != 0) {
+                viewDpi = reportedDpi;
+            }
+        }
+        const int expectedIconSize = std::clamp(
+            MulDiv(surface.snapshot_.viewIconSize,
+                   static_cast<int>(viewDpi), 96),
+            16, 512);
+        if (surface.d2d_.Target() == nullptr ||
+            surface.iconSize_ != expectedIconSize) {
+            return false;
+        }
+        FLOAT dpiX = 0.0f;
+        FLOAT dpiY = 0.0f;
+        surface.d2d_.Target()->GetDpi(&dpiX, &dpiY);
+        const bool anchorsMatch = std::all_of(
+            surface.snapshot_.items.begin(),
+            surface.snapshot_.items.end(),
+            [&](const DesktopViewItem& item) {
+                const RECT cell = surface.CellRect(item);
+                const int iconLeft = cell.left +
+                    (surface.cellWidth_ - surface.iconSize_) / 2;
+                return iconLeft == item.screenPoint.x -
+                        surface.snapshot_.screenRect.left &&
+                    cell.top == item.screenPoint.y -
+                        surface.snapshot_.screenRect.top;
+            });
+        return anchorsMatch &&
+            std::abs(dpiX - 96.0f) < 0.01f &&
+            std::abs(dpiY - 96.0f) < 0.01f;
+    }
+
+    static bool HasShellImageIdentity(
+        const DesktopSurfaceWindow& surface) {
+        return std::all_of(
+            surface.snapshot_.items.begin(),
+            surface.snapshot_.items.end(),
+            [](const DesktopViewItem& item) {
+                return item.systemImageIndex >= 0;
+            });
+    }
+
+    static size_t MissingShellImageIdentityCount(
+        const DesktopSurfaceWindow& surface) {
+        return static_cast<size_t>(std::count_if(
+            surface.snapshot_.items.begin(),
+            surface.snapshot_.items.end(),
+            [](const DesktopViewItem& item) {
+                return item.systemImageIndex < 0;
+            }));
+    }
+
+    static bool AllVisibleIconsReady(
+        DesktopSurfaceWindow& surface) {
+        if (surface.d2d_.Target() == nullptr) {
+            return false;
+        }
+        return std::all_of(
+            surface.visibleItems_.begin(),
+            surface.visibleItems_.end(),
+            [&](const DesktopViewItem& item) {
+                return surface.iconCache_.IsIconReady(
+                    surface.d2d_.Target(), item.path);
+            });
+    }
+
+    static RECT NormalizeMarqueeRect(
+        POINT anchor,
+        POINT current,
+        const RECT& bounds) {
+        return DesktopSurfaceWindow::NormalizeMarqueeRect(
+            anchor, current, bounds);
+    }
+
+    static void ConfigureSelectionFixture(
+        DesktopSurfaceWindow& surface,
+        const std::vector<DesktopViewItem>& items,
+        const std::vector<std::wstring>& selected) {
+        surface.snapshot_.screenRect = RECT{0, 0, 300, 220};
+        surface.cellWidth_ = 80;
+        surface.cellHeight_ = 50;
+        surface.iconSize_ = 40;
+        surface.visibleItems_ = items;
+        surface.selectedIdentities_.clear();
+        surface.selectedIdentities_.insert(
+            selected.begin(), selected.end());
+        surface.selectionBaseline_.clear();
+        surface.ResetPointerGesture();
+        surface.RebuildInteractionRects();
+    }
+
+    static void BeginPointerGesture(
+        DesktopSurfaceWindow& surface,
+        POINT point,
+        bool controlPressed) {
+        surface.BeginPointerGesture(point, controlPressed);
+    }
+
+    static std::vector<std::wstring> ContinuePointerGesture(
+        DesktopSurfaceWindow& surface,
+        POINT point) {
+        return surface.ContinuePointerGesture(point);
+    }
+
+    static void CompletePointerGesture(
+        DesktopSurfaceWindow& surface) {
+        surface.CompletePointerGesture();
+    }
+
+    static void CancelPointerGesture(
+        DesktopSurfaceWindow& surface) {
+        surface.CancelPointerCapture();
+    }
+
+    static bool IsSelected(
+        const DesktopSurfaceWindow& surface,
+        const std::wstring& identity) {
+        return surface.IsSelected(identity);
+    }
+
+    static bool IsMarqueeActive(
+        const DesktopSurfaceWindow& surface) {
+        return surface.pointerGesture_ ==
+                DesktopSurfaceWindow::PointerGesture::MarqueeActive &&
+            !IsRectEmpty(&surface.marqueeRect_);
+    }
+
+    static bool IsMarqueePending(
+        const DesktopSurfaceWindow& surface) {
+        return surface.pointerGesture_ ==
+            DesktopSurfaceWindow::PointerGesture::MarqueePending;
+    }
+
+    static bool IsItemPressed(
+        const DesktopSurfaceWindow& surface) {
+        return surface.pointerGesture_ ==
+            DesktopSurfaceWindow::PointerGesture::ItemPressed;
+    }
+
+    static bool HasNoPointerGesture(
+        const DesktopSurfaceWindow& surface) {
+        return surface.pointerGesture_ ==
+                DesktopSurfaceWindow::PointerGesture::None &&
+            IsRectEmpty(&surface.marqueeRect_);
+    }
+
+    static std::vector<std::wstring> SelectedPaths(
+        const DesktopSurfaceWindow& surface) {
+        return surface.SelectedPathsInVisibleOrder();
+    }
+
+    static std::vector<ShellItemReference>
+    VisibleShellItems(
+        const DesktopSurfaceWindow& surface,
+        size_t maximumCount) {
+        std::vector<ShellItemReference> result;
+        const size_t count = (std::min)(
+            maximumCount, surface.visibleItems_.size());
+        result.reserve(count);
+        for (size_t index = 0; index < count; ++index) {
+            const DesktopViewItem& item =
+                surface.visibleItems_[index];
+            result.push_back(ShellItemReference{
+                item.path, item.shellChildPidl});
+        }
+        return result;
+    }
+
+    static bool IsBlankPoint(const DesktopSurfaceWindow& surface, POINT point) {
+        return surface.HitTest(point) < 0;
+    }
+
+    static RECT CellRect(
+        const DesktopSurfaceWindow& surface,
+        size_t visibleIndex) {
+        return visibleIndex < surface.visibleItems_.size()
+            ? surface.CellRect(surface.visibleItems_[visibleIndex])
+            : RECT{};
+    }
+
+    static RECT InteractionRect(
+        const DesktopSurfaceWindow& surface,
+        size_t visibleIndex) {
+        return surface.InteractionRect(visibleIndex);
+    }
+
+    static std::optional<RECT> InteractionRectForIdentity(
+        const DesktopSurfaceWindow& surface,
+        const std::wstring& identity) {
+        for (size_t index = 0;
+             index < surface.visibleItems_.size(); ++index) {
+            if (CompareStringOrdinal(
+                    surface.visibleItems_[index].path.c_str(), -1,
+                    identity.c_str(), -1, TRUE) == CSTR_EQUAL) {
+                return surface.InteractionRect(index);
+            }
+        }
+        return std::nullopt;
+    }
+
+    static std::optional<POINT> VisibleScreenPointForIdentity(
+        const DesktopSurfaceWindow& surface,
+        const std::wstring& identity) {
+        const auto item = std::find_if(
+            surface.visibleItems_.begin(),
+            surface.visibleItems_.end(),
+            [&](const DesktopViewItem& value) {
+                return CompareStringOrdinal(
+                           value.path.c_str(), -1,
+                           identity.c_str(), -1, TRUE) == CSTR_EQUAL;
+            });
+        return item == surface.visibleItems_.end()
+            ? std::nullopt
+            : std::optional<POINT>(item->screenPoint);
+    }
+
+    static RECT ClientBounds(const DesktopSurfaceWindow& surface) {
+        return surface.ClientBounds();
+    }
+
+    static bool HasNativeListViewQueryAccess(
+        const DesktopSurfaceWindow& surface) {
+        return surface.listViewQueryReady_;
+    }
+
+    static size_t ShellDragStartCount(
+        const DesktopSurfaceWindow& surface) {
+        return surface.shellDragStartCount_;
+    }
+
+    static bool BuildShellDragImage(
+        DesktopSurfaceWindow& surface,
+        POINT sourceClientPoint,
+        SHDRAGIMAGE& dragImage) {
+        return surface.BuildShellDragImage(
+            sourceClientPoint, dragImage);
+    }
+
+    static void SuppressShellDragForSmoke(
+        DesktopSurfaceWindow& surface,
+        bool suppress) {
+        surface.suppressShellDragForSmoke_ = suppress;
+    }
+
+    static std::vector<DesktopPosition> OffsetDragPositions(
+        const std::vector<DesktopPosition>& positions,
+        POINT source,
+        POINT drop) {
+        return DesktopSurfaceWindow::OffsetDragPositions(
+            positions, source, drop);
+    }
+
+    static bool PlanVisibleGridDrop(
+        const std::vector<DesktopPosition>& visiblePositions,
+        const std::vector<DesktopPosition>& selectedPositions,
+        POINT source,
+        POINT drop,
+        const RECT& screenRect,
+        int cellWidth,
+        int cellHeight,
+        int iconSize,
+        std::vector<DesktopPosition>& plannedPositions) {
+        return DesktopSurfaceWindow::PlanVisibleGridDrop(
+            visiblePositions,
+            selectedPositions,
+            source,
+            drop,
+            screenRect,
+            cellWidth,
+            cellHeight,
+            iconSize,
+            plannedPositions);
+    }
+
+    static std::optional<POINT> FindNativeCellGapPoint(
+        const DesktopSurfaceWindow& surface) {
+        const RECT bounds = surface.ClientBounds();
+        for (size_t offset = 0;
+             offset < surface.visibleItems_.size(); ++offset) {
+            const size_t index =
+                surface.visibleItems_.size() - 1 - offset;
+            const RECT cell = surface.CellRect(
+                surface.visibleItems_[index]);
+            const LONG top = (std::max)(cell.top + 1, bounds.top);
+            const LONG bottom = (std::min)(
+                cell.top + surface.iconSize_ - 1,
+                bounds.bottom - 1);
+            const LONG left = (std::max)(cell.left + 1, bounds.left);
+            const LONG right = (std::min)(cell.right - 1, bounds.right - 1);
+            for (LONG y = top; y <= bottom; y += 2) {
+                for (LONG x = left; x <= right; x += 2) {
+                    const POINT candidate{x, y};
+                    POINT screenPoint = candidate;
+                    if (surface.hwnd_ == nullptr ||
+                        ClientToScreen(surface.hwnd_, &screenPoint) == FALSE ||
+                        WindowFromPoint(screenPoint) != surface.hwnd_) {
+                        continue;
+                    }
+                    int hitIndex = -1;
+                    if (surface.TryNativeHitTest(
+                            candidate, hitIndex) &&
+                        hitIndex < 0) {
+                        return candidate;
+                    }
+                }
+            }
+        }
+        return std::nullopt;
+    }
+
+    static std::optional<POINT> FindBlankPoint(
+        const DesktopSurfaceWindow& surface) {
+        const RECT bounds = surface.ClientBounds();
+        for (LONG y = bounds.bottom - 8;
+             y >= bounds.top;
+             y -= 8) {
+            for (LONG x = bounds.right - 8;
+                 x >= bounds.left;
+                 x -= 8) {
+                const POINT point{x, y};
+                if (surface.HitTest(point) < 0) {
+                    return point;
+                }
+            }
+        }
+        return std::nullopt;
+    }
+
+    static void ReconcileSelection(
+        DesktopSurfaceWindow& surface,
+        const std::vector<DesktopViewItem>& snapshotItems,
+        const std::vector<std::wstring>& assigned) {
+        surface.snapshot_.items = snapshotItems;
+        surface.assignedIdentities_ = assigned;
+        surface.RebuildVisibleItems();
+    }
+};
+
 namespace {
 
 std::optional<std::string> ReadFileBytes(const std::wstring& path) {
@@ -249,6 +682,50 @@ std::optional<std::string> ReadFileBytes(const std::wstring& path) {
     return std::string(
         std::istreambuf_iterator<char>(input),
         std::istreambuf_iterator<char>());
+}
+
+struct StableFileIdentity {
+    ULONGLONG volumeSerial = 0;
+    FILE_ID_128 fileId{};
+};
+
+std::optional<StableFileIdentity> ReadStableFileIdentity(
+    const std::filesystem::path& path) {
+    const DWORD attributes = GetFileAttributesW(path.c_str());
+    if (attributes == INVALID_FILE_ATTRIBUTES) {
+        return std::nullopt;
+    }
+    HANDLE file = CreateFileW(
+        path.c_str(),
+        FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr,
+        OPEN_EXISTING,
+        (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0
+            ? FILE_FLAG_BACKUP_SEMANTICS
+            : FILE_ATTRIBUTE_NORMAL,
+        nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        return std::nullopt;
+    }
+    FILE_ID_INFO info{};
+    const bool read = GetFileInformationByHandleEx(
+        file, FileIdInfo, &info, sizeof(info)) != FALSE;
+    CloseHandle(file);
+    if (!read) {
+        return std::nullopt;
+    }
+    return StableFileIdentity{info.VolumeSerialNumber, info.FileId};
+}
+
+bool SameStableFileIdentity(
+    const std::optional<StableFileIdentity>& left,
+    const std::optional<StableFileIdentity>& right) {
+    return left.has_value() && right.has_value() &&
+        left->volumeSerial == right->volumeSerial &&
+        std::memcmp(
+            &left->fileId, &right->fileId,
+            sizeof(FILE_ID_128)) == 0;
 }
 
 void AttachParentConsole() {
@@ -415,6 +892,11 @@ bool CaptureScreenPixels(
             rect.top,
             SRCCOPY | CAPTUREBLT);
 
+    if (previous != nullptr) {
+        SelectObject(memory, previous);
+        previous = nullptr;
+    }
+
     bool succeeded = false;
     if (copied != FALSE) {
         BITMAPINFO info{};
@@ -449,6 +931,138 @@ bool CaptureScreenPixels(
         pixels.clear();
     }
     return succeeded;
+}
+
+bool SaveCapturedPixelsBmp(
+    const RECT& rect,
+    const std::vector<std::uint32_t>& pixels,
+    const std::filesystem::path& outputPath) {
+    const LONG width = rect.right - rect.left;
+    const LONG height = rect.bottom - rect.top;
+    if (width <= 0 || height <= 0 ||
+        pixels.size() != static_cast<size_t>(width) * height) {
+        return false;
+    }
+    BITMAPFILEHEADER fileHeader{};
+    BITMAPINFOHEADER info{};
+    fileHeader.bfType = 0x4D42;
+    fileHeader.bfOffBits = sizeof(fileHeader) + sizeof(info);
+    fileHeader.bfSize = fileHeader.bfOffBits +
+        static_cast<DWORD>(pixels.size() * sizeof(std::uint32_t));
+    info.biSize = sizeof(info);
+    info.biWidth = width;
+    info.biHeight = -height;
+    info.biPlanes = 1;
+    info.biBitCount = 32;
+    info.biCompression = BI_RGB;
+    std::ofstream output(outputPath, std::ios::binary | std::ios::trunc);
+    if (!output) {
+        return false;
+    }
+    output.write(
+        reinterpret_cast<const char*>(&fileHeader), sizeof(fileHeader));
+    output.write(reinterpret_cast<const char*>(&info), sizeof(info));
+    output.write(
+        reinterpret_cast<const char*>(pixels.data()),
+        static_cast<std::streamsize>(
+            pixels.size() * sizeof(std::uint32_t)));
+    output.flush();
+    return output.good();
+}
+
+
+bool SaveWindowClientBmp(
+    HWND window,
+    const std::filesystem::path& outputPath) {
+    RECT client{};
+    if (window == nullptr ||
+        GetClientRect(window, &client) == FALSE) {
+        return false;
+    }
+    const UINT width = static_cast<UINT>(client.right - client.left);
+    const UINT height = static_cast<UINT>(client.bottom - client.top);
+    if (width == 0 || height == 0) {
+        return false;
+    }
+    HDC windowDc = GetDC(window);
+    HDC memoryDc = windowDc == nullptr
+        ? nullptr
+        : CreateCompatibleDC(windowDc);
+    BITMAPINFO bitmapInfo{};
+    bitmapInfo.bmiHeader.biSize = sizeof(bitmapInfo.bmiHeader);
+    bitmapInfo.bmiHeader.biWidth = static_cast<LONG>(width);
+    bitmapInfo.bmiHeader.biHeight = -static_cast<LONG>(height);
+    bitmapInfo.bmiHeader.biPlanes = 1;
+    bitmapInfo.bmiHeader.biBitCount = 32;
+    bitmapInfo.bmiHeader.biCompression = BI_RGB;
+    void* pixels = nullptr;
+    HBITMAP bitmap = memoryDc == nullptr
+        ? nullptr
+        : CreateDIBSection(
+            windowDc,
+            &bitmapInfo,
+            DIB_RGB_COLORS,
+            &pixels,
+            nullptr,
+            0);
+    HGDIOBJ previous = bitmap == nullptr
+        ? nullptr
+        : SelectObject(memoryDc, bitmap);
+    constexpr UINT kPrintWindowRenderFullContent = 0x00000002;
+    BOOL captured = previous != nullptr
+        ? PrintWindow(
+            window,
+            memoryDc,
+            PW_CLIENTONLY | kPrintWindowRenderFullContent)
+        : FALSE;
+    if (captured == FALSE && previous != nullptr) {
+        captured = BitBlt(
+            memoryDc,
+            0,
+            0,
+            static_cast<int>(width),
+            static_cast<int>(height),
+            windowDc,
+            0,
+            0,
+            SRCCOPY | CAPTUREBLT);
+    }
+    bool saved = false;
+    if (captured != FALSE && pixels != nullptr) {
+        const DWORD pixelBytes = width * height * 4;
+        BITMAPFILEHEADER fileHeader{};
+        fileHeader.bfType = 0x4D42;
+        fileHeader.bfOffBits =
+            sizeof(BITMAPFILEHEADER) + sizeof(BITMAPINFOHEADER);
+        fileHeader.bfSize = fileHeader.bfOffBits + pixelBytes;
+        std::ofstream output(outputPath, std::ios::binary | std::ios::trunc);
+        if (output) {
+            output.write(
+                reinterpret_cast<const char*>(&fileHeader),
+                sizeof(fileHeader));
+            output.write(
+                reinterpret_cast<const char*>(&bitmapInfo.bmiHeader),
+                sizeof(bitmapInfo.bmiHeader));
+            output.write(
+                static_cast<const char*>(pixels),
+                static_cast<std::streamsize>(pixelBytes));
+            output.flush();
+            saved = output.good();
+        }
+    }
+    if (previous != nullptr) {
+        SelectObject(memoryDc, previous);
+    }
+    if (bitmap != nullptr) {
+        DeleteObject(bitmap);
+    }
+    if (memoryDc != nullptr) {
+        DeleteDC(memoryDc);
+    }
+    if (windowDc != nullptr) {
+        ReleaseDC(window, windowDc);
+    }
+    return saved;
 }
 
 bool CaptureIconPixels(
@@ -874,6 +1488,13 @@ int RunSmokeConfig() {
     desktopPlacement.y = 192;
     appConfig.desktopLayout.clear();
     appConfig.desktopLayout.push_back(desktopPlacement);
+    DesktopPlacementConfig desktopDisplayPlacement;
+    desktopDisplayPlacement.path = layoutItem.originalDesktopPath;
+    desktopDisplayPlacement.x = 120;
+    desktopDisplayPlacement.y = 240;
+    appConfig.desktopDisplayLayout.clear();
+    appConfig.desktopDisplayLayout.push_back(
+        desktopDisplayPlacement);
     CategoryConfig category;
     category.id = L"smoke-category";
     category.name = L"Smoke";
@@ -932,10 +1553,59 @@ int RunSmokeConfig() {
         loadedAppConfig.desktopLayout.size() != 1 ||
         loadedAppConfig.desktopLayout.front().path != desktopPlacement.path ||
         loadedAppConfig.desktopLayout.front().x != desktopPlacement.x ||
-        loadedAppConfig.desktopLayout.front().y != desktopPlacement.y) {
+        loadedAppConfig.desktopLayout.front().y != desktopPlacement.y ||
+        loadedAppConfig.desktopDisplayLayout.size() != 1 ||
+        loadedAppConfig.desktopDisplayLayout.front().path !=
+            desktopDisplayPlacement.path ||
+        loadedAppConfig.desktopDisplayLayout.front().x !=
+            desktopDisplayPlacement.x ||
+        loadedAppConfig.desktopDisplayLayout.front().y !=
+            desktopDisplayPlacement.y) {
         std::wcerr << L"Desktop layout config persistence failed\n";
         return 1;
     }
+    if (!store.SaveDesktopDisplayPositionsAsync(
+            {DesktopPlacementConfig{
+                desktopDisplayPlacement.path, 333, 444}}) ||
+        !store.SaveDesktopDisplayPositionsAsync(
+            {
+                DesktopPlacementConfig{
+                    desktopDisplayPlacement.path, 777, 888},
+                DesktopPlacementConfig{
+                    L"desktop-display-second", 555, 666},
+            }) ||
+        !ConfigStore::DrainPendingWrites(5000)) {
+        std::wcerr << L"Desktop display layout async save failed";
+        return 1;
+    }
+    const AppConfig displayUpdatedConfig = store.LoadAppConfig();
+    const auto updatedDisplay = std::find_if(
+        displayUpdatedConfig.desktopDisplayLayout.begin(),
+        displayUpdatedConfig.desktopDisplayLayout.end(),
+        [&](const DesktopPlacementConfig& value) {
+            return value.path == desktopDisplayPlacement.path;
+        });
+    const auto secondDisplay = std::find_if(
+        displayUpdatedConfig.desktopDisplayLayout.begin(),
+        displayUpdatedConfig.desktopDisplayLayout.end(),
+        [](const DesktopPlacementConfig& value) {
+            return value.path == L"desktop-display-second";
+        });
+    if (updatedDisplay ==
+            displayUpdatedConfig.desktopDisplayLayout.end() ||
+        updatedDisplay->x != 777 || updatedDisplay->y != 888 ||
+        secondDisplay ==
+            displayUpdatedConfig.desktopDisplayLayout.end() ||
+        secondDisplay->x != 555 || secondDisplay->y != 666 ||
+        displayUpdatedConfig.desktopLayout.size() != 1 ||
+        displayUpdatedConfig.desktopLayout.front().x !=
+            desktopPlacement.x ||
+        displayUpdatedConfig.desktopLayout.front().y !=
+            desktopPlacement.y) {
+        std::wcerr << L"Desktop display layout merge changed native layout";
+        return 1;
+    }
+
     const auto savedCategory = std::find_if(
         loadedAppConfig.categories.begin(),
         loadedAppConfig.categories.end(),
@@ -974,37 +1644,52 @@ int RunSmokeConfig() {
 
 int RunSmokeDesktopLayout() {
     AttachParentConsole();
-    DesktopScanner scanner;
     DesktopLayout layout;
-    std::wstring lastError;
+    DesktopViewSnapshot snapshot;
+    std::wstring errorMessage;
     const std::filesystem::path diagnosticPath =
         std::filesystem::path(ConfigStore{}.ConfigPath()).parent_path() /
         L"smoke-layout-diagnostics.txt";
     std::ofstream diagnostics(diagnosticPath, std::ios::trunc);
-    const auto utf8 = [](const std::wstring& value) {
-        const int required = WideCharToMultiByte(
-            CP_UTF8, 0, value.c_str(), static_cast<int>(value.size()), nullptr, 0, nullptr, nullptr);
-        std::string result(static_cast<size_t>((std::max)(required, 0)), '\0');
-        if (required > 0) {
-            WideCharToMultiByte(
-                CP_UTF8, 0, value.c_str(), static_cast<int>(value.size()), result.data(), required, nullptr, nullptr);
-        }
-        return result;
-    };
-    const std::vector<DesktopItem> items = scanner.Scan(false);
-    diagnostics << "ITEM_COUNT=" << items.size() << "\n";
-    for (const DesktopItem& item : items) {
-        POINT point{};
-        if (layout.CapturePosition(item.path, point, lastError)) {
-            diagnostics << "CAPTURED=" << utf8(item.path) << " @ " << point.x << "," << point.y << "\n";
-            std::wcout << L"Desktop layout item: " << item.displayName << L" @ " << point.x << L"," << point.y << L"\n";
-            return 0;
-        }
-        diagnostics << "FAILED=" << utf8(item.path) << " | " << utf8(lastError) << "\n";
+    const auto started = std::chrono::steady_clock::now();
+    if (!layout.CaptureViewSnapshot(snapshot, errorMessage)) {
+        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - started).count();
+        diagnostics << "STATUS=FAIL\nELAPSED_MS=" << elapsed << "\n";
+        diagnostics.flush();
+        std::wcerr << L"Desktop layout snapshot failed: " << errorMessage << L"\n";
+        return 1;
     }
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - started).count();
+    const bool valid = snapshot.desktopHost != nullptr &&
+        snapshot.shellViewWindow != nullptr &&
+        snapshot.listViewWindow != nullptr &&
+        IsWindow(snapshot.desktopHost) != FALSE &&
+        IsWindow(snapshot.shellViewWindow) != FALSE &&
+        IsWindow(snapshot.listViewWindow) != FALSE &&
+        snapshot.screenRect.right > snapshot.screenRect.left &&
+        snapshot.screenRect.bottom > snapshot.screenRect.top &&
+        !snapshot.items.empty() &&
+        std::any_of(
+            snapshot.items.begin(),
+            snapshot.items.end(),
+            [](const DesktopViewItem& item) {
+                return item.viewIndex >= 0 && item.systemImageIndex >= 0;
+            });
+    diagnostics << "STATUS=" << (valid ? "PASS" : "FAIL") << "\n"
+                << "ELAPSED_MS=" << elapsed << "\n"
+                << "ITEM_COUNT=" << snapshot.items.size() << "\n"
+                << "VIEW_FLAGS=" << snapshot.viewFlags << "\n"
+                << "VIEW_ICON_SIZE=" << snapshot.viewIconSize << "\n";
     diagnostics.flush();
-    std::wcerr << L"Desktop layout capture failed: " << lastError << L"\n";
-    return 1;
+    if (!valid) {
+        std::wcerr << L"Desktop layout snapshot returned incomplete Shell identity\n";
+        return 1;
+    }
+    std::wcout << L"Desktop layout snapshot items: " << snapshot.items.size()
+               << L", elapsed: " << elapsed << L" ms\n";
+    return 0;
 }
 
 int RunSmokeShellNewMenu() {
@@ -1085,6 +1770,7 @@ int RunSmokeManagedItems() {
     const std::filesystem::path testRoot =
         testBase / (L"run-" + std::to_wstring(GetCurrentProcessId()));
     const std::filesystem::path dataDirectory = testRoot / L"Data";
+    const std::filesystem::path configDirectory = testRoot / L"Config";
     const std::filesystem::path desktopDirectory = testRoot / L"Desktop";
     const std::filesystem::path publicDesktopDirectory = testRoot / L"PublicDesktop";
     std::error_code fileError;
@@ -1142,16 +1828,118 @@ int RunSmokeManagedItems() {
         std::filesystem::remove_all(testRoot, cleanupError);
         return 1;
     };
+
+    if (!SetEnvironmentVariableW(
+            L"DESKTOP_ORGANIZER_CONFIG_DIR",
+            configDirectory.c_str()) ||
+        !SetEnvironmentVariableW(
+            L"DESKTOP_ORGANIZER_DATA_DIR",
+            dataDirectory.c_str()) ||
+        !SetEnvironmentVariableW(
+            L"DESKTOP_ORGANIZER_DESKTOP_DIR",
+            desktopDirectory.c_str()) ||
+        !SetEnvironmentVariableW(
+            L"DESKTOP_ORGANIZER_PUBLIC_DESKTOP_DIR",
+            publicDesktopDirectory.c_str())) {
+        return fail(L"Original-path collection environment setup failed");
+    }
+
+    const auto userIdentityBefore = ReadStableFileIdentity(sourceFile);
+    const auto publicIdentityBefore = ReadStableFileIdentity(publicFolder);
+    const auto userBytesBefore = ReadFileBytes(sourceFile.wstring());
+    const auto publicBytesBefore = ReadFileBytes(
+        (publicFolder / L"公共内容.md").wstring());
+    const auto countTopLevel = [](const std::filesystem::path& directory) {
+        size_t count = 0;
+        std::error_code error;
+        for (std::filesystem::directory_iterator it(directory, error), end;
+             !error && it != end; it.increment(error)) {
+            ++count;
+        }
+        return error ? static_cast<size_t>(-1) : count;
+    };
+    const size_t userCountBefore = countTopLevel(desktopDirectory);
+    const size_t publicCountBefore = countTopLevel(publicDesktopDirectory);
+    ConfigStore metadataConfigStore;
+    AppConfig metadataConfig;
+    CategoryConfig metadataCategory;
+    metadataCategory.id = L"original-path-category";
+    metadataCategory.name = L"原路径收纳";
+    metadataConfig.categories.push_back(metadataCategory);
+    if (!metadataConfigStore.SaveAppConfig(metadataConfig)) {
+        return fail(L"Original-path collection config setup failed");
+    }
+    DesktopCollectionItemRequest userRequest;
+    userRequest.categoryId = metadataCategory.id;
+    userRequest.path = sourceFile.wstring();
+    userRequest.insertionIndex = 0;
+    const DesktopCollectionItemResult userCollected =
+        CommitDesktopCollectionItemTransaction(userRequest);
+    DesktopCollectionItemRequest publicRequest;
+    publicRequest.categoryId = metadataCategory.id;
+    publicRequest.path = publicFolder.wstring();
+    publicRequest.insertionIndex = 1;
+    const DesktopCollectionItemResult publicCollected =
+        CommitDesktopCollectionItemTransaction(publicRequest);
+    const AppConfig restartedConfig = metadataConfigStore.LoadAppConfig();
+    const auto restartedCategory = std::find_if(
+        restartedConfig.categories.begin(),
+        restartedConfig.categories.end(),
+        [&](const CategoryConfig& value) {
+            return value.id == metadataCategory.id;
+        });
+    const bool noManagedPayload =
+        !std::filesystem::exists(dataDirectory / L"ManagedShortcuts");
+    if (!userCollected.succeeded || !publicCollected.succeeded ||
+        userCollected.destinationPath != sourceFile.wstring() ||
+        publicCollected.destinationPath != publicFolder.wstring() ||
+        restartedCategory == restartedConfig.categories.end() ||
+        restartedCategory->itemIds.size() != 2 ||
+        restartedCategory->itemIds[0] != userCollected.itemId ||
+        restartedCategory->itemIds[1] != publicCollected.itemId ||
+        !SameStableFileIdentity(
+            userIdentityBefore, ReadStableFileIdentity(sourceFile)) ||
+        !SameStableFileIdentity(
+            publicIdentityBefore, ReadStableFileIdentity(publicFolder)) ||
+        ReadFileBytes(sourceFile.wstring()) != userBytesBefore ||
+        ReadFileBytes((publicFolder / L"公共内容.md").wstring()) !=
+            publicBytesBefore ||
+        countTopLevel(desktopDirectory) != userCountBefore ||
+        countTopLevel(publicDesktopDirectory) != publicCountBefore ||
+        !noManagedPayload) {
+        return fail(
+            L"Daily collection changed an original path, File ID, content, count, order, or ManagedShortcuts state");
+    }
+
+    DesktopPlacementRequest userMoveOut;
+    userMoveOut.path = sourceFile.wstring();
+    userMoveOut.commitMoveOut = true;
+    userMoveOut.itemId = userCollected.itemId;
+    userMoveOut.sourcePath = sourceFile.wstring();
+    std::wstring unchangedDesktopPath;
+    std::wstring metadataError;
+    if (!CommitDesktopMoveOutTransaction(
+            userMoveOut, unchangedDesktopPath, metadataError) ||
+        unchangedDesktopPath != sourceFile.wstring() ||
+        !SameStableFileIdentity(
+            userIdentityBefore, ReadStableFileIdentity(sourceFile)) ||
+        std::filesystem::exists(dataDirectory / L"ManagedShortcuts")) {
+        return fail(
+            L"Daily move-out changed the original item or created ManagedShortcuts: " +
+            metadataError);
+    }
+
     if (!store.IsSupportedDesktopItem(sourceFile.wstring()) ||
         !store.IsSupportedDesktopItem(sourceFolder.wstring()) ||
         store.IsSupportedShortcut(sourceFile.wstring()) ||
-        !store.RequiresManagedStorage(sourceFile.wstring()) ||
-        !store.RequiresManagedStorage(sourceFolder.wstring()) ||
-        !store.RequiresManagedStorage(sourceShortcut.wstring()) ||
-        !store.RequiresManagedStorage(sourceUrl.wstring()) ||
-        !store.RequiresManagedStorage(publicShortcut.wstring()) ||
-        !store.RequiresManagedStorage(publicFolder.wstring()) ||
-        store.RequiresManagedStorage(externalFile.wstring())) {
+        store.RequiresManagedStorage(sourceFile.wstring()) ||
+        store.RequiresManagedStorage(sourceFolder.wstring()) ||
+        store.RequiresManagedStorage(sourceShortcut.wstring()) ||
+        store.RequiresManagedStorage(sourceUrl.wstring()) ||
+        store.RequiresManagedStorage(publicShortcut.wstring()) ||
+        store.RequiresManagedStorage(publicFolder.wstring()) ||
+        store.RequiresManagedStorage(externalFile.wstring()) ||
+        store.IsSupportedDesktopItem(externalFile.wstring())) {
         return fail(L"Manual desktop item type acceptance failed");
     }
 
@@ -1364,7 +2152,8 @@ int RunSmokeManagedItems() {
     std::vector<std::pair<std::wstring, std::wstring>> batchDestinations;
     const bool batchMoved = store.MoveToOriginalDesktopBatch(
         {
-            {L"smoke-public-batch-a", managedPublicBatchA, publicBatchA.wstring(), true},
+            {L"smoke-public-batch-a", managedPublicBatchA,
+             (desktopDirectory / publicBatchA.filename()).wstring(), true},
             {L"smoke-public-batch-b", managedPublicBatchB, publicBatchB.wstring(), true},
         },
         [&](const std::vector<std::pair<std::wstring, std::wstring>>& moved) {
@@ -1378,7 +2167,8 @@ int RunSmokeManagedItems() {
     if (!batchMoved || batchPersistCalls != 1 || batchDestinations.size() != 2 ||
         std::filesystem::exists(managedPublicBatchA) ||
         std::filesystem::exists(managedPublicBatchB) ||
-        !std::filesystem::exists(publicBatchA) ||
+        !std::filesystem::exists(desktopDirectory / publicBatchA.filename()) ||
+        std::filesystem::exists(publicBatchA) ||
         !std::filesystem::exists(publicBatchB) ||
         std::filesystem::exists(dataDirectory / L"ManagedShortcuts" / L"move-journal.bin")) {
         return fail(L"Public Desktop batch transaction failed: " + moveError);
@@ -1622,7 +2412,6 @@ int RunSmokeCategoryStorage() {
     }
 
     ConfigStore configStore;
-    ManagedShortcutStore managedStore(dataDirectory.wstring(), desktopDirectory.wstring());
     AppConfig config;
     config.uncategorizedName = L"AI";
     config.uncategorizedStorageFolder = L"uncategorized";
@@ -1645,39 +2434,13 @@ int RunSmokeCategoryStorage() {
         return fail(L"Legacy category storage config save failed");
     }
 
-    CategoryStorageManager storageManager(configStore, managedStore);
+    CategoryStorageManager storageManager(configStore);
     std::wstring errorMessage;
     if (!storageManager.SynchronizeAll(errorMessage)) {
-        return fail(L"Legacy category storage migration failed: " + errorMessage);
+        return fail(L"Category metadata validation failed: " + errorMessage);
     }
-    AppConfig migrated = configStore.LoadAppConfig();
-    const auto migratedCategory = std::find_if(
-        migrated.categories.begin(),
-        migrated.categories.end(),
-        [&](const CategoryConfig& value) { return value.id == categoryId; });
-    const auto migratedUncategorizedItem = std::find_if(
-        migrated.items.begin(),
-        migrated.items.end(),
-        [&](const ItemConfig& value) { return value.id == uncategorizedItem.id; });
-    const auto migratedCategoryItem = std::find_if(
-        migrated.items.begin(),
-        migrated.items.end(),
-        [&](const ItemConfig& value) { return value.id == categoryItem.id; });
-    if (migrated.uncategorizedStorageFolder != L"AI" ||
-        migratedCategory == migrated.categories.end() || migratedCategory->storageFolder != L"AI编程" ||
-        migratedUncategorizedItem == migrated.items.end() ||
-        migratedUncategorizedItem->path != (managedDirectory / L"AI" / L"豆包.lnk").wstring() ||
-        migratedCategoryItem == migrated.items.end() ||
-        migratedCategoryItem->path != (managedDirectory / L"AI编程" / L"代码.txt").wstring() ||
-        !std::filesystem::exists(managedDirectory / L"AI" / L"豆包.lnk") ||
-        !std::filesystem::exists(managedDirectory / L"AI编程" / L"代码.txt") ||
-        std::filesystem::exists(managedDirectory / L"uncategorized") ||
-        std::filesystem::exists(managedDirectory / categoryId)) {
-        return fail(L"Legacy category storage migration result mismatch");
-    }
-
-    if (!storageManager.Rename(categoryId, L"编程工具", errorMessage)) {
-        return fail(L"Category storage rename failed: " + errorMessage);
+    if (!storageManager.Rename(categoryId, L"CON / 编程工具", errorMessage)) {
+        return fail(L"Category metadata rename failed: " + errorMessage);
     }
     const AppConfig renamed = configStore.LoadAppConfig();
     const auto renamedCategory = std::find_if(
@@ -1688,50 +2451,38 @@ int RunSmokeCategoryStorage() {
         renamed.items.begin(),
         renamed.items.end(),
         [&](const ItemConfig& value) { return value.id == categoryItem.id; });
-    if (renamedCategory == renamed.categories.end() || renamedCategory->name != L"编程工具" ||
-        renamedCategory->storageFolder != L"编程工具" || renamedItem == renamed.items.end() ||
-        renamedItem->path != (managedDirectory / L"编程工具" / L"代码.txt").wstring() ||
-        !std::filesystem::exists(managedDirectory / L"编程工具" / L"代码.txt") ||
-        std::filesystem::exists(managedDirectory / L"AI编程")) {
-        return fail(L"Category storage rename result mismatch");
+    if (renamedCategory == renamed.categories.end() ||
+        renamedCategory->name != L"CON / 编程工具" ||
+        renamedCategory->storageFolder != categoryId ||
+        renamedItem == renamed.items.end() ||
+        renamedItem->path != categoryItem.path ||
+        !std::filesystem::exists(categoryItem.path) ||
+        !std::filesystem::exists(uncategorizedItem.path)) {
+        return fail(L"Category rename changed legacy storage paths or item identity");
     }
     if (storageManager.CanUseName(categoryId, L"AI", errorMessage) ||
-        storageManager.CanUseName(categoryId, L"CON", errorMessage)) {
-        return fail(L"Category storage name validation failed");
+        !storageManager.CanUseName(categoryId, L"CON", errorMessage)) {
+        return fail(L"Category display-name validation still follows folder rules");
     }
-    std::filesystem::create_directories(managedDirectory / L"已存在目录", fileError);
-    if (fileError || storageManager.CanUseName(L"new-category", L"已存在目录", errorMessage)) {
-        return fail(L"Existing unmanaged category directory validation failed");
-    }
-    std::filesystem::remove(managedDirectory / L"编程工具" / L"代码.txt", fileError);
-    if (fileError || !storageManager.RemoveEmpty(categoryId, errorMessage) ||
-        std::filesystem::exists(managedDirectory / L"编程工具")) {
-        return fail(L"Empty category storage cleanup failed: " + errorMessage);
+    if (!storageManager.RemoveEmpty(categoryId, errorMessage) ||
+        !std::filesystem::exists(categoryItem.path)) {
+        return fail(L"Category removal validation touched a legacy source: " + errorMessage);
     }
 
-    const std::array<std::filesystem::path, 4> preservedConfigPaths{
-        configDirectory / L"config.ini",
-        configDirectory / L"config.backup.ini",
-        configDirectory / L"config.backup.ini.1",
-        configDirectory / L"config.backup.ini.2"};
-    std::array<std::optional<std::string>, 4> preservedConfigBytes{};
-    for (size_t index = 0; index < preservedConfigPaths.size(); ++index) {
-        preservedConfigBytes[index] = ReadFileBytes(preservedConfigPaths[index]);
-        if (!preservedConfigBytes[index].has_value()) {
-            return fail(L"Category storage no-op snapshot failed");
-        }
+    const std::filesystem::path preservedConfigPath =
+        configDirectory / L"config.ini";
+    const std::optional<std::string> preservedConfigBytes =
+        ReadFileBytes(preservedConfigPath);
+    if (!preservedConfigBytes.has_value()) {
+        return fail(L"Category metadata no-op snapshot failed");
     }
-    if (!storageManager.SynchronizeAll(errorMessage) ||
-        !std::filesystem::exists(managedDirectory / L"编程工具")) {
-        return fail(L"Category storage no-op synchronization failed: " + errorMessage);
+    if (!storageManager.SynchronizeAll(errorMessage)) {
+        return fail(L"Category metadata no-op validation failed: " + errorMessage);
     }
-    for (size_t index = 0; index < preservedConfigPaths.size(); ++index) {
-        const std::optional<std::string> after =
-            ReadFileBytes(preservedConfigPaths[index]);
-        if (!after.has_value() ||
-            *after != *preservedConfigBytes[index]) {
-            return fail(L"Category storage no-op synchronization rewrote config history");
-        }
+    const std::optional<std::string> after =
+        ReadFileBytes(preservedConfigPath);
+    if (!after.has_value() || *after != *preservedConfigBytes) {
+        return fail(L"Category metadata validation rewrote config history");
     }
 
     std::filesystem::remove_all(testRoot, fileError);
@@ -1739,7 +2490,7 @@ int RunSmokeCategoryStorage() {
         std::wcerr << L"Category storage smoke cleanup failed\n";
         return 1;
     }
-    std::wcout << L"Category storage migration and rename passed\n";
+    std::wcout << L"Category metadata-only rename and validation passed\n";
     return 0;
 }
 
@@ -1769,8 +2520,7 @@ int RunSmokeWidgetAlignment(HINSTANCE instance) {
     const std::filesystem::path desktopDirectory = testRoot / L"Desktop";
     std::error_code fileError;
     std::filesystem::create_directories(configDirectory, fileError);
-    std::filesystem::create_directories(dataDirectory / L"ManagedShortcuts" / L"对齐测试一", fileError);
-    std::filesystem::create_directories(dataDirectory / L"ManagedShortcuts" / L"对齐测试二", fileError);
+    std::filesystem::create_directories(dataDirectory, fileError);
     std::filesystem::create_directories(desktopDirectory, fileError);
     if (fileError ||
         !SetEnvironmentVariableW(L"DESKTOP_ORGANIZER_CONFIG_DIR", configDirectory.c_str()) ||
@@ -2188,14 +2938,31 @@ int RunSmokeWidgetDesktopLayer(HINSTANCE instance) {
         return fail(L"Showing the widget raised it above a normal application", 69);
     }
 
+    const auto settleFrame = [](DWORD milliseconds) {
+        const ULONGLONG end = GetTickCount64() + milliseconds;
+        do {
+            MSG message{};
+            while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+                TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
+            MsgWaitForMultipleObjects(0, nullptr, FALSE, 16, QS_ALLINPUT);
+        } while (GetTickCount64() < end);
+        DwmFlush();
+    };
     ShowWindow(coverWindow, SW_HIDE);
     widget->SetVisible(false);
+    settleFrame(300);
     DwmFlush();
     std::vector<std::uint32_t> desktopPixels;
     if (!CaptureScreenPixels(captureRect, desktopPixels)) {
         return fail(L"Desktop pixels could not be captured with the widget hidden", 70);
     }
     widget->SetVisible(true);
+    // The synchronous show paint can be submitted while DWM still has the
+    // old covered/hidden state. Request the sampled frame after that state
+    // transition, rather than only waiting after the early paint.
+    settleFrame(300);
     RedrawWindow(
         widgetWindow,
         nullptr,
@@ -2212,6 +2979,42 @@ int RunSmokeWidgetDesktopLayer(HINSTANCE instance) {
                << visiblePixelDifferences << L"/" << widgetPixels.size()
                << L"\n";
     if (visiblePixelDifferences < widgetPixels.size() / 100) {
+        const auto outputRoot = std::filesystem::path(baseValue);
+        std::wofstream diagnostic(outputRoot / L"widget-pixels.txt");
+        diagnostic << L"widget=" << widgetWindow << L" pid=" << GetCurrentProcessId()
+                   << L" rect=" << widgetRect.left << L"," << widgetRect.top
+                   << L"," << widgetRect.right << L"," << widgetRect.bottom << L"\n";
+        const POINT probe{captureRect.left + 4, captureRect.top + 4};
+        HWND hit = WindowFromPoint(probe);
+        wchar_t hitClass[128]{};
+        DWORD hitPid = 0;
+        GetClassNameW(hit, hitClass, ARRAYSIZE(hitClass));
+        GetWindowThreadProcessId(hit, &hitPid);
+        diagnostic << L"hit=" << hit << L" class=" << hitClass << L" pid=" << hitPid
+                   << L" visible=" << IsWindowVisible(widgetWindow) << L"\n";
+        DWORD cloaked = 0;
+        const HRESULT cloakResult = DwmGetWindowAttribute(
+            widgetWindow, DWMWA_CLOAKED, &cloaked, sizeof(cloaked));
+        diagnostic << L"cloakResult=" << cloakResult << L" cloaked=" << cloaked << L"\n";
+        WidgetWindowSmokeAccess::WriteRenderState(*widget, diagnostic);
+        const LONG width = captureRect.right - captureRect.left;
+        const LONG height = captureRect.bottom - captureRect.top;
+        BITMAPFILEHEADER fileHeader{};
+        BITMAPINFOHEADER info{};
+        fileHeader.bfType = 0x4D42;
+        fileHeader.bfOffBits = sizeof(fileHeader) + sizeof(info);
+        fileHeader.bfSize = fileHeader.bfOffBits + static_cast<DWORD>(widgetPixels.size() * 4);
+        info.biSize = sizeof(info);
+        info.biWidth = width;
+        info.biHeight = -height;
+        info.biPlanes = 1;
+        info.biBitCount = 32;
+        info.biCompression = BI_RGB;
+        std::ofstream bitmap(outputRoot / L"widget-pixels.bmp", std::ios::binary);
+        bitmap.write(reinterpret_cast<const char*>(&fileHeader), sizeof(fileHeader));
+        bitmap.write(reinterpret_cast<const char*>(&info), sizeof(info));
+        bitmap.write(reinterpret_cast<const char*>(widgetPixels.data()),
+            static_cast<std::streamsize>(widgetPixels.size() * 4));
         return fail(L"Desktop-hosted widget did not produce visible screen pixels", 71);
     }
     const HWND visibleWindow = WindowFromPoint(overlapPoint);
@@ -2244,6 +3047,44 @@ int RunSmokeWidgetDesktopLayer(HINSTANCE instance) {
                    << L" desktopHost=" << desktopHost << L"\n";
         return fail(L"Widget was not visible above the desktop root", 72);
     }
+
+    // Compare a background-only strip below the title glyphs, above the
+    // collapsed bottom border. Read actual screen pixels, not PrintWindow.
+    if (!WidgetWindowSmokeAccess::PrepareWallpaper(*widget)) {
+        return fail(L"Collapse pixel probe requires a loaded full-height wallpaper", 78);
+    }
+    const LONG headerHeight = MulDiv(32, GetDpiForWindow(widgetWindow), 96);
+    const RECT titleStrip{
+        widgetRect.left + 60, widgetRect.top + headerHeight - 6,
+        widgetRect.right - 60, widgetRect.top + headerHeight - 4};
+    const auto captureTitle = [&](std::vector<std::uint32_t>& pixels) {
+        RedrawWindow(widgetWindow, nullptr, nullptr,
+            RDW_INVALIDATE | RDW_UPDATENOW | RDW_ERASE);
+        settleFrame(100);
+        for (LONG x = titleStrip.left; x < titleStrip.right; ++x) {
+            if (WindowFromPoint(POINT{x, titleStrip.top}) != widgetWindow) {
+                return false;
+            }
+        }
+        return CaptureScreenPixels(titleStrip, pixels);
+    };
+    std::vector<std::uint32_t> expandedTitle;
+    std::vector<std::uint32_t> collapsedTitle;
+    std::vector<std::uint32_t> restoredTitle;
+    if (!captureTitle(expandedTitle)) {
+        return fail(L"Expanded title pixel probe is obscured or unavailable", 78);
+    }
+    WidgetWindowSmokeAccess::ToggleCollapsed(*widget);
+    if (!captureTitle(collapsedTitle)) {
+        return fail(L"Collapsed title pixel probe is obscured or unavailable", 78);
+    }
+    WidgetWindowSmokeAccess::ToggleCollapsed(*widget);
+    if (!captureTitle(restoredTitle) || expandedTitle != collapsedTitle ||
+        expandedTitle != restoredTitle) {
+        return fail(L"Collapse changed the real title background pixels", 78);
+    }
+    std::wcout << L"Collapse title background pixel equality passed: "
+               << expandedTitle.size() << L" pixels across three states\n";
 
     siblingWidget = std::make_unique<WidgetWindow>(
         instance, nullptr, siblingCategory.id, 0);
@@ -2334,6 +3175,2284 @@ int RunSmokeWidgetDesktopLayer(HINSTANCE instance) {
     return 0;
 }
 
+int RunSmokeDesktopIconFidelity(HINSTANCE instance) {
+    AttachParentConsole();
+    SetThreadDpiAwarenessContext(
+        DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    const DWORD outputRequired = GetEnvironmentVariableW(
+        L"DESKTOP_ORGANIZER_SMOKE_ITEMS_DIR", nullptr, 0);
+    if (outputRequired == 0) {
+        std::wcerr << L"Desktop icon fidelity output directory missing\n";
+        return 136;
+    }
+    std::wstring outputRoot(outputRequired, L'\0');
+    const DWORD outputCopied = GetEnvironmentVariableW(
+        L"DESKTOP_ORGANIZER_SMOKE_ITEMS_DIR",
+        outputRoot.data(),
+        outputRequired);
+    if (outputCopied == 0 || outputCopied >= outputRequired) {
+        std::wcerr << L"Desktop icon fidelity output directory invalid\n";
+        return 136;
+    }
+    outputRoot.resize(outputCopied);
+    DesktopLayout layout;
+    DesktopViewSnapshot before;
+    std::vector<DesktopPosition> positionsBefore;
+    std::wstring errorMessage;
+    if (!layout.CaptureViewSnapshot(before, errorMessage)) {
+        std::ofstream diagnostic(
+            std::filesystem::path(outputRoot) /
+                L"desktop-icon-fidelity-error.txt",
+            std::ios::trunc);
+        diagnostic << "STAGE=CaptureViewSnapshot\n"
+                   << "ERROR=" << Utf8Text(errorMessage) << "\n";
+        std::wcerr << errorMessage << L"\n";
+        return 130;
+    }
+    if (!layout.CaptureAllPositions(positionsBefore, errorMessage)) {
+        std::ofstream diagnostic(
+            std::filesystem::path(outputRoot) /
+                L"desktop-icon-fidelity-error.txt",
+            std::ios::trunc);
+        diagnostic << "STAGE=CaptureAllPositions\n"
+                   << "ERROR=" << Utf8Text(errorMessage) << "\n";
+        std::wcerr << errorMessage << L"\n";
+        return 130;
+    }
+    const std::filesystem::path nativeCapture =
+        std::filesystem::path(outputRoot) / L"desktop-native.bmp";
+    const std::filesystem::path latticeCapture =
+        std::filesystem::path(outputRoot) / L"desktop-lattice.bmp";
+    const bool nativeCaptureAvailable =
+        SaveWindowClientBmp(before.listViewWindow, nativeCapture);
+    DesktopSurfaceWindow surface(instance);
+    if (!surface.Create({}, errorMessage)) {
+        std::wcerr << errorMessage << L"\n";
+        return 131;
+    }
+    {
+        std::ofstream metrics(
+            std::filesystem::path(outputRoot) /
+                L"desktop-icon-metrics.txt",
+            std::ios::trunc);
+        metrics
+            << "VIEW_ICON_LOGICAL=" << before.viewIconSize << "\n"
+            << "LISTVIEW_DPI="
+            << GetDpiForWindow(before.listViewWindow) << "\n"
+            << "SURFACE_ICON_PHYSICAL="
+            << DesktopSurfaceWindowSmokeAccess::IconSize(surface) << "\n"
+            << "CELL_WIDTH="
+            << DesktopSurfaceWindowSmokeAccess::CellWidth(surface) << "\n"
+            << "CELL_HEIGHT="
+            << DesktopSurfaceWindowSmokeAccess::CellHeight(surface) << "\n";
+        for (size_t index = 0;
+             index < std::min<size_t>(before.items.size(), 24);
+             ++index) {
+            metrics
+                << "ITEM_" << index << "="
+                << before.items[index].screenPoint.x << ","
+                << before.items[index].screenPoint.y << ","
+                << before.items[index].systemImageIndex << ","
+                << before.items[index].overlayIndex << ","
+                << Utf8Text(before.items[index].displayName) << "\n";
+        }
+    }
+    if (!DesktopSurfaceWindowSmokeAccess::UsesPhysicalPixelGeometry(
+            surface) ||
+        !DesktopSurfaceWindowSmokeAccess::HasShellImageIdentity(
+            surface)) {
+        const size_t missing =
+            DesktopSurfaceWindowSmokeAccess::MissingShellImageIdentityCount(
+                surface);
+        surface.Close();
+        std::wcerr
+            << L"Desktop icon fidelity geometry/identity failed: missing="
+            << missing << L"\n";
+        return 132;
+    }
+    surface.Show();
+    const ULONGLONG iconDeadline = GetTickCount64() + 5000;
+    while (!DesktopSurfaceWindowSmokeAccess::AllVisibleIconsReady(
+               surface) &&
+           GetTickCount64() < iconDeadline) {
+        MSG message{};
+        while (PeekMessageW(
+                &message, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+        MsgWaitForMultipleObjects(
+            0, nullptr, FALSE, 16, QS_ALLINPUT);
+    }
+    if (!DesktopSurfaceWindowSmokeAccess::AllVisibleIconsReady(
+            surface)) {
+        surface.Close();
+        std::wcerr
+            << L"Desktop icon fidelity left a Shell item on a placeholder\n";
+        return 133;
+    }
+    RedrawWindow(
+        surface.Window(),
+        nullptr,
+        nullptr,
+        RDW_INVALIDATE | RDW_UPDATENOW | RDW_ERASE);
+    if (!SaveWindowClientBmp(
+            surface.Window(), latticeCapture)) {
+        surface.Close();
+        std::wcerr << L"Could not capture Lattice desktop surface\n";
+        return 138;
+    }
+    surface.Close();
+    DesktopViewSnapshot after;
+    std::vector<DesktopPosition> positionsAfter;
+    if (!layout.CaptureViewSnapshot(after, errorMessage) ||
+        !layout.CaptureAllPositions(positionsAfter, errorMessage) ||
+        before.viewFlags != after.viewFlags ||
+        positionsBefore.size() != positionsAfter.size()) {
+        std::wcerr
+            << L"Desktop icon fidelity changed Explorer snapshot\n";
+        return 134;
+    }
+    const bool positionsStable = std::all_of(
+        positionsBefore.begin(),
+        positionsBefore.end(),
+        [&](const DesktopPosition& expected) {
+            return std::any_of(
+                positionsAfter.begin(),
+                positionsAfter.end(),
+                [&](const DesktopPosition& actual) {
+                    return CompareStringOrdinal(
+                               expected.path.c_str(), -1,
+                               actual.path.c_str(), -1, TRUE) ==
+                            CSTR_EQUAL &&
+                        expected.point.x == actual.point.x &&
+                        expected.point.y == actual.point.y;
+                });
+        });
+    if (!positionsStable) {
+        std::wcerr
+            << L"Desktop icon fidelity changed Explorer coordinates\n";
+        return 135;
+    }
+    std::wcout
+        << L"Desktop icon fidelity passed: items="
+        << before.items.size()
+        << L", view-icon-px=" << before.viewIconSize
+        << L", desktop-dpi="
+        << GetDpiForWindow(before.listViewWindow)
+        << L", native-capture="
+        << (nativeCaptureAvailable ? 1 : 0)
+        << L"\n";
+    return 0;
+}
+
+int RunSmokeDesktopDisplayTakeover(HINSTANCE instance) {
+    AttachParentConsole();
+    SetThreadDpiAwarenessContext(
+        DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    DesktopLayout layout;
+    DesktopViewSnapshot before;
+    std::wstring errorMessage;
+    if (!layout.CaptureViewSnapshot(before, errorMessage)) {
+        const DWORD required = GetEnvironmentVariableW(
+            L"DESKTOP_ORGANIZER_SMOKE_ITEMS_DIR", nullptr, 0);
+        if (required != 0) {
+            std::wstring root(required, L'\0');
+            const DWORD copied = GetEnvironmentVariableW(
+                L"DESKTOP_ORGANIZER_SMOKE_ITEMS_DIR",
+                root.data(), required);
+            if (copied != 0 && copied < required) {
+                root.resize(copied);
+                std::ofstream diagnostic(
+                    std::filesystem::path(root) /
+                        L"desktop-takeover-capture-error.txt",
+                    std::ios::trunc);
+                diagnostic << Utf8Text(errorMessage) << "\n";
+            }
+        }
+        std::wcerr << errorMessage << L"\n";
+        return 101;
+    }
+    std::vector<DesktopPosition> positionsBefore;
+    if (!layout.CaptureAllPositions(
+            positionsBefore, errorMessage)) {
+        std::wcerr << errorMessage << L"\n";
+        return 102;
+    }
+    std::vector<std::wstring> assigned;
+    POINT assignedProbe{};
+    if (!before.items.empty()) {
+        const DesktopViewItem& item = before.items.front();
+        assigned.push_back(item.path);
+        assignedProbe = POINT{
+            item.screenPoint.x + 12,
+            item.screenPoint.y + 12};
+    }
+    DesktopSurfaceWindow surface(instance);
+    if (!surface.Create(assigned, errorMessage)) {
+        std::wcerr << errorMessage << L"\n";
+        return 103;
+    }
+    const HWND surfaceWindow = surface.Window();
+    const DesktopViewSnapshot created = surface.Snapshot();
+    const LONG_PTR style =
+        GetWindowLongPtrW(surfaceWindow, GWL_STYLE);
+    const LONG_PTR exStyle =
+        GetWindowLongPtrW(surfaceWindow, GWL_EXSTYLE);
+    wchar_t hostClass[64]{};
+    if (!surface.IsDesktopHosted() ||
+        surfaceWindow == nullptr ||
+        created.desktopHost == nullptr ||
+        GetClassNameW(
+            created.desktopHost,
+            hostClass,
+            ARRAYSIZE(hostClass)) == 0 ||
+        (wcscmp(hostClass, L"Progman") != 0 &&
+         wcscmp(hostClass, L"WorkerW") != 0) ||
+        (style & WS_POPUP) == 0 ||
+        (style & WS_CHILD) != 0 ||
+        GetAncestor(surfaceWindow, GA_PARENT) !=
+            created.desktopHost ||
+        (exStyle & WS_EX_LAYERED) != 0 ||
+        (exStyle & WS_EX_TOPMOST) != 0 ||
+        surface.VisibleItemCount() + assigned.size() !=
+            before.items.size()) {
+        surface.Close();
+        std::wcerr
+            << L"Desktop takeover host or unique partition invariant failed\n";
+        return 104;
+    }
+    if (!DesktopSurfaceWindowSmokeAccess::UsesPhysicalPixelGeometry(
+            surface) ||
+        !DesktopSurfaceWindowSmokeAccess::HasShellImageIdentity(
+            surface)) {
+        surface.Close();
+        std::wcerr
+            << L"Desktop takeover DPI geometry or Shell image identity invariant failed\n";
+        return 114;
+    }
+    surface.Show();
+    const ULONGLONG deadline = GetTickCount64() + 1200;
+    while (GetTickCount64() < deadline) {
+        MSG message{};
+        while (PeekMessageW(
+                &message, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+        MsgWaitForMultipleObjects(
+            0, nullptr, FALSE, 16, QS_ALLINPUT);
+    }
+    const ULONGLONG iconDeadline = GetTickCount64() + 3000;
+    while (!DesktopSurfaceWindowSmokeAccess::AllVisibleIconsReady(
+               surface) &&
+           GetTickCount64() < iconDeadline) {
+        MSG message{};
+        while (PeekMessageW(
+                &message, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+        MsgWaitForMultipleObjects(
+            0, nullptr, FALSE, 16, QS_ALLINPUT);
+    }
+    if (!DesktopSurfaceWindowSmokeAccess::AllVisibleIconsReady(
+            surface)) {
+        surface.Close();
+        std::wcerr
+            << L"Desktop takeover left a visible Shell item on a placeholder icon\n";
+        return 115;
+    }
+    const std::vector<ShellItemReference> shellItems =
+        DesktopSurfaceWindowSmokeAccess::VisibleShellItems(
+            surface, 2);
+    if (shellItems.size() != 2 ||
+        std::any_of(
+            shellItems.begin(), shellItems.end(),
+            [](const ShellItemReference& item) {
+                return item.path.empty() ||
+                    item.desktopChildPidl.empty();
+            })) {
+        surface.Close();
+        std::wcerr
+            << L"Desktop takeover snapshot did not retain two Shell child identities\n";
+        return 116;
+    }
+    Microsoft::WRL::ComPtr<IDataObject> shellSelection;
+    const std::vector<std::wstring> shellSelectionPaths{
+        shellItems[0].path, shellItems[1].path};
+    const std::vector<std::wstring> extractedSelection =
+        SUCCEEDED(CreateDesktopShellSelectionObject(
+            surfaceWindow,
+            shellItems,
+            IID_PPV_ARGS(shellSelection.GetAddressOf()))) &&
+            shellSelection != nullptr
+        ? ExtractShellDropPaths(shellSelection.Get())
+        : std::vector<std::wstring>{};
+    const bool selectionIdentityMatches =
+        extractedSelection.size() ==
+            shellSelectionPaths.size() &&
+        std::equal(
+            extractedSelection.begin(),
+            extractedSelection.end(),
+            shellSelectionPaths.begin(),
+            [](const std::wstring& left,
+               const std::wstring& right) {
+                return CompareStringOrdinal(
+                           left.c_str(), -1,
+                           right.c_str(), -1,
+                           TRUE) == CSTR_EQUAL;
+            });
+    if (!selectionIdentityMatches) {
+        surface.Close();
+        std::wcerr
+            << L"Desktop takeover multi-selection lost native Shell identity or order\n";
+        return 117;
+    }
+
+    const std::optional<POINT> blankPoint =
+        DesktopSurfaceWindowSmokeAccess::FindBlankPoint(
+            surface);
+    if (!blankPoint.has_value()) {
+        surface.Close();
+        std::wcerr
+            << L"Desktop takeover could not find a blank marquee probe point\n";
+        return 118;
+    }
+    SendMessageW(
+        surfaceWindow,
+        WM_LBUTTONDOWN,
+        MK_LBUTTON,
+        MAKELPARAM(blankPoint->x, blankPoint->y));
+    if (GetCapture() != surfaceWindow ||
+        !DesktopSurfaceWindowSmokeAccess::IsMarqueePending(
+            surface)) {
+        surface.Close();
+        std::wcerr
+            << L"Desktop takeover did not capture a blank marquee press\n";
+        return 119;
+    }
+    SendMessageW(
+        surfaceWindow,
+        WM_MOUSEMOVE,
+        0,
+        MAKELPARAM(blankPoint->x, blankPoint->y));
+    if (GetCapture() == surfaceWindow ||
+        !DesktopSurfaceWindowSmokeAccess::HasNoPointerGesture(
+            surface)) {
+        surface.Close();
+        std::wcerr
+            << L"Desktop takeover did not self-heal a missing left-button state\n";
+        return 120;
+    }
+    SendMessageW(
+        surfaceWindow,
+        WM_LBUTTONDOWN,
+        MK_LBUTTON,
+        MAKELPARAM(blankPoint->x, blankPoint->y));
+    if (GetCapture() != surfaceWindow) {
+        surface.Close();
+        std::wcerr
+            << L"Desktop takeover could not reacquire marquee capture\n";
+        return 121;
+    }
+    SendMessageW(surfaceWindow, WM_CANCELMODE, 0, 0);
+    if (GetCapture() == surfaceWindow ||
+        !DesktopSurfaceWindowSmokeAccess::HasNoPointerGesture(
+            surface)) {
+        surface.Close();
+        std::wcerr
+            << L"Desktop takeover cancel mode left transient capture behind\n";
+        return 122;
+    }
+    // Exercise Windows input routing, not just direct WM_* dispatch. The
+    // start point must be inside the old full cell but native Explorer blank.
+    POINT savedCursor{};
+    POINT inputStart{};
+    const std::optional<POINT> nativeGap =
+        DesktopSurfaceWindowSmokeAccess::FindNativeCellGapPoint(
+            surface);
+    if (!DesktopSurfaceWindowSmokeAccess::HasNativeListViewQueryAccess(
+            surface)) {
+        surface.Close();
+        std::wcerr
+            << L"Desktop takeover could not open native ListView query access\n";
+        return 126;
+    }
+    if (!nativeGap.has_value()) {
+        surface.Close();
+        std::wcerr
+            << L"Desktop takeover could not find an LVM_HITTEST cell gap\n";
+        return 127;
+    }
+    inputStart = *nativeGap;
+    ClientToScreen(surfaceWindow, &inputStart);
+    if (WindowFromPoint(inputStart) != surfaceWindow) {
+        surface.Close();
+        std::wcerr
+            << L"Native Explorer cell gap was not routed to the takeover surface\n";
+        return 128;
+    }
+    if (!GetCursorPos(&savedCursor) ||
+        ((GetAsyncKeyState(VK_LBUTTON) | GetAsyncKeyState(VK_RBUTTON) |
+          GetAsyncKeyState(VK_CONTROL) | GetAsyncKeyState(VK_SHIFT) |
+          GetAsyncKeyState(VK_MENU)) & 0x8000) != 0) {
+        surface.Close();
+        std::wcerr
+            << L"Native input precondition found a held mouse button or modifier\n";
+        return 129;
+    }
+    const size_t shellDragCountBefore =
+        DesktopSurfaceWindowSmokeAccess::ShellDragStartCount(
+            surface);
+    DesktopSurfaceWindowSmokeAccess::SuppressShellDragForSmoke(
+        surface, true);
+    const auto pumpInput = [&]() {
+        const ULONGLONG end = GetTickCount64() + 100;
+        do {
+            MSG message{};
+            while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+                TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
+            MsgWaitForMultipleObjects(0, nullptr, FALSE, 10, QS_ALLINPUT);
+        } while (GetTickCount64() < end);
+    };
+    const auto injectMouse = [&](POINT point, DWORD flags) {
+        INPUT input{};
+        input.type = INPUT_MOUSE;
+        input.mi.dx = MulDiv(point.x - GetSystemMetrics(SM_XVIRTUALSCREEN),
+            65535, (std::max)(1, GetSystemMetrics(SM_CXVIRTUALSCREEN) - 1));
+        input.mi.dy = MulDiv(point.y - GetSystemMetrics(SM_YVIRTUALSCREEN),
+            65535, (std::max)(1, GetSystemMetrics(SM_CYVIRTUALSCREEN) - 1));
+        input.mi.dwFlags = MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK |
+            MOUSEEVENTF_MOVE | flags;
+        const bool sent = SendInput(1, &input, sizeof(input)) == 1;
+        pumpInput();
+        return sent;
+    };
+    bool nativeInputPassed = injectMouse(inputStart, 0);
+    nativeInputPassed = nativeInputPassed &&
+        WindowFromPoint(inputStart) == surfaceWindow &&
+        injectMouse(inputStart, MOUSEEVENTF_LEFTDOWN) &&
+        GetCapture() == surfaceWindow;
+    const POINT inputEnd{created.screenRect.left + 8, created.screenRect.top + 8};
+    nativeInputPassed = nativeInputPassed && injectMouse(inputEnd, 0) &&
+        DesktopSurfaceWindowSmokeAccess::IsMarqueeActive(surface) &&
+        DesktopSurfaceWindowSmokeAccess::SelectedPaths(surface).size() >= 2;
+    // Always release our press even if capture or a previous assertion failed.
+    const bool released = injectMouse(inputEnd, MOUSEEVENTF_LEFTUP);
+    nativeInputPassed = nativeInputPassed && released && GetCapture() != surfaceWindow &&
+        DesktopSurfaceWindowSmokeAccess::HasNoPointerGesture(surface) &&
+        DesktopSurfaceWindowSmokeAccess::SelectedPaths(surface).size() >= 2 &&
+        DesktopSurfaceWindowSmokeAccess::ShellDragStartCount(surface) ==
+            shellDragCountBefore;
+    injectMouse(savedCursor, 0);
+    DesktopSurfaceWindowSmokeAccess::SuppressShellDragForSmoke(
+        surface, false);
+    if (!nativeInputPassed) {
+        surface.Close();
+        return 124;
+    }
+
+    const auto writeTakeoverDiagnostics =
+        [&](HWND hitWindow, const wchar_t* phase) {
+            const DWORD required = GetEnvironmentVariableW(
+                L"DESKTOP_ORGANIZER_SMOKE_ITEMS_DIR",
+                nullptr,
+                0);
+            if (required == 0) {
+                return;
+            }
+            std::wstring root(required, L'\0');
+            const DWORD copied = GetEnvironmentVariableW(
+                L"DESKTOP_ORGANIZER_SMOKE_ITEMS_DIR",
+                root.data(),
+                required);
+            if (copied == 0 || copied >= required) {
+                return;
+            }
+            root.resize(copied);
+            std::wofstream diagnostic(
+                std::filesystem::path(root) /
+                    L"desktop-takeover-diagnostics.txt",
+                std::ios::app);
+            const auto dumpWindow =
+                [&](const wchar_t* label, HWND window) {
+                    wchar_t className[128]{};
+                    RECT rect{};
+                    DWORD processId = 0;
+                    if (window != nullptr) {
+                        GetClassNameW(
+                            window,
+                            className,
+                            ARRAYSIZE(className));
+                        GetWindowRect(window, &rect);
+                        GetWindowThreadProcessId(
+                            window, &processId);
+                    }
+                    diagnostic
+                        << label << L" hwnd="
+                        << reinterpret_cast<UINT_PTR>(window)
+                        << L" class=" << className
+                        << L" pid=" << processId
+                        << L" parent="
+                        << reinterpret_cast<UINT_PTR>(
+                            window == nullptr
+                                ? nullptr
+                                : GetParent(window))
+                        << L" owner="
+                        << reinterpret_cast<UINT_PTR>(
+                            window == nullptr
+                                ? nullptr
+                                : GetWindow(window, GW_OWNER))
+                        << L" root="
+                        << reinterpret_cast<UINT_PTR>(
+                            window == nullptr
+                                ? nullptr
+                                : GetAncestor(window, GA_ROOT))
+                        << L" style="
+                        << (window == nullptr
+                                ? 0
+                                : GetWindowLongPtrW(
+                                      window, GWL_STYLE))
+                        << L" exstyle="
+                        << (window == nullptr
+                                ? 0
+                                : GetWindowLongPtrW(
+                                      window, GWL_EXSTYLE))
+                        << L" visible="
+                        << (window != nullptr &&
+                            IsWindowVisible(window) != FALSE)
+                        << L" enabled="
+                        << (window != nullptr &&
+                            IsWindowEnabled(window) != FALSE)
+                        << L" rect="
+                        << rect.left << L"," << rect.top
+                        << L"," << rect.right << L","
+                        << rect.bottom << L"\n";
+                };
+            diagnostic << L"phase=" << phase
+                       << L" probe=" << assignedProbe.x
+                       << L"," << assignedProbe.y << L"\n";
+            dumpWindow(L"surface", surfaceWindow);
+            dumpWindow(L"desktop-host", created.desktopHost);
+            dumpWindow(L"defview", created.shellViewWindow);
+            dumpWindow(L"listview", created.listViewWindow);
+            dumpWindow(L"hit", hitWindow);
+            dumpWindow(
+                L"hit-ga-parent",
+                hitWindow == nullptr
+                    ? nullptr
+                    : GetAncestor(hitWindow, GA_PARENT));
+            dumpWindow(
+                L"hit-ga-root",
+                hitWindow == nullptr
+                    ? nullptr
+                    : GetAncestor(hitWindow, GA_ROOT));
+            dumpWindow(
+                L"hit-ga-rootowner",
+                hitWindow == nullptr
+                    ? nullptr
+                    : GetAncestor(hitWindow, GA_ROOTOWNER));
+            dumpWindow(
+                L"hit-gw-owner",
+                hitWindow == nullptr
+                    ? nullptr
+                    : GetWindow(hitWindow, GW_OWNER));
+            dumpWindow(
+                L"hit-z-prev",
+                hitWindow == nullptr
+                    ? nullptr
+                    : GetWindow(hitWindow, GW_HWNDPREV));
+            dumpWindow(
+                L"hit-z-next",
+                hitWindow == nullptr
+                    ? nullptr
+                    : GetWindow(hitWindow, GW_HWNDNEXT));
+            int zIndex = 0;
+            for (HWND child = GetWindow(
+             created.desktopHost, GW_CHILD);
+                 child != nullptr;
+                 child = GetWindow(child, GW_HWNDNEXT)) {
+                diagnostic << L"zindex=" << zIndex++ << L" ";
+                dumpWindow(L"child", child);
+            }
+            diagnostic.flush();
+        };
+    bool surfaceBeforeDefView = false;
+    bool sawSurface = false;
+    bool sawDefView = false;
+    for (HWND child = GetWindow(created.desktopHost, GW_CHILD);
+         child != nullptr;
+         child = GetWindow(child, GW_HWNDNEXT)) {
+        if (child == surfaceWindow) {
+            sawSurface = true;
+            surfaceBeforeDefView = !sawDefView;
+        } else if (child == created.shellViewWindow) {
+            sawDefView = true;
+        }
+    }
+    if (!sawSurface || !sawDefView || !surfaceBeforeDefView) {
+        writeTakeoverDiagnostics(
+            WindowFromPoint(assignedProbe),
+            L"desktop-host-z-order-failed");
+        surface.Close();
+        std::wcerr
+            << L"Desktop takeover was not ahead of Explorer DefView\n";
+        return 105;
+    }
+    if (!assigned.empty()) {
+        const HWND takeoverHit = WindowFromPoint(assignedProbe);
+        const HWND takeoverRoot = takeoverHit == nullptr
+            ? nullptr
+            : GetAncestor(takeoverHit, GA_ROOT);
+        const bool normalApplicationAlreadyCovers =
+            takeoverHit != nullptr &&
+            takeoverRoot != created.desktopHost;
+        const bool externalDesktopLayerCovers =
+            takeoverHit != nullptr &&
+            takeoverRoot == created.desktopHost &&
+            takeoverHit != surfaceWindow &&
+            GetAncestor(takeoverHit, GA_PARENT) ==
+                created.desktopHost;
+        if (takeoverHit != surfaceWindow &&
+            !normalApplicationAlreadyCovers &&
+            !externalDesktopLayerCovers) {
+            writeTakeoverDiagnostics(
+                takeoverHit, L"explorer-occlusion-failed");
+            surface.Close();
+            std::wcerr
+                << L"Desktop takeover did not occlude the Explorer icon layer\n";
+            return 105;
+        }
+        if (externalDesktopLayerCovers) {
+            writeTakeoverDiagnostics(
+                takeoverHit, L"external-desktop-layer-observed");
+        }
+        const HWND previousForeground = GetForegroundWindow();
+        HWND normalCover = normalApplicationAlreadyCovers
+            ? nullptr
+            : CreateWindowExW(
+            0,
+            L"STATIC",
+            L"Lattice takeover normal-window probe",
+            WS_OVERLAPPEDWINDOW,
+            assignedProbe.x - 8,
+            assignedProbe.y - 8,
+            96,
+            96,
+            nullptr,
+            nullptr,
+            instance,
+            nullptr);
+        if (!normalApplicationAlreadyCovers &&
+            normalCover != nullptr) {
+            ShowWindow(normalCover, SW_SHOWNORMAL);
+            SetWindowPos(
+                normalCover, HWND_TOP,
+                assignedProbe.x - 8,
+                assignedProbe.y - 8,
+                96, 96, SWP_SHOWWINDOW);
+            SetForegroundWindow(normalCover);
+            UpdateWindow(normalCover);
+            const ULONGLONG coverDeadline = GetTickCount64() + 500;
+            while (GetTickCount64() < coverDeadline) {
+                MSG message{};
+                while (PeekMessageW(
+                        &message, nullptr, 0, 0, PM_REMOVE)) {
+                    TranslateMessage(&message);
+                    DispatchMessageW(&message);
+                }
+                if (GetAncestor(
+                        WindowFromPoint(assignedProbe),
+                        GA_ROOT) == normalCover) {
+                    break;
+                }
+                MsgWaitForMultipleObjects(
+                    0, nullptr, FALSE, 16, QS_ALLINPUT);
+            }
+        }
+        if (!normalApplicationAlreadyCovers &&
+            (normalCover == nullptr ||
+             GetAncestor(
+                 WindowFromPoint(assignedProbe),
+                 GA_ROOT) != normalCover)) {
+            writeTakeoverDiagnostics(
+                WindowFromPoint(assignedProbe),
+                L"normal-window-coverage-failed");
+            if (normalCover != nullptr) {
+                DestroyWindow(normalCover);
+            }
+            if (previousForeground != nullptr &&
+                IsWindow(previousForeground) != FALSE) {
+                SetForegroundWindow(previousForeground);
+            }
+            surface.Close();
+            std::wcerr
+                << L"Desktop takeover covered a normal application window\n";
+            return 108;
+        }
+        if (normalCover != nullptr) {
+            DestroyWindow(normalCover);
+            if (previousForeground != nullptr &&
+                IsWindow(previousForeground) != FALSE) {
+                SetForegroundWindow(previousForeground);
+            }
+        }
+    }
+    if (IsWindowVisible(created.listViewWindow) == FALSE ||
+        IsWindowEnabled(created.listViewWindow) == FALSE) {
+        surface.Close();
+        std::wcerr
+            << L"Desktop takeover changed Explorer list-view state\n";
+        return 109;
+    }
+    surface.Close();
+
+    DesktopViewSnapshot after;
+    std::vector<DesktopPosition> positionsAfter;
+    if (!layout.CaptureViewSnapshot(after, errorMessage) ||
+        !layout.CaptureAllPositions(
+            positionsAfter, errorMessage) ||
+        after.viewFlags != before.viewFlags ||
+        after.items.size() != before.items.size() ||
+        positionsAfter.size() != positionsBefore.size()) {
+        std::wcerr
+            << L"Desktop takeover close did not preserve Explorer snapshot\n";
+        return 106;
+    }
+    const bool sameDesktopIdentities = std::all_of(
+        before.items.begin(), before.items.end(),
+        [&](const DesktopViewItem& expected) {
+            return std::any_of(
+                after.items.begin(), after.items.end(),
+                [&](const DesktopViewItem& actual) {
+                    return CompareStringOrdinal(
+                               expected.path.c_str(), -1,
+                               actual.path.c_str(), -1,
+                               TRUE) == CSTR_EQUAL;
+                });
+        });
+    if (!sameDesktopIdentities) {
+        std::wcerr
+            << L"Desktop takeover input changed the desktop item set\n";
+        return 125;
+    }
+    const auto findPosition =
+        [&](const DesktopPosition& expected) {
+            return std::find_if(
+                positionsAfter.begin(),
+                positionsAfter.end(),
+                [&](const DesktopPosition& actual) {
+                    return CompareStringOrdinal(
+                               expected.path.c_str(),
+                               -1,
+                               actual.path.c_str(),
+                               -1,
+                               TRUE) == CSTR_EQUAL &&
+                        expected.point.x == actual.point.x &&
+                        expected.point.y == actual.point.y;
+                }) != positionsAfter.end();
+        };
+    if (!std::all_of(
+            positionsBefore.begin(),
+            positionsBefore.end(),
+            findPosition)) {
+        std::wcerr
+            << L"Desktop takeover changed Explorer icon coordinates\n";
+        return 107;
+    }
+    std::wcout
+        << L"Desktop display takeover PoC passed: items="
+        << before.items.size()
+        << L", visible="
+        << (before.items.size() - assigned.size())
+        << L", flags=" << before.viewFlags << L"\n";
+    return 0;
+}
+
+HWND FindShellPocListView();
+
+class RemoteListViewQuery final {
+public:
+    ~RemoteListViewQuery() {
+        if (process_ != nullptr && remoteBuffer_ != nullptr) {
+            VirtualFreeEx(process_, remoteBuffer_, 0, MEM_RELEASE);
+        }
+        if (process_ != nullptr) {
+            CloseHandle(process_);
+        }
+    }
+
+    bool Initialize(HWND listView) {
+        listView_ = listView;
+        DWORD processId = 0;
+        GetWindowThreadProcessId(listView_, &processId);
+        if (processId == 0) return false;
+        if (processId == GetCurrentProcessId()) return true;
+        process_ = OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_OPERATION |
+                PROCESS_VM_READ | PROCESS_VM_WRITE,
+            FALSE,
+            processId);
+        if (process_ == nullptr) return false;
+        constexpr SIZE_T kBufferSize =
+            sizeof(LVHITTESTINFO) > sizeof(RECT)
+                ? sizeof(LVHITTESTINFO)
+                : sizeof(RECT);
+        remoteBuffer_ = VirtualAllocEx(
+            process_, nullptr, kBufferSize,
+            MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        return remoteBuffer_ != nullptr;
+    }
+
+    bool HitTest(POINT point, LVHITTESTINFO& hit) const {
+        hit = {};
+        hit.pt = point;
+        hit.iItem = -1;
+        LRESULT messageResult = -1;
+        return Query(LVM_HITTEST, 0, &hit, sizeof(hit), messageResult);
+    }
+
+    bool ItemRect(int itemIndex, int rectKind, RECT& rect) const {
+        rect = {};
+        rect.left = rectKind;
+        LRESULT messageResult = FALSE;
+        return Query(
+                   LVM_GETITEMRECT,
+                   static_cast<WPARAM>(itemIndex),
+                   &rect,
+                   sizeof(rect),
+                   messageResult) &&
+            messageResult != FALSE;
+    }
+
+    bool ItemPosition(int itemIndex, POINT& point) const {
+        point = {};
+        LRESULT messageResult = FALSE;
+        return Query(
+                   LVM_GETITEMPOSITION,
+                   static_cast<WPARAM>(itemIndex),
+                   &point,
+                   sizeof(point),
+                   messageResult) &&
+            messageResult != FALSE;
+    }
+
+private:
+    bool Query(
+        UINT message,
+        WPARAM wParam,
+        void* localBuffer,
+        SIZE_T bufferSize,
+        LRESULT& messageResult) const {
+        if (listView_ == nullptr || localBuffer == nullptr ||
+            bufferSize == 0 || IsWindow(listView_) == FALSE) {
+            return false;
+        }
+        void* messageBuffer = localBuffer;
+        if (process_ != nullptr) {
+            SIZE_T written = 0;
+            if (WriteProcessMemory(
+                    process_, remoteBuffer_, localBuffer, bufferSize,
+                    &written) == FALSE ||
+                written != bufferSize) {
+                return false;
+            }
+            messageBuffer = remoteBuffer_;
+        }
+        DWORD_PTR rawResult = 0;
+        if (SendMessageTimeoutW(
+                listView_, message, wParam,
+                reinterpret_cast<LPARAM>(messageBuffer),
+                SMTO_ABORTIFHUNG | SMTO_BLOCK | SMTO_ERRORONEXIT,
+                1000, &rawResult) == 0) {
+            return false;
+        }
+        if (process_ != nullptr) {
+            SIZE_T read = 0;
+            if (ReadProcessMemory(
+                    process_, remoteBuffer_, localBuffer, bufferSize,
+                    &read) == FALSE ||
+                read != bufferSize) {
+                return false;
+            }
+        }
+        messageResult = static_cast<LRESULT>(rawResult);
+        return true;
+    }
+
+    HWND listView_ = nullptr;
+    HANDLE process_ = nullptr;
+    void* remoteBuffer_ = nullptr;
+};
+
+int RunSmokeDesktopNativeDragOracle() {
+    AttachParentConsole();
+    SetThreadDpiAwarenessContext(
+        DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    const auto environmentValue = [](const wchar_t* name) {
+        const DWORD required = GetEnvironmentVariableW(name, nullptr, 0);
+        if (required == 0) return std::wstring{};
+        std::wstring value(required, L'\0');
+        const DWORD copied = GetEnvironmentVariableW(
+            name, value.data(), required);
+        if (copied == 0 || copied >= required) return std::wstring{};
+        value.resize(copied);
+        return value;
+    };
+    const std::wstring markerA =
+        environmentValue(L"LATTICE_INTERNAL_DRAG_MARKER_A");
+    const std::wstring markerB =
+        environmentValue(L"LATTICE_INTERNAL_DRAG_MARKER_B");
+    const std::filesystem::path resultRoot = environmentValue(
+        L"DESKTOP_ORGANIZER_SMOKE_ITEMS_DIR");
+    std::ofstream result(
+        resultRoot / L"desktop-native-drag-oracle-result.txt",
+        std::ios::trunc);
+    const auto markerIsValid = [](const std::wstring& path) {
+        return !path.empty() &&
+            std::filesystem::path(path).filename().wstring().rfind(
+                L".lattice-internal-drag-", 0) == 0 &&
+            GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES;
+    };
+    if (resultRoot.empty() || !markerIsValid(markerA) ||
+        !markerIsValid(markerB)) {
+        result << "INPUT_REJECTED=1\nSTATUS=FAIL\n";
+        return 221;
+    }
+
+    DesktopLayout layout;
+    std::vector<DesktopPosition> positionsBefore;
+    DWORD flagsBefore = 0;
+    std::wstring errorMessage;
+    if (!layout.CaptureAllPositions(positionsBefore, errorMessage) ||
+        !layout.CaptureViewFlags(flagsBefore, errorMessage)) {
+        result << "SNAPSHOT_FAILED=1\nERROR="
+               << Utf8Text(errorMessage) << "\nSTATUS=FAIL\n";
+        return 222;
+    }
+    const auto lookupPosition = [](
+        const std::vector<DesktopPosition>& positions,
+        const std::wstring& path) -> std::optional<POINT> {
+        const auto found = std::find_if(
+            positions.begin(), positions.end(),
+            [&](const DesktopPosition& position) {
+                return CompareStringOrdinal(
+                    position.path.c_str(), -1,
+                    path.c_str(), -1, TRUE) == CSTR_EQUAL;
+            });
+        return found == positions.end()
+            ? std::nullopt
+            : std::optional<POINT>(found->point);
+    };
+    const auto beforeA = lookupPosition(positionsBefore, markerA);
+    const auto beforeB = lookupPosition(positionsBefore, markerB);
+    const HWND listView = FindShellPocListView();
+    if (!beforeA.has_value() || !beforeB.has_value() ||
+        listView == nullptr || IsWindow(listView) == FALSE) {
+        result << "MARKERS_OR_LISTVIEW_MISSING=1\nSTATUS=FAIL\n";
+        return 223;
+    }
+
+    RemoteListViewQuery query;
+    if (!query.Initialize(listView)) {
+        result << "LISTVIEW_QUERY_FAILED=1\nSTATUS=FAIL\n";
+        return 224;
+    }
+    DWORD_PTR itemCountResult = 0;
+    if (SendMessageTimeoutW(
+            listView, LVM_GETITEMCOUNT, 0, 0,
+            SMTO_ABORTIFHUNG | SMTO_BLOCK | SMTO_ERRORONEXIT,
+            1000, &itemCountResult) == 0) {
+        result << "ITEM_COUNT_QUERY_FAILED=1\nSTATUS=FAIL\n";
+        return 224;
+    }
+    const int itemCount = static_cast<int>(itemCountResult);
+    int markerAIndex = -1;
+    int markerBIndex = -1;
+    for (int index = 0; index < itemCount; ++index) {
+        POINT position{};
+        if (!query.ItemPosition(index, position)) continue;
+        if (position.x == beforeA->x && position.y == beforeA->y) {
+            markerAIndex = index;
+        }
+        if (position.x == beforeB->x && position.y == beforeB->y) {
+            markerBIndex = index;
+        }
+    }
+    if (markerAIndex < 0 || markerBIndex < 0 ||
+        markerAIndex == markerBIndex) {
+        result << "MARKER_INDEX_MATCH_FAILED=1\nSTATUS=FAIL\n";
+        return 223;
+    }
+    RECT iconRectA{};
+    if (!query.ItemRect(markerAIndex, LVIR_ICON, iconRectA)) {
+        result << "LISTVIEW_QUERY_FAILED=1\nSTATUS=FAIL\n";
+        return 224;
+    }
+    POINT dragStart{
+        (iconRectA.left + iconRectA.right) / 2,
+        (iconRectA.top + iconRectA.bottom) / 2};
+    LVHITTESTINFO startHit{};
+    if (!query.HitTest(dragStart, startHit) ||
+        startHit.iItem != markerAIndex) {
+        result << "START_HIT_FAILED=1\nSTATUS=FAIL\n";
+        return 225;
+    }
+
+    DWORD_PTR spacingResult = 0;
+    if (SendMessageTimeoutW(
+            listView, LVM_GETITEMSPACING, FALSE, 0,
+            SMTO_ABORTIFHUNG | SMTO_BLOCK | SMTO_ERRORONEXIT,
+            1000, &spacingResult) == 0) {
+        result << "SPACING_QUERY_FAILED=1\nSTATUS=FAIL\n";
+        return 226;
+    }
+    const int cellWidth = LOWORD(spacingResult);
+    const int cellHeight = HIWORD(spacingResult);
+    const POINT gridDelta{
+        beforeB->x - beforeA->x,
+        beforeB->y - beforeA->y};
+    std::optional<POINT> dragEnd;
+    const int maximumOffset = (std::max)(4, cellWidth / 2 - 2);
+    for (int offset = 4; offset <= maximumOffset; offset += 2) {
+        const std::array<POINT, 4> candidates{{
+            {dragStart.x + gridDelta.x + offset,
+             dragStart.y + gridDelta.y},
+            {dragStart.x + gridDelta.x - offset,
+             dragStart.y + gridDelta.y},
+            {dragStart.x + gridDelta.x,
+             dragStart.y + gridDelta.y + offset},
+            {dragStart.x + gridDelta.x,
+             dragStart.y + gridDelta.y - offset},
+        }};
+        for (const POINT candidate : candidates) {
+            LVHITTESTINFO hit{};
+            if (query.HitTest(candidate, hit) && hit.iItem < 0) {
+                dragEnd = candidate;
+                break;
+            }
+        }
+        if (dragEnd.has_value()) break;
+    }
+    if (!dragEnd.has_value()) {
+        result << "OCCUPIED_CELL_GAP_NOT_FOUND=1\n"
+               << "CELL_WIDTH=" << cellWidth << "\n"
+               << "CELL_HEIGHT=" << cellHeight << "\n"
+               << "STATUS=FAIL\n";
+        return 227;
+    }
+
+    POINT dragStartScreen = dragStart;
+    POINT dragEndScreen = *dragEnd;
+    if (ClientToScreen(listView, &dragStartScreen) == FALSE ||
+        ClientToScreen(listView, &dragEndScreen) == FALSE ||
+        WindowFromPoint(dragStartScreen) != listView ||
+        WindowFromPoint(dragEndScreen) != listView) {
+        result << "NATIVE_ROUTE_NOT_EXPOSED=1\nSTATUS=FAIL\n";
+        return 228;
+    }
+    if (((GetAsyncKeyState(VK_LBUTTON) | GetAsyncKeyState(VK_RBUTTON) |
+          GetAsyncKeyState(VK_CONTROL) | GetAsyncKeyState(VK_SHIFT) |
+          GetAsyncKeyState(VK_MENU)) & 0x8000) != 0) {
+        result << "INPUT_BUSY=1\nSTATUS=FAIL\n";
+        return 229;
+    }
+
+    const int virtualLeft = GetSystemMetrics(SM_XVIRTUALSCREEN);
+    const int virtualTop = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    const int virtualWidth =
+        (std::max)(1, GetSystemMetrics(SM_CXVIRTUALSCREEN) - 1);
+    const int virtualHeight =
+        (std::max)(1, GetSystemMetrics(SM_CYVIRTUALSCREEN) - 1);
+    const auto sendMouse = [&](POINT screenPoint, DWORD flags) {
+        INPUT input{};
+        input.type = INPUT_MOUSE;
+        input.mi.dx = MulDiv(
+            screenPoint.x - virtualLeft, 65535, virtualWidth);
+        input.mi.dy = MulDiv(
+            screenPoint.y - virtualTop, 65535, virtualHeight);
+        input.mi.dwFlags = MOUSEEVENTF_ABSOLUTE |
+            MOUSEEVENTF_VIRTUALDESK | MOUSEEVENTF_MOVE | flags;
+        return SendInput(1, &input, sizeof(input)) == 1;
+    };
+    POINT savedCursor{};
+    GetCursorPos(&savedCursor);
+    bool inputSucceeded = sendMouse(dragStartScreen, 0);
+    Sleep(50);
+    inputSucceeded =
+        sendMouse(dragStartScreen, MOUSEEVENTF_LEFTDOWN) &&
+        inputSucceeded;
+    Sleep(80);
+    inputSucceeded = sendMouse(dragEndScreen, 0) && inputSucceeded;
+    Sleep(180);
+    inputSucceeded =
+        sendMouse(dragEndScreen, MOUSEEVENTF_LEFTUP) &&
+        inputSucceeded;
+    Sleep(500);
+    sendMouse(savedCursor, 0);
+
+    std::vector<DesktopPosition> positionsAfter;
+    DWORD flagsAfter = 0;
+    const bool capturedAfter =
+        layout.CaptureAllPositions(positionsAfter, errorMessage) &&
+        layout.CaptureViewFlags(flagsAfter, errorMessage);
+    size_t changedCount = 0;
+    if (capturedAfter) {
+        for (const DesktopPosition& position : positionsBefore) {
+            const auto current = lookupPosition(positionsAfter, position.path);
+            if (!current.has_value() ||
+                current->x != position.point.x ||
+                current->y != position.point.y) {
+                ++changedCount;
+                result << "CHANGED_IDENTITY="
+                       << Utf8Text(position.path) << "\n";
+            }
+        }
+    }
+    const auto afterA = lookupPosition(positionsAfter, markerA);
+    const auto afterB = lookupPosition(positionsAfter, markerB);
+    const bool markerMoved = beforeA.has_value() && afterA.has_value() &&
+        (beforeA->x != afterA->x || beforeA->y != afterA->y);
+
+    std::wstring restoreError;
+    const bool restoreIssued = layout.RestorePositions(
+        positionsBefore, restoreError);
+    Sleep(160);
+    std::vector<DesktopPosition> restoredOnce;
+    std::vector<DesktopPosition> restoredTwice;
+    const bool restoredCaptured =
+        layout.CaptureAllPositions(restoredOnce, restoreError) &&
+        (Sleep(100), layout.CaptureAllPositions(restoredTwice, restoreError));
+    const auto exactMap = [&](const std::vector<DesktopPosition>& current) {
+        if (current.size() != positionsBefore.size()) return false;
+        return std::all_of(
+            positionsBefore.begin(), positionsBefore.end(),
+            [&](const DesktopPosition& position) {
+                const auto value = lookupPosition(current, position.path);
+                return value.has_value() &&
+                    value->x == position.point.x &&
+                    value->y == position.point.y;
+            });
+    };
+    const bool restored = restoreIssued && restoredCaptured &&
+        exactMap(restoredOnce) && exactMap(restoredTwice);
+
+    result << "INPUT_SUCCEEDED=" << inputSucceeded << "\n"
+           << "CAPTURED_AFTER=" << capturedAfter << "\n"
+           << "FLAGS_BEFORE=" << flagsBefore << "\n"
+           << "FLAGS_AFTER=" << flagsAfter << "\n"
+           << "CELL_WIDTH=" << cellWidth << "\n"
+           << "CELL_HEIGHT=" << cellHeight << "\n"
+           << "REQUESTED_OFFSET_X="
+           << (dragEnd->x - dragStart.x - gridDelta.x) << "\n"
+           << "REQUESTED_OFFSET_Y="
+           << (dragEnd->y - dragStart.y - gridDelta.y) << "\n"
+           << "CHANGED_COUNT=" << changedCount << "\n"
+           << "MARKER_A_MOVED=" << markerMoved << "\n";
+    if (beforeA.has_value() && afterA.has_value()) {
+        result << "MARKER_A_BEFORE=" << beforeA->x << "," << beforeA->y
+               << "\nMARKER_A_AFTER=" << afterA->x << "," << afterA->y
+               << "\n";
+    }
+    if (beforeB.has_value() && afterB.has_value()) {
+        result << "MARKER_B_BEFORE=" << beforeB->x << "," << beforeB->y
+               << "\nMARKER_B_AFTER=" << afterB->x << "," << afterB->y
+               << "\n";
+    }
+    result << "RESTORED_TWICE=" << restored << "\n";
+    const bool passed = inputSucceeded && capturedAfter && markerMoved &&
+        flagsAfter == flagsBefore && restored;
+    result << "STATUS=" << (passed ? "PASS" : "FAIL") << "\n";
+    if (!passed) {
+        std::wcerr << L"Native Explorer drag oracle failed: "
+                   << errorMessage << L" / " << restoreError << L"\n";
+        return 230;
+    }
+    return 0;
+}
+
+int RunSmokeDesktopInternalDrag(HINSTANCE instance) {
+    AttachParentConsole();
+    SetThreadDpiAwarenessContext(
+        DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    const auto environmentValue = [](const wchar_t* name) {
+        const DWORD required = GetEnvironmentVariableW(name, nullptr, 0);
+        if (required == 0) return std::wstring{};
+        std::wstring value(required, L'\0');
+        const DWORD copied = GetEnvironmentVariableW(
+            name, value.data(), required);
+        if (copied == 0 || copied >= required) return std::wstring{};
+        value.resize(copied);
+        return value;
+    };
+    const std::wstring markerA =
+        environmentValue(L"LATTICE_INTERNAL_DRAG_MARKER_A");
+    const std::wstring markerB =
+        environmentValue(L"LATTICE_INTERNAL_DRAG_MARKER_B");
+    const std::filesystem::path resultRoot = environmentValue(
+        L"DESKTOP_ORGANIZER_SMOKE_ITEMS_DIR");
+    std::ofstream result(
+        resultRoot / L"desktop-internal-drag-result.txt",
+        std::ios::trunc);
+    const auto markerIsValid = [](const std::wstring& path) {
+        return !path.empty() &&
+            std::filesystem::path(path).filename().wstring().rfind(
+                L".lattice-internal-drag-", 0) == 0 &&
+            GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES;
+    };
+    if (resultRoot.empty() || !markerIsValid(markerA) ||
+        !markerIsValid(markerB) ||
+        CompareStringOrdinal(
+            markerA.c_str(), -1, markerB.c_str(), -1, TRUE) ==
+                CSTR_EQUAL) {
+        result << "INPUT_REJECTED=1\nSTATUS=FAIL\n";
+        return 201;
+    }
+
+    DesktopLayout layout;
+    std::vector<DesktopPosition> positionsBefore;
+    DWORD flagsBefore = 0;
+    std::wstring errorMessage;
+    if (!layout.CaptureAllPositions(positionsBefore, errorMessage) ||
+        !layout.CaptureViewFlags(flagsBefore, errorMessage)) {
+        result << "SNAPSHOT_FAILED=1\n";
+        result << "ERROR=" << Utf8Text(errorMessage) << "\n";
+        result << "POSITIONS=" << positionsBefore.size() << "\n";
+        result << "STATUS=FAIL\n";
+        return 202;
+    }
+    DesktopSurfaceWindow probeSurface(instance);
+    if (!probeSurface.Create({}, errorMessage)) {
+        result << "SURFACE_CREATE_FAILED=1\nSTATUS=FAIL\n";
+        return 204;
+    }
+    DesktopViewSnapshot before = probeSurface.Snapshot();
+    before.viewFlags = flagsBefore;
+    const auto findItem = [&](const std::wstring& path) {
+        return std::find_if(
+            before.items.begin(), before.items.end(),
+            [&](const DesktopViewItem& item) {
+                return CompareStringOrdinal(
+                    item.path.c_str(), -1, path.c_str(), -1, TRUE) ==
+                    CSTR_EQUAL;
+            });
+    };
+    auto itemA = findItem(markerA);
+    auto itemB = findItem(markerB);
+    if (itemA == before.items.end() || itemB == before.items.end()) {
+        result << "MARKERS_NOT_VISIBLE=1\nSTATUS=FAIL\n";
+        return 203;
+    }
+    const auto identityA = ReadStableFileIdentity(markerA);
+    const auto identityB = ReadStableFileIdentity(markerB);
+    const auto bytesA = ReadFileBytes(markerA);
+    const auto bytesB = ReadFileBytes(markerB);
+    const std::filesystem::path desktopRoot =
+        std::filesystem::path(markerA).parent_path();
+    const auto directoryEntries = [&]() {
+        std::vector<std::wstring> names;
+        std::error_code error;
+        for (std::filesystem::directory_iterator it(desktopRoot, error), end;
+             !error && it != end; it.increment(error)) {
+            names.push_back(it->path().filename().wstring());
+        }
+        if (error) names.clear();
+        std::sort(names.begin(), names.end());
+        return names;
+    };
+    const std::vector<std::wstring> entriesBefore = directoryEntries();
+
+    std::vector<std::wstring> assigned;
+    assigned.reserve(before.items.size() - 2);
+    for (const DesktopViewItem& item : before.items) {
+        if (CompareStringOrdinal(
+                item.path.c_str(), -1, markerA.c_str(), -1, TRUE) !=
+                CSTR_EQUAL &&
+            CompareStringOrdinal(
+                item.path.c_str(), -1, markerB.c_str(), -1, TRUE) !=
+                CSTR_EQUAL) {
+            assigned.push_back(item.path);
+        }
+    }
+
+    probeSurface.Show();
+    const auto pumpProbe = [](DWORD milliseconds) {
+        const ULONGLONG deadline = GetTickCount64() + milliseconds;
+        do {
+            MSG message{};
+            while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+                TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
+            MsgWaitForMultipleObjects(
+                0, nullptr, FALSE, 8, QS_ALLINPUT);
+        } while (GetTickCount64() < deadline);
+    };
+    pumpProbe(250);
+    const int fixtureCellWidth =
+        DesktopSurfaceWindowSmokeAccess::CellWidth(probeSurface);
+    const int fixtureCellHeight =
+        DesktopSurfaceWindowSmokeAccess::CellHeight(probeSurface);
+    const int fixtureIconSize =
+        DesktopSurfaceWindowSmokeAccess::IconSize(probeSurface);
+    const int fixtureColumns = (std::max)(
+        1, static_cast<int>(
+            (before.screenRect.right - before.screenRect.left) /
+            (std::max)(1, fixtureCellWidth)));
+    const int fixtureRows = (std::max)(
+        1, static_cast<int>(
+            (before.screenRect.bottom - before.screenRect.top) /
+            (std::max)(1, fixtureCellHeight)));
+    std::vector<POINT> freeExposedSlots;
+    for (int row = -fixtureRows; row <= fixtureRows; ++row) {
+        for (int column = -fixtureColumns;
+             column <= fixtureColumns; ++column) {
+            const POINT slot{
+                itemA->screenPoint.x + column * fixtureCellWidth,
+                itemA->screenPoint.y + row * fixtureCellHeight};
+            if (slot.x < before.screenRect.left ||
+                slot.y < before.screenRect.top ||
+                slot.x + fixtureIconSize > before.screenRect.right ||
+                slot.y + fixtureCellHeight > before.screenRect.bottom) {
+                continue;
+            }
+            bool occupied = false;
+            for (const DesktopViewItem& item : before.items) {
+                if (CompareStringOrdinal(
+                        item.path.c_str(), -1, markerA.c_str(), -1, TRUE) ==
+                            CSTR_EQUAL ||
+                    CompareStringOrdinal(
+                        item.path.c_str(), -1, markerB.c_str(), -1, TRUE) ==
+                            CSTR_EQUAL) {
+                    continue;
+                }
+                if (std::abs(item.screenPoint.x - slot.x) <
+                        fixtureCellWidth / 2 &&
+                    std::abs(item.screenPoint.y - slot.y) <
+                        fixtureCellHeight / 2) {
+                    occupied = true;
+                    break;
+                }
+            }
+            const POINT hitPoint{
+                slot.x + fixtureIconSize / 2,
+                slot.y + fixtureIconSize / 2};
+            if (!occupied &&
+                WindowFromPoint(hitPoint) == probeSurface.Window()) {
+                freeExposedSlots.push_back(slot);
+            }
+        }
+    }
+    const auto samePoint = [](POINT left, POINT right) {
+        return left.x == right.x && left.y == right.y;
+    };
+    const auto containsSlot = [&](POINT target) {
+        return std::any_of(
+            freeExposedSlots.begin(), freeExposedSlots.end(),
+            [&](POINT value) { return samePoint(value, target); });
+    };
+    POINT fixtureSourceA{};
+    POINT fixtureSourceB{};
+    POINT fixtureTargetA{};
+    bool fixtureFound = false;
+    const std::array<POINT, 2> pairShapes{{
+        POINT{fixtureCellWidth, 0},
+        POINT{0, fixtureCellHeight}}};
+    for (const POINT shape : pairShapes) {
+        for (const POINT source : freeExposedSlots) {
+            const POINT sourceB{
+                source.x + shape.x, source.y + shape.y};
+            if (!containsSlot(sourceB)) continue;
+            for (const POINT target : freeExposedSlots) {
+                const POINT targetB{
+                    target.x + shape.x, target.y + shape.y};
+                if (!containsSlot(targetB) ||
+                    samePoint(source, target) ||
+                    samePoint(source, targetB) ||
+                    samePoint(sourceB, target) ||
+                    samePoint(sourceB, targetB)) {
+                    continue;
+                }
+                fixtureSourceA = source;
+                fixtureSourceB = sourceB;
+                fixtureTargetA = target;
+                fixtureFound = true;
+                break;
+            }
+            if (fixtureFound) break;
+        }
+        if (fixtureFound) break;
+    }
+    probeSurface.Close();
+    pumpProbe(80);
+    if (!fixtureFound) {
+        result << "EXPOSED_FIXTURE_SLOTS_FAILED=1\n";
+        result << "FREE_EXPOSED_SLOTS=" << freeExposedSlots.size() << "\n";
+        result << "STATUS=FAIL\n";
+        return 209;
+    }
+    std::vector<DesktopPosition> confirmedFixture;
+    if (!layout.PositionScreenItemsOnce(
+            {{markerA, fixtureSourceA}, {markerB, fixtureSourceB}},
+            confirmedFixture, errorMessage) ||
+        confirmedFixture.size() != 2) {
+        result << "FIXTURE_POSITION_FAILED=1\nSTATUS=FAIL\n";
+        return 210;
+    }
+    positionsBefore.clear();
+    if (!layout.CaptureAllPositions(positionsBefore, errorMessage) ||
+        !layout.CaptureViewFlags(before.viewFlags, errorMessage)) {
+        result << "PREPARED_SNAPSHOT_FAILED=1\nSTATUS=FAIL\n";
+        return 211;
+    }
+    for (DesktopViewItem& item : before.items) {
+        const auto prepared = std::find_if(
+            positionsBefore.begin(), positionsBefore.end(),
+            [&](const DesktopPosition& position) {
+                return CompareStringOrdinal(
+                           position.path.c_str(), -1,
+                           item.path.c_str(), -1, TRUE) == CSTR_EQUAL;
+            });
+        if (prepared == positionsBefore.end()) {
+            result << "PREPARED_IDENTITY_MISSING=1\nSTATUS=FAIL\n";
+            return 211;
+        }
+        item.viewPoint = prepared->point;
+        item.screenPoint = prepared->point;
+        if (ClientToScreen(
+                before.listViewWindow,
+                &item.screenPoint) == FALSE) {
+            result << "PREPARED_POINT_MAP_FAILED=1\nSTATUS=FAIL\n";
+            return 211;
+        }
+    }
+    itemA = findItem(markerA);
+    itemB = findItem(markerB);
+    if (itemA == before.items.end() || itemB == before.items.end()) {
+        result << "PREPARED_MARKERS_NOT_VISIBLE=1\nSTATUS=FAIL\n";
+        return 212;
+    }
+
+    DesktopSurfaceWindow surface(instance);
+    if (!surface.Create(assigned, errorMessage)) {
+        result << "SURFACE_CREATE_FAILED=1\nSTATUS=FAIL\n";
+        return 204;
+    }
+    ConfigStore displayStore;
+    std::vector<DesktopPosition> committedViewPositions;
+    surface.SetDisplayPositionCommitHandler(
+        [&](const std::vector<DesktopPosition>& positions) {
+            committedViewPositions = positions;
+            std::vector<DesktopPlacementConfig> placements;
+            placements.reserve(positions.size());
+            for (const DesktopPosition& position : positions) {
+                placements.push_back(DesktopPlacementConfig{
+                    position.path,
+                    position.point.x,
+                    position.point.y});
+            }
+            return displayStore.SaveDesktopDisplayPositionsAsync(
+                placements);
+        });
+    surface.Show();
+    const auto pumpFor = [](DWORD milliseconds) {
+        const ULONGLONG deadline = GetTickCount64() + milliseconds;
+        do {
+            MSG message{};
+            while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+                TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
+            MsgWaitForMultipleObjects(
+                0, nullptr, FALSE, 8, QS_ALLINPUT);
+        } while (GetTickCount64() < deadline);
+    };
+    pumpFor(350);
+    const HWND surfaceWindow = surface.Window();
+    const auto rectA =
+        DesktopSurfaceWindowSmokeAccess::InteractionRectForIdentity(
+            surface, markerA);
+    const auto rectB =
+        DesktopSurfaceWindowSmokeAccess::InteractionRectForIdentity(
+            surface, markerB);
+    if (surface.VisibleItemCount() != 2 || !rectA.has_value() ||
+        !rectB.has_value()) {
+        surface.Close();
+        result << "MARKER_PARTITION_FAILED=1\nSTATUS=FAIL\n";
+        return 205;
+    }
+    if (((GetAsyncKeyState(VK_LBUTTON) | GetAsyncKeyState(VK_RBUTTON) |
+          GetAsyncKeyState(VK_CONTROL) | GetAsyncKeyState(VK_SHIFT) |
+          GetAsyncKeyState(VK_MENU)) & 0x8000) != 0) {
+        surface.Close();
+        result << "INPUT_BUSY=1\nSTATUS=FAIL\n";
+        return 206;
+    }
+
+    const RECT bounds =
+        DesktopSurfaceWindowSmokeAccess::ClientBounds(surface);
+    const std::array<std::pair<POINT, POINT>, 4> marqueeCandidates{{
+        {{bounds.left + 2, bounds.top + 2},
+         {bounds.right - 2, bounds.bottom - 2}},
+        {{bounds.right - 2, bounds.bottom - 2},
+         {bounds.left + 2, bounds.top + 2}},
+        {{bounds.right - 2, bounds.top + 2},
+         {bounds.left + 2, bounds.bottom - 2}},
+        {{bounds.left + 2, bounds.bottom - 2},
+         {bounds.right - 2, bounds.top + 2}},
+    }};
+    std::optional<std::pair<POINT, POINT>> marquee;
+    for (const auto& candidate : marqueeCandidates) {
+        POINT startScreen = candidate.first;
+        ClientToScreen(surfaceWindow, &startScreen);
+        if (DesktopSurfaceWindowSmokeAccess::IsBlankPoint(
+                surface, candidate.first) &&
+            WindowFromPoint(startScreen) == surfaceWindow) {
+            marquee = candidate;
+            break;
+        }
+    }
+    if (!marquee.has_value()) {
+        surface.Close();
+        result << "MARQUEE_POINTS_FAILED=1\nSTATUS=FAIL\n";
+        return 207;
+    }
+
+    const int virtualLeft = GetSystemMetrics(SM_XVIRTUALSCREEN);
+    const int virtualTop = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    const int virtualWidth =
+        (std::max)(1, GetSystemMetrics(SM_CXVIRTUALSCREEN) - 1);
+    const int virtualHeight =
+        (std::max)(1, GetSystemMetrics(SM_CYVIRTUALSCREEN) - 1);
+    const auto sendMouse = [&](POINT screenPoint, DWORD flags) {
+        INPUT input{};
+        input.type = INPUT_MOUSE;
+        input.mi.dx = MulDiv(
+            screenPoint.x - virtualLeft, 65535, virtualWidth);
+        input.mi.dy = MulDiv(
+            screenPoint.y - virtualTop, 65535, virtualHeight);
+        input.mi.dwFlags = MOUSEEVENTF_ABSOLUTE |
+            MOUSEEVENTF_VIRTUALDESK | MOUSEEVENTF_MOVE | flags;
+        return SendInput(1, &input, sizeof(input)) == 1;
+    };
+    const auto sendEscape = []() {
+        INPUT input{};
+        input.type = INPUT_KEYBOARD;
+        input.ki.wVk = VK_ESCAPE;
+        const bool keyDown = SendInput(1, &input, sizeof(input)) == 1;
+        Sleep(80);
+        input.ki.dwFlags = KEYEVENTF_KEYUP;
+        const bool keyUp = SendInput(1, &input, sizeof(input)) == 1;
+        return keyDown && keyUp;
+    };
+    POINT savedCursor{};
+    GetCursorPos(&savedCursor);
+    POINT marqueeStart = marquee->first;
+    POINT marqueeEnd = marquee->second;
+    ClientToScreen(surfaceWindow, &marqueeStart);
+    ClientToScreen(surfaceWindow, &marqueeEnd);
+    bool marqueePassed = sendMouse(marqueeStart, 0);
+    pumpFor(30);
+    marqueePassed = marqueePassed &&
+        sendMouse(marqueeStart, MOUSEEVENTF_LEFTDOWN);
+    pumpFor(30);
+    marqueePassed = marqueePassed && sendMouse(marqueeEnd, 0);
+    pumpFor(60);
+    const bool marqueeInputSequenceSucceeded = marqueePassed;
+    const bool marqueeReleased =
+        sendMouse(marqueeEnd, MOUSEEVENTF_LEFTUP);
+    pumpFor(80);
+    const std::vector<std::wstring> selected =
+        DesktopSurfaceWindowSmokeAccess::SelectedPaths(surface);
+    const bool marqueeSelectedA =
+        std::any_of(selected.begin(), selected.end(),
+            [&](const std::wstring& value) {
+                return CompareStringOrdinal(
+                    value.c_str(), -1, markerA.c_str(), -1, TRUE) ==
+                    CSTR_EQUAL;
+            });
+    const bool marqueeSelectedB =
+        std::any_of(selected.begin(), selected.end(),
+            [&](const std::wstring& value) {
+                return CompareStringOrdinal(
+                    value.c_str(), -1, markerB.c_str(), -1, TRUE) ==
+                    CSTR_EQUAL;
+            });
+    marqueePassed = marqueeInputSequenceSucceeded && marqueeReleased &&
+        selected.size() == 2 && marqueeSelectedA && marqueeSelectedB;
+    if (!marqueePassed) {
+        sendMouse(marqueeEnd, MOUSEEVENTF_LEFTUP);
+        sendMouse(savedCursor, 0);
+        surface.Close();
+        result << "REAL_MARQUEE_FAILED=1\n";
+        result << "REAL_MARQUEE_INPUT_SEQUENCE_SUCCEEDED="
+               << marqueeInputSequenceSucceeded << "\n";
+        result << "REAL_MARQUEE_RELEASED=" << marqueeReleased << "\n";
+        result << "REAL_MARQUEE_SELECTED_COUNT=" << selected.size() << "\n";
+        result << "REAL_MARQUEE_SELECTED_A=" << marqueeSelectedA << "\n";
+        result << "REAL_MARQUEE_SELECTED_B=" << marqueeSelectedB << "\n";
+        result << "STATUS=FAIL\n";
+        return 208;
+    }
+
+    POINT dragStart{
+        (rectA->left + rectA->right) / 2,
+        (rectA->top + rectA->bottom) / 2};
+    ClientToScreen(surfaceWindow, &dragStart);
+    const POINT dragDelta{
+        fixtureTargetA.x - fixtureSourceA.x,
+        fixtureTargetA.y - fixtureSourceA.y};
+    const POINT dragEnd{
+        dragStart.x + dragDelta.x,
+        dragStart.y + dragDelta.y};
+    if (WindowFromPoint(dragStart) != surfaceWindow ||
+        WindowFromPoint(dragEnd) != surfaceWindow) {
+        sendMouse(savedCursor, 0);
+        surface.Close();
+        result << "FIXTURE_ROUTE_CHANGED=1\nSTATUS=FAIL\n";
+        return 213;
+    }
+
+    const ULONGLONG iconReadyDeadline = GetTickCount64() + 2500;
+    while (!DesktopSurfaceWindowSmokeAccess::AllVisibleIconsReady(surface) &&
+           GetTickCount64() < iconReadyDeadline) {
+        pumpFor(16);
+    }
+    POINT dragStartClient = dragStart;
+    ScreenToClient(surfaceWindow, &dragStartClient);
+    SHDRAGIMAGE expectedDragImage{};
+    const bool dragCompositeReady =
+        DesktopSurfaceWindowSmokeAccess::BuildShellDragImage(
+            surface, dragStartClient, expectedDragImage);
+    RECT expectedGhostRect{};
+    if (dragCompositeReady) {
+        expectedGhostRect = RECT{
+            dragEnd.x - expectedDragImage.ptOffset.x,
+            dragEnd.y - expectedDragImage.ptOffset.y,
+            dragEnd.x - expectedDragImage.ptOffset.x +
+                expectedDragImage.sizeDragImage.cx,
+            dragEnd.y - expectedDragImage.ptOffset.y +
+                expectedDragImage.sizeDragImage.cy};
+        IntersectRect(
+            &expectedGhostRect,
+            &expectedGhostRect,
+            &before.screenRect);
+    }
+    if (expectedDragImage.hbmpDragImage != nullptr) {
+        DeleteObject(expectedDragImage.hbmpDragImage);
+        expectedDragImage.hbmpDragImage = nullptr;
+    }
+    if (!dragCompositeReady || IsRectEmpty(&expectedGhostRect)) {
+        sendMouse(savedCursor, 0);
+        surface.Close();
+        result << "DRAG_COMPOSITE_NOT_READY=1\nSTATUS=FAIL\n";
+        return 214;
+    }
+
+    // Establish the reference frame with the cursor already at the future
+    // drag hotspot. GDI screen capture does not normally include the cursor,
+    // but keeping its position identical also avoids compositor/cursor noise.
+    bool baselineReady = sendMouse(dragEnd, 0);
+    pumpFor(80);
+    DwmFlush();
+    std::vector<std::uint32_t> feedbackBaseline;
+    baselineReady = baselineReady && CaptureScreenPixels(
+        before.screenRect, feedbackBaseline);
+    const size_t shellDragBefore =
+        DesktopSurfaceWindowSmokeAccess::ShellDragStartCount(surface);
+    std::atomic<bool> inputSucceeded{true};
+    std::atomic<bool> inputFinished{false};
+    constexpr size_t kFeedbackFrameCount = 5;
+    std::array<std::vector<std::uint32_t>, kFeedbackFrameCount>
+        feedbackFrames;
+    std::array<bool, kFeedbackFrameCount> feedbackFrameCaptured{};
+    std::thread injector([&]() {
+        bool ok = sendMouse(dragStart, 0);
+        Sleep(30);
+        ok = sendMouse(dragStart, MOUSEEVENTF_LEFTDOWN) && ok;
+        Sleep(40);
+        ok = sendMouse(dragEnd, 0) && ok;
+        Sleep(60);
+        for (size_t index = 0; index < kFeedbackFrameCount; ++index) {
+            DwmFlush();
+            feedbackFrameCaptured[index] = CaptureScreenPixels(
+                before.screenRect, feedbackFrames[index]);
+            Sleep(24);
+        }
+        ok = sendMouse(dragEnd, MOUSEEVENTF_LEFTUP) && ok;
+        inputSucceeded.store(ok);
+        inputFinished.store(true);
+    });
+    const ULONGLONG inputDeadline = GetTickCount64() + 5000;
+    while (!inputFinished.load() && GetTickCount64() < inputDeadline) {
+        pumpFor(16);
+    }
+    injector.join();
+    pumpFor(250);
+    sendMouse(savedCursor, 0);
+    const HRESULT multiDragImageInitializationResult =
+        LastShellDragImageInitializationResultForTesting();
+
+    const LONG captureWidth =
+        before.screenRect.right - before.screenRect.left;
+    const size_t capturePixelCount = feedbackBaseline.size();
+    size_t capturedFeedbackFrames = 0;
+    size_t maximumGhostPixelChanges = 0;
+    size_t maximumBlackTransitions = 0;
+    for (size_t frameIndex = 0;
+         frameIndex < kFeedbackFrameCount; ++frameIndex) {
+        if (!feedbackFrameCaptured[frameIndex] ||
+            feedbackFrames[frameIndex].size() != capturePixelCount) {
+            continue;
+        }
+        ++capturedFeedbackFrames;
+        size_t ghostChanges = 0;
+        size_t blackTransitions = 0;
+        for (LONG y = before.screenRect.top;
+             y < before.screenRect.bottom; ++y) {
+            const size_t row = static_cast<size_t>(
+                y - before.screenRect.top) * captureWidth;
+            for (LONG x = before.screenRect.left;
+                 x < before.screenRect.right; ++x) {
+                const size_t pixelIndex = row + static_cast<size_t>(
+                    x - before.screenRect.left);
+                const std::uint32_t first = feedbackBaseline[pixelIndex];
+                const std::uint32_t second =
+                    feedbackFrames[frameIndex][pixelIndex];
+                const int firstBlue = first & 0xFF;
+                const int firstGreen = (first >> 8) & 0xFF;
+                const int firstRed = (first >> 16) & 0xFF;
+                const int secondBlue = second & 0xFF;
+                const int secondGreen = (second >> 8) & 0xFF;
+                const int secondRed = (second >> 16) & 0xFF;
+                const int channelDifference =
+                    std::abs(firstRed - secondRed) +
+                    std::abs(firstGreen - secondGreen) +
+                    std::abs(firstBlue - secondBlue);
+                if (x >= expectedGhostRect.left &&
+                    x < expectedGhostRect.right &&
+                    y >= expectedGhostRect.top &&
+                    y < expectedGhostRect.bottom &&
+                    channelDifference >= 12) {
+                    ++ghostChanges;
+                }
+                if (firstRed + firstGreen + firstBlue >= 150 &&
+                    secondRed + secondGreen + secondBlue <= 24) {
+                    ++blackTransitions;
+                }
+            }
+        }
+        maximumGhostPixelChanges = (std::max)(
+            maximumGhostPixelChanges, ghostChanges);
+        maximumBlackTransitions = (std::max)(
+            maximumBlackTransitions, blackTransitions);
+    }
+    const size_t ghostRectArea = static_cast<size_t>(
+        expectedGhostRect.right - expectedGhostRect.left) *
+        static_cast<size_t>(
+            expectedGhostRect.bottom - expectedGhostRect.top);
+    const size_t minimumGhostChanges = (std::max)(
+        static_cast<size_t>(200), ghostRectArea / 100);
+    const bool dragGhostVisible = baselineReady &&
+        capturedFeedbackFrames == kFeedbackFrameCount &&
+        maximumGhostPixelChanges >= minimumGhostChanges;
+    const bool noBlackFrame = baselineReady &&
+        capturedFeedbackFrames == kFeedbackFrameCount &&
+        maximumBlackTransitions < capturePixelCount / 20;
+    if (!dragGhostVisible || !noBlackFrame) {
+        SaveCapturedPixelsBmp(
+            before.screenRect,
+            feedbackBaseline,
+            resultRoot / L"desktop-drag-feedback-baseline.bmp");
+        for (size_t index = 0; index < kFeedbackFrameCount; ++index) {
+            if (feedbackFrameCaptured[index]) {
+                SaveCapturedPixelsBmp(
+                    before.screenRect,
+                    feedbackFrames[index],
+                    resultRoot /
+                        (L"desktop-drag-feedback-held-" +
+                         std::to_wstring(index) + L".bmp"));
+            }
+        }
+    }
+
+    const bool multiShellDragStarted =
+        DesktopSurfaceWindowSmokeAccess::ShellDragStartCount(surface) ==
+        shellDragBefore + 1;
+    const auto singleRectA =
+        DesktopSurfaceWindowSmokeAccess::InteractionRectForIdentity(
+            surface, markerA);
+    if (!singleRectA.has_value()) {
+        sendMouse(savedCursor, 0);
+        surface.Close();
+        result << "SINGLE_RECT_MISSING=1\nSTATUS=FAIL\n";
+        return 215;
+    }
+    POINT singleStartClient{
+        (singleRectA->left + singleRectA->right) / 2,
+        (singleRectA->top + singleRectA->bottom) / 2};
+    POINT singleStart = singleStartClient;
+    ClientToScreen(surfaceWindow, &singleStart);
+    bool singleSelectionReady = sendMouse(singleStart, 0);
+    pumpFor(30);
+    singleSelectionReady = singleSelectionReady &&
+        sendMouse(singleStart, MOUSEEVENTF_LEFTDOWN);
+    pumpFor(30);
+    singleSelectionReady = singleSelectionReady &&
+        sendMouse(singleStart, MOUSEEVENTF_LEFTUP);
+    pumpFor(80);
+    const std::vector<std::wstring> singleSelected =
+        DesktopSurfaceWindowSmokeAccess::SelectedPaths(surface);
+    singleSelectionReady = singleSelectionReady &&
+        singleSelected.size() == 1 &&
+        CompareStringOrdinal(
+            singleSelected.front().c_str(), -1,
+            markerA.c_str(), -1, TRUE) == CSTR_EQUAL;
+    if (!singleSelectionReady) {
+        sendMouse(savedCursor, 0);
+        surface.Close();
+        result << "SINGLE_SELECTION_FAILED=1\nSTATUS=FAIL\n";
+        return 216;
+    }
+    pumpFor(GetDoubleClickTime() + 100);
+
+    const LONG horizontalTravel =
+        singleStart.x + 120 < before.screenRect.right - 4 ? 120 : -120;
+    const LONG verticalTravel =
+        singleStart.y + 96 < before.screenRect.bottom - 4 ? 96 : -96;
+    const POINT singleEnd{
+        singleStart.x + horizontalTravel,
+        singleStart.y + verticalTravel};
+    const LONG thresholdTravelX = (std::max)(
+        12L,
+        static_cast<LONG>(GetSystemMetrics(SM_CXDRAG) + 2));
+    const LONG thresholdTravelY = (std::max)(
+        12L,
+        static_cast<LONG>(GetSystemMetrics(SM_CYDRAG) + 2));
+    const POINT singleThresholdPoint{
+        singleStart.x + (horizontalTravel > 0
+            ? thresholdTravelX
+            : -thresholdTravelX),
+        singleStart.y + (verticalTravel > 0
+            ? thresholdTravelY
+            : -thresholdTravelY)};
+    if (WindowFromPoint(singleStart) != surfaceWindow ||
+        WindowFromPoint(singleThresholdPoint) != surfaceWindow ||
+        WindowFromPoint(singleEnd) != surfaceWindow) {
+        sendMouse(savedCursor, 0);
+        surface.Close();
+        result << "SINGLE_ROUTE_CHANGED=1\nSTATUS=FAIL\n";
+        return 217;
+    }
+    SHDRAGIMAGE singleDragImage{};
+    const bool singleCompositeReady =
+        DesktopSurfaceWindowSmokeAccess::BuildShellDragImage(
+            surface, singleStartClient, singleDragImage);
+    RECT expectedSingleGhostRect{};
+    if (singleCompositeReady) {
+        expectedSingleGhostRect = RECT{
+            singleEnd.x - singleDragImage.ptOffset.x,
+            singleEnd.y - singleDragImage.ptOffset.y,
+            singleEnd.x - singleDragImage.ptOffset.x +
+                singleDragImage.sizeDragImage.cx,
+            singleEnd.y - singleDragImage.ptOffset.y +
+                singleDragImage.sizeDragImage.cy};
+        IntersectRect(
+            &expectedSingleGhostRect,
+            &expectedSingleGhostRect,
+            &before.screenRect);
+    }
+    if (singleDragImage.hbmpDragImage != nullptr) {
+        DeleteObject(singleDragImage.hbmpDragImage);
+        singleDragImage.hbmpDragImage = nullptr;
+    }
+    if (!singleCompositeReady || IsRectEmpty(&expectedSingleGhostRect)) {
+        sendMouse(savedCursor, 0);
+        surface.Close();
+        result << "SINGLE_COMPOSITE_NOT_READY=1\nSTATUS=FAIL\n";
+        return 218;
+    }
+
+    const auto cancelBeforeA =
+        DesktopSurfaceWindowSmokeAccess::VisibleScreenPointForIdentity(
+            surface, markerA);
+    const auto cancelBeforeB =
+        DesktopSurfaceWindowSmokeAccess::VisibleScreenPointForIdentity(
+            surface, markerB);
+    bool singleBaselineReady = sendMouse(singleEnd, 0);
+    pumpFor(80);
+    DwmFlush();
+    std::vector<std::uint32_t> singleFeedbackBaseline;
+    singleBaselineReady = singleBaselineReady && CaptureScreenPixels(
+        before.screenRect, singleFeedbackBaseline);
+    const size_t singleShellDragBefore =
+        DesktopSurfaceWindowSmokeAccess::ShellDragStartCount(surface);
+    std::atomic<bool> singleInputSucceeded{true};
+    std::atomic<bool> singleInputFinished{false};
+    std::array<std::vector<std::uint32_t>, kFeedbackFrameCount>
+        singleFeedbackFrames;
+    std::array<bool, kFeedbackFrameCount>
+        singleFeedbackFrameCaptured{};
+    std::thread singleInjector([&]() {
+        bool ok = sendMouse(singleStart, 0);
+        Sleep(30);
+        ok = sendMouse(singleStart, MOUSEEVENTF_LEFTDOWN) && ok;
+        Sleep(40);
+        ok = sendMouse(singleThresholdPoint, 0) && ok;
+        Sleep(50);
+        ok = sendMouse(singleEnd, 0) && ok;
+        Sleep(60);
+        for (size_t index = 0; index < kFeedbackFrameCount; ++index) {
+            DwmFlush();
+            singleFeedbackFrameCaptured[index] = CaptureScreenPixels(
+                before.screenRect, singleFeedbackFrames[index]);
+            Sleep(24);
+        }
+        ok = sendEscape() && ok;
+        Sleep(40);
+        ok = sendMouse(singleEnd, MOUSEEVENTF_LEFTUP) && ok;
+        singleInputSucceeded.store(ok);
+        singleInputFinished.store(true);
+    });
+    const ULONGLONG singleInputDeadline = GetTickCount64() + 5000;
+    while (!singleInputFinished.load() &&
+           GetTickCount64() < singleInputDeadline) {
+        pumpFor(16);
+    }
+    singleInjector.join();
+    pumpFor(250);
+    sendMouse(savedCursor, 0);
+    const HRESULT singleDragImageInitializationResult =
+        LastShellDragImageInitializationResultForTesting();
+
+    size_t singleCapturedFeedbackFrames = 0;
+    size_t maximumSingleGhostPixelChanges = 0;
+    size_t maximumSingleBlackTransitions = 0;
+    for (size_t frameIndex = 0;
+         frameIndex < kFeedbackFrameCount; ++frameIndex) {
+        if (!singleFeedbackFrameCaptured[frameIndex] ||
+            singleFeedbackBaseline.size() != capturePixelCount ||
+            singleFeedbackFrames[frameIndex].size() != capturePixelCount) {
+            continue;
+        }
+        ++singleCapturedFeedbackFrames;
+        size_t ghostChanges = 0;
+        size_t blackTransitions = 0;
+        for (LONG y = before.screenRect.top;
+             y < before.screenRect.bottom; ++y) {
+            const size_t row = static_cast<size_t>(
+                y - before.screenRect.top) * captureWidth;
+            for (LONG x = before.screenRect.left;
+                 x < before.screenRect.right; ++x) {
+                const size_t pixelIndex = row + static_cast<size_t>(
+                    x - before.screenRect.left);
+                const std::uint32_t first =
+                    singleFeedbackBaseline[pixelIndex];
+                const std::uint32_t second =
+                    singleFeedbackFrames[frameIndex][pixelIndex];
+                const int firstBlue = first & 0xFF;
+                const int firstGreen = (first >> 8) & 0xFF;
+                const int firstRed = (first >> 16) & 0xFF;
+                const int secondBlue = second & 0xFF;
+                const int secondGreen = (second >> 8) & 0xFF;
+                const int secondRed = (second >> 16) & 0xFF;
+                const int channelDifference =
+                    std::abs(firstRed - secondRed) +
+                    std::abs(firstGreen - secondGreen) +
+                    std::abs(firstBlue - secondBlue);
+                if (x >= expectedSingleGhostRect.left &&
+                    x < expectedSingleGhostRect.right &&
+                    y >= expectedSingleGhostRect.top &&
+                    y < expectedSingleGhostRect.bottom &&
+                    channelDifference >= 12) {
+                    ++ghostChanges;
+                }
+                if (firstRed + firstGreen + firstBlue >= 150 &&
+                    secondRed + secondGreen + secondBlue <= 24) {
+                    ++blackTransitions;
+                }
+            }
+        }
+        maximumSingleGhostPixelChanges = (std::max)(
+            maximumSingleGhostPixelChanges, ghostChanges);
+        maximumSingleBlackTransitions = (std::max)(
+            maximumSingleBlackTransitions, blackTransitions);
+    }
+    const size_t singleGhostRectArea = static_cast<size_t>(
+        expectedSingleGhostRect.right - expectedSingleGhostRect.left) *
+        static_cast<size_t>(
+            expectedSingleGhostRect.bottom - expectedSingleGhostRect.top);
+    const size_t minimumSingleGhostChanges = (std::max)(
+        static_cast<size_t>(80), singleGhostRectArea / 100);
+    const bool singleDragGhostVisible = singleBaselineReady &&
+        singleCapturedFeedbackFrames == kFeedbackFrameCount &&
+        maximumSingleGhostPixelChanges >= minimumSingleGhostChanges;
+    const bool singleNoBlackFrame = singleBaselineReady &&
+        singleCapturedFeedbackFrames == kFeedbackFrameCount &&
+        maximumSingleBlackTransitions < capturePixelCount / 20;
+    const auto cancelAfterA =
+        DesktopSurfaceWindowSmokeAccess::VisibleScreenPointForIdentity(
+            surface, markerA);
+    const auto cancelAfterB =
+        DesktopSurfaceWindowSmokeAccess::VisibleScreenPointForIdentity(
+            surface, markerB);
+    const size_t singleShellDragAfter =
+        DesktopSurfaceWindowSmokeAccess::ShellDragStartCount(surface);
+    const bool singleCancelStable =
+        cancelBeforeA.has_value() && cancelAfterA.has_value() &&
+        cancelBeforeB.has_value() && cancelAfterB.has_value() &&
+        cancelBeforeA->x == cancelAfterA->x &&
+        cancelBeforeA->y == cancelAfterA->y &&
+        cancelBeforeB->x == cancelAfterB->x &&
+        cancelBeforeB->y == cancelAfterB->y;
+    const bool singleCancelPassed = singleInputSucceeded.load() &&
+        singleShellDragAfter == singleShellDragBefore + 1 &&
+        singleDragGhostVisible && singleNoBlackFrame && singleCancelStable;
+    if (!singleDragGhostVisible || !singleNoBlackFrame) {
+        SaveCapturedPixelsBmp(
+            before.screenRect,
+            singleFeedbackBaseline,
+            resultRoot / L"desktop-single-drag-feedback-baseline.bmp");
+        for (size_t index = 0; index < kFeedbackFrameCount; ++index) {
+            if (singleFeedbackFrameCaptured[index]) {
+                SaveCapturedPixelsBmp(
+                    before.screenRect,
+                    singleFeedbackFrames[index],
+                    resultRoot /
+                        (L"desktop-single-drag-feedback-held-" +
+                         std::to_wstring(index) + L".bmp"));
+            }
+        }
+    }
+
+    const auto displayedAfterA =
+        DesktopSurfaceWindowSmokeAccess::VisibleScreenPointForIdentity(
+            surface, markerA);
+    const auto displayedAfterB =
+        DesktopSurfaceWindowSmokeAccess::VisibleScreenPointForIdentity(
+            surface, markerB);
+    const bool displayPersisted =
+        ConfigStore::DrainPendingWrites(5000);
+    const AppConfig persistedDisplayConfig =
+        displayStore.LoadAppConfig();
+
+    DesktopViewSnapshot after;
+    std::vector<DesktopPosition> positionsAfter;
+    DWORD flagsAfter = 0;
+    const bool capturedAfter =
+        layout.CaptureViewSnapshot(after, errorMessage) &&
+        layout.CaptureAllPositions(positionsAfter, errorMessage) &&
+        layout.CaptureViewFlags(flagsAfter, errorMessage);
+    surface.Close();
+
+    const auto findPosition = [](
+        const std::vector<DesktopPosition>& positions,
+        const std::wstring& path) {
+        return std::find_if(
+            positions.begin(), positions.end(),
+            [&](const DesktopPosition& position) {
+                return CompareStringOrdinal(
+                    position.path.c_str(), -1, path.c_str(), -1, TRUE) ==
+                    CSTR_EQUAL;
+            });
+    };
+    const auto beforeA = findPosition(positionsBefore, markerA);
+    const auto beforeB = findPosition(positionsBefore, markerB);
+    bool underlyingPositionsStable = capturedAfter &&
+        positionsBefore.size() == positionsAfter.size();
+    for (const DesktopPosition& position : positionsBefore) {
+        const auto current = findPosition(positionsAfter, position.path);
+        if (current == positionsAfter.end() ||
+            current->point.x != position.point.x ||
+            current->point.y != position.point.y) {
+            underlyingPositionsStable = false;
+            break;
+        }
+    }
+    const bool groupMoved = beforeA != positionsBefore.end() &&
+        beforeB != positionsBefore.end() &&
+        displayedAfterA.has_value() && displayedAfterB.has_value() &&
+        (displayedAfterA->x != beforeA->point.x ||
+         displayedAfterA->y != beforeA->point.y) &&
+        displayedAfterA->x - beforeA->point.x ==
+            displayedAfterB->x - beforeB->point.x &&
+        displayedAfterA->y - beforeA->point.y ==
+            displayedAfterB->y - beforeB->point.y;
+    const auto findDisplayPlacement = [](
+        const AppConfig& config,
+        const std::wstring& identity) {
+        return std::find_if(
+            config.desktopDisplayLayout.begin(),
+            config.desktopDisplayLayout.end(),
+            [&](const DesktopPlacementConfig& value) {
+                return CompareStringOrdinal(
+                           value.path.c_str(), -1,
+                           identity.c_str(), -1, TRUE) == CSTR_EQUAL;
+            });
+    };
+    const auto persistedA = findDisplayPlacement(
+        persistedDisplayConfig, markerA);
+    const auto persistedB = findDisplayPlacement(
+        persistedDisplayConfig, markerB);
+    const bool persistedCoordinatesValid = displayPersisted &&
+        committedViewPositions.size() == 2 &&
+        persistedA !=
+            persistedDisplayConfig.desktopDisplayLayout.end() &&
+        persistedB !=
+            persistedDisplayConfig.desktopDisplayLayout.end();
+    std::vector<DesktopPosition> persistedPositions;
+    persistedPositions.reserve(
+        persistedDisplayConfig.desktopDisplayLayout.size());
+    for (const DesktopPlacementConfig& placement :
+         persistedDisplayConfig.desktopDisplayLayout) {
+        persistedPositions.push_back(DesktopPosition{
+            placement.path,
+            POINT{placement.x, placement.y}});
+    }
+    bool restartDisplayStable = false;
+    DesktopSurfaceWindow restartSurface(instance);
+    if (persistedCoordinatesValid &&
+        restartSurface.Create(assigned, errorMessage)) {
+        restartSurface.UpdateDisplayPositions(persistedPositions);
+        restartSurface.Show();
+        pumpFor(250);
+        const auto restartedA =
+            DesktopSurfaceWindowSmokeAccess::VisibleScreenPointForIdentity(
+                restartSurface, markerA);
+        const auto restartedB =
+            DesktopSurfaceWindowSmokeAccess::VisibleScreenPointForIdentity(
+                restartSurface, markerB);
+        restartDisplayStable =
+            restartedA.has_value() && restartedB.has_value() &&
+            displayedAfterA.has_value() && displayedAfterB.has_value() &&
+            restartedA->x == displayedAfterA->x &&
+            restartedA->y == displayedAfterA->y &&
+            restartedB->x == displayedAfterB->x &&
+            restartedB->y == displayedAfterB->y;
+        restartSurface.Close();
+        pumpFor(80);
+    }
+    const auto snapshotIdentities = [](const DesktopViewSnapshot& snapshot) {
+        std::vector<std::wstring> identities;
+        identities.reserve(snapshot.items.size());
+        for (const DesktopViewItem& item : snapshot.items) {
+            std::wstring identity = item.path;
+            std::transform(
+                identity.begin(), identity.end(), identity.begin(),
+                [](wchar_t value) {
+                    return static_cast<wchar_t>(std::towlower(value));
+                });
+            identities.push_back(std::move(identity));
+        }
+        std::sort(identities.begin(), identities.end());
+        return identities;
+    };
+    const bool shellItemsStable = capturedAfter &&
+        snapshotIdentities(before) == snapshotIdentities(after);
+    const bool endpointsStable =
+        SameStableFileIdentity(identityA, ReadStableFileIdentity(markerA)) &&
+        SameStableFileIdentity(identityB, ReadStableFileIdentity(markerB)) &&
+        bytesA == ReadFileBytes(markerA) &&
+        bytesB == ReadFileBytes(markerB) &&
+        entriesBefore == directoryEntries() && shellItemsStable;
+    const bool dragPassed = inputSucceeded.load() && capturedAfter &&
+        dragCompositeReady && dragGhostVisible && noBlackFrame &&
+        multiShellDragStarted && singleCancelPassed &&
+        flagsAfter == before.viewFlags && groupMoved &&
+        underlyingPositionsStable && endpointsStable &&
+        persistedCoordinatesValid && restartDisplayStable;
+
+    Sleep(120);
+    std::vector<DesktopPosition> stableOnce;
+    std::vector<DesktopPosition> stableTwice;
+    const bool stabilityCaptured =
+        layout.CaptureAllPositions(stableOnce, errorMessage) &&
+        (Sleep(80), layout.CaptureAllPositions(
+            stableTwice, errorMessage));
+    const auto samePositions = [](const auto& left, const auto& right) {
+        if (left.size() != right.size()) return false;
+        return std::all_of(left.begin(), left.end(),
+            [&](const DesktopPosition& expected) {
+                const auto actual = std::find_if(
+                    right.begin(), right.end(),
+                    [&](const DesktopPosition& candidate) {
+                        return CompareStringOrdinal(
+                            candidate.path.c_str(), -1,
+                            expected.path.c_str(), -1, TRUE) ==
+                                CSTR_EQUAL;
+                    });
+                return actual != right.end() &&
+                    actual->point.x == expected.point.x &&
+                    actual->point.y == expected.point.y;
+            });
+    };
+    const bool nativeStableTwice =
+        stabilityCaptured &&
+        samePositions(positionsBefore, stableOnce) &&
+        samePositions(stableOnce, stableTwice);
+    const bool passed = dragPassed && nativeStableTwice;
+    result << "REAL_MARQUEE_SELECTED_TWO=" << marqueePassed << "\n";
+    result << "INTERNAL_DRAG_STARTED="
+           << multiShellDragStarted << "\n";
+    result << "DRAG_COMPOSITE_READY=" << dragCompositeReady << "\n";
+    result << "DRAG_IMAGE_INIT_HRESULT="
+           << multiDragImageInitializationResult << "\n";
+    result << "DRAG_FEEDBACK_FRAMES=" << capturedFeedbackFrames << "\n";
+    result << "DRAG_GHOST_VISIBLE=" << dragGhostVisible << "\n";
+    result << "DRAG_GHOST_CHANGED_PIXELS="
+           << maximumGhostPixelChanges << "\n";
+    result << "DRAG_GHOST_MINIMUM_PIXELS="
+           << minimumGhostChanges << "\n";
+    result << "NO_BLACK_FRAME=" << noBlackFrame << "\n";
+    result << "MAX_BLACK_TRANSITION_PIXELS="
+           << maximumBlackTransitions << "\n";
+    result << "SINGLE_SELECTION_READY=" << singleSelectionReady << "\n";
+    result << "SINGLE_DRAG_COMPOSITE_READY="
+           << singleCompositeReady << "\n";
+    result << "SINGLE_DRAG_IMAGE_INIT_HRESULT="
+           << singleDragImageInitializationResult << "\n";
+    result << "SINGLE_DRAG_FEEDBACK_FRAMES="
+           << singleCapturedFeedbackFrames << "\n";
+    result << "SINGLE_DRAG_GHOST_VISIBLE="
+           << singleDragGhostVisible << "\n";
+    result << "SINGLE_DRAG_GHOST_CHANGED_PIXELS="
+           << maximumSingleGhostPixelChanges << "\n";
+    result << "SINGLE_DRAG_GHOST_MINIMUM_PIXELS="
+           << minimumSingleGhostChanges << "\n";
+    result << "SINGLE_NO_BLACK_FRAME=" << singleNoBlackFrame << "\n";
+    result << "SINGLE_MAX_BLACK_TRANSITION_PIXELS="
+           << maximumSingleBlackTransitions << "\n";
+    result << "SINGLE_ESC_CANCEL_POSITION_STABLE="
+           << singleCancelStable << "\n";
+    result << "SINGLE_INPUT_SUCCEEDED="
+           << singleInputSucceeded.load() << "\n";
+    result << "SINGLE_DRAG_STARTED="
+           << (singleShellDragAfter == singleShellDragBefore + 1) << "\n";
+    result << "SINGLE_DRAG_COUNT_BEFORE="
+           << singleShellDragBefore << "\n";
+    result << "SINGLE_DRAG_COUNT_AFTER="
+           << singleShellDragAfter << "\n";
+    result << "SINGLE_ESC_CANCEL_PASSED="
+           << singleCancelPassed << "\n";
+    result << "GROUP_MOVED_WITH_RELATIVE_GEOMETRY=" << groupMoved << "\n";
+    result << "NO_NEW_FILES_OR_SHORTCUTS=" << endpointsStable << "\n";
+    result << "SHELL_IDENTITY_SET_STABLE=" << shellItemsStable << "\n";
+    result << "EXPLORER_POSITIONS_FLAGS_UNCHANGED="
+           << (underlyingPositionsStable &&
+               flagsAfter == before.viewFlags) << "\n";
+    result << "DISPLAY_LAYOUT_PERSISTED=" <<
+        persistedCoordinatesValid << "\n";
+    result << "RESTART_DISPLAY_LAYOUT_STABLE=" <<
+        restartDisplayStable << "\n";
+    result << "NATIVE_LAYOUT_STABLE_TWICE=" <<
+        nativeStableTwice << "\n";
+    result << "STATUS=" << (passed ? "PASS" : "FAIL") << "\n";
+    return passed ? 0 : 210;
+}
+
 int RunSmokeWidgetInteraction(HINSTANCE instance) {
     AttachParentConsole();
     SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -2357,20 +5476,16 @@ int RunSmokeWidgetInteraction(HINSTANCE instance) {
         (L"widget-interaction-" + std::to_wstring(GetCurrentProcessId()));
     const std::filesystem::path dataRoot = testRoot / L"Data";
     const std::filesystem::path desktopRoot = testRoot / L"Desktop";
-    const std::filesystem::path managedRoot = dataRoot / L"ManagedShortcuts";
-    const std::filesystem::path uncategorizedRoot = managedRoot / L"未分类";
-    const std::filesystem::path categoryRoot = managedRoot / L"交互测试";
     std::error_code fileError;
-    std::filesystem::create_directories(uncategorizedRoot, fileError);
-    std::filesystem::create_directories(categoryRoot, fileError);
+    std::filesystem::create_directories(dataRoot, fileError);
     std::filesystem::create_directories(desktopRoot, fileError);
     if (fileError) {
         std::wcerr << L"Widget interaction directories failed\n";
         return 1;
     }
-    const std::filesystem::path uncategorizedPath = uncategorizedRoot / L"未分类.txt";
-    const std::filesystem::path firstPath = categoryRoot / L"第一项.txt";
-    const std::filesystem::path secondPath = categoryRoot / L"第二项.txt";
+    const std::filesystem::path uncategorizedPath = desktopRoot / L"未分类.txt";
+    const std::filesystem::path firstPath = desktopRoot / L"第一项.txt";
+    const std::filesystem::path secondPath = desktopRoot / L"第二项.txt";
     {
         std::ofstream file(uncategorizedPath, std::ios::binary);
         file << "uncategorized";
@@ -2417,9 +5532,15 @@ int RunSmokeWidgetInteraction(HINSTANCE instance) {
     config.uncategorizedName = L"未分类";
     config.uncategorizedStorageFolder = L"未分类";
     config.uncategorizedItemIds = {L"widget-uncategorized"};
-    config.items.push_back(ItemConfig{L"widget-uncategorized", uncategorizedPath.wstring(), L"未分类项"});
-    config.items.push_back(ItemConfig{L"widget-first", firstPath.wstring(), L"第一项"});
-    config.items.push_back(ItemConfig{L"widget-second", secondPath.wstring(), L"第二项"});
+    ItemConfig uncategorizedItem{L"widget-uncategorized", uncategorizedPath.wstring(), L"未分类项"};
+    uncategorizedItem.originalDesktopPath = uncategorizedPath.wstring();
+    config.items.push_back(std::move(uncategorizedItem));
+    ItemConfig firstItem{L"widget-first", firstPath.wstring(), L"第一项"};
+    firstItem.originalDesktopPath = firstPath.wstring();
+    config.items.push_back(std::move(firstItem));
+    ItemConfig secondItem{L"widget-second", secondPath.wstring(), L"第二项"};
+    secondItem.originalDesktopPath = secondPath.wstring();
+    config.items.push_back(std::move(secondItem));
     for (int index = 0; index < 219; ++index) {
         config.desktopLayout.push_back(DesktopPlacementConfig{
             (desktopRoot / (L"交互性能规模填充-" + std::to_wstring(index) +
@@ -2771,9 +5892,10 @@ int RunSmokeWidgetInteraction(HINSTANCE instance) {
     const std::optional<std::string> configAfterUpdateExit =
         ReadFileBytes(configStore.ConfigPath());
     if (!configAfterUpdateExit.has_value() ||
-        *configAfterUpdateExit != *configBeforeUpdateExit) {
+        *configAfterUpdateExit != *configBeforeUpdateExit ||
+        std::filesystem::exists(dataRoot / L"ManagedShortcuts")) {
         return fail(
-            L"Update exit changed layout, settings, category membership, or item order",
+            L"Update exit changed original-path state or created ManagedShortcuts",
             50);
     }
 
@@ -2811,15 +5933,11 @@ int RunSmokeWidgetNormalExit(HINSTANCE instance) {
     const std::filesystem::path desktopRoot = testRoot / L"Desktop";
     const std::wstring categoryName =
         L"正常退出恢复测试-" + std::to_wstring(GetCurrentProcessId());
-    const std::filesystem::path managedRoot =
-        dataRoot / L"ManagedShortcuts" / categoryName;
-    const std::filesystem::path managedPath = managedRoot / L"退出恢复.txt";
-    const std::filesystem::path desktopPath = desktopRoot / managedPath.filename();
+    const std::filesystem::path desktopPath = desktopRoot / L"退出原路径保持.txt";
     const std::filesystem::path staleLayoutPath =
         desktopRoot / L"已经不存在的历史桌面项.lnk";
     std::error_code fileError;
     std::filesystem::create_directories(configRoot, fileError);
-    std::filesystem::create_directories(managedRoot, fileError);
     std::filesystem::create_directories(desktopRoot, fileError);
 
     const auto cleanup = [&]() {
@@ -2839,8 +5957,8 @@ int RunSmokeWidgetNormalExit(HINSTANCE instance) {
         return fail(L"Widget normal-exit smoke setup failed", 81);
     }
     {
-        std::ofstream fixture(managedPath, std::ios::binary);
-        fixture << "isolated widget normal-exit restore fixture";
+        std::ofstream fixture(desktopPath, std::ios::binary);
+        fixture << "isolated widget normal-exit original-path fixture";
         if (!fixture) {
             return fail(L"Widget normal-exit fixture creation failed", 82);
         }
@@ -2867,7 +5985,7 @@ int RunSmokeWidgetNormalExit(HINSTANCE instance) {
     config.uncategorizedItemIds = {L"widget-normal-exit-item"};
     ItemConfig item;
     item.id = L"widget-normal-exit-item";
-    item.path = managedPath.wstring();
+    item.path = desktopPath.wstring();
     item.displayName = L"退出恢复";
     item.originalDesktopPath = desktopPath.wstring();
     config.items.push_back(item);
@@ -2879,6 +5997,18 @@ int RunSmokeWidgetNormalExit(HINSTANCE instance) {
     if (!configStore.SaveAppConfig(config)) {
         return fail(L"Widget normal-exit config save failed", 84);
     }
+    const auto identityBefore = ReadStableFileIdentity(desktopPath);
+    const auto bytesBefore = ReadFileBytes(desktopPath.wstring());
+    const auto countTopLevel = [](const std::filesystem::path& directory) {
+        size_t count = 0;
+        std::error_code error;
+        for (std::filesystem::directory_iterator it(directory, error), end;
+             !error && it != end; it.increment(error)) {
+            ++count;
+        }
+        return error ? static_cast<size_t>(-1) : count;
+    };
+    const size_t desktopCountBefore = countTopLevel(desktopRoot);
 
     App app(instance);
     if (!app.InitializeForIsolatedSmoke(SW_SHOWNOACTIVATE)) {
@@ -2940,21 +6070,23 @@ int RunSmokeWidgetNormalExit(HINSTANCE instance) {
     if (exitElapsedMilliseconds >= 2000) {
         return fail(L"Normal exit waited for a missing historical desktop item", 93);
     }
-    if (std::filesystem::exists(managedPath) ||
-        !std::filesystem::exists(desktopPath)) {
-        return fail(L"Normal exit did not restore the managed item", 89);
+    if (!SameStableFileIdentity(identityBefore, ReadStableFileIdentity(desktopPath)) ||
+        !std::filesystem::exists(desktopPath) ||
+        std::filesystem::exists(dataRoot / L"ManagedShortcuts") ||
+        countTopLevel(desktopRoot) != desktopCountBefore) {
+        return fail(L"Normal exit changed the original desktop item or created managed storage", 89);
     }
     const std::optional<std::string> restoredBytes =
         ReadFileBytes(desktopPath.wstring());
-    if (!restoredBytes.has_value() ||
-        *restoredBytes != "isolated widget normal-exit restore fixture") {
-        return fail(L"Normal exit changed the restored item", 90);
+    if (!restoredBytes.has_value() || restoredBytes != bytesBefore) {
+        return fail(L"Normal exit changed the original item contents", 90);
     }
     const AppConfig restoredConfig = configStore.LoadAppConfig();
     if (restoredConfig.items.size() != 1 ||
         restoredConfig.items.front().path != desktopPath.wstring() ||
         restoredConfig.items.front().originalDesktopPath != desktopPath.wstring() ||
-        std::any_of(
+        restoredConfig.uncategorizedItemIds != config.uncategorizedItemIds ||
+        !std::any_of(
             restoredConfig.desktopLayout.begin(),
             restoredConfig.desktopLayout.end(),
             [&](const DesktopPlacementConfig& placement) {
@@ -2963,7 +6095,7 @@ int RunSmokeWidgetNormalExit(HINSTANCE instance) {
                            staleLayoutPath.c_str(), -1,
                            TRUE) == CSTR_EQUAL;
             })) {
-        return fail(L"Normal exit did not commit the restored item path", 91);
+        return fail(L"Normal exit changed item ownership, order, path, or existing layout metadata", 91);
     }
     if (std::filesystem::exists(
             dataRoot / L"ManagedShortcuts" / L"move-journal.bin")) {
@@ -2971,7 +6103,7 @@ int RunSmokeWidgetNormalExit(HINSTANCE instance) {
     }
 
     cleanup();
-    std::wcout << L"Widget exit request stayed asynchronous, ignored stale layout, and restored the managed item in "
+    std::wcout << L"Widget exit request stayed asynchronous and preserved the original desktop item, File ID, contents, count, ownership, order, and layout metadata in "
                << exitElapsedMilliseconds << L" ms\n";
     return 0;
 }
@@ -3008,13 +6140,10 @@ int RunSmokeWidgetDropLatency(HINSTANCE instance) {
     const std::wstring categoryId = L"widget-drop-latency-category";
     const std::wstring categoryName =
         L"拖放延迟隔离测试-" + std::to_wstring(GetCurrentProcessId());
-    const std::filesystem::path managedRoot =
-        dataRoot / L"ManagedShortcuts" / categoryName;
-    const std::filesystem::path managedPath = managedRoot / L"延迟测试.txt";
-    const std::filesystem::path desktopPath = desktopRoot / managedPath.filename();
+    const std::filesystem::path desktopPath = desktopRoot / L"延迟测试.txt";
     std::error_code fileError;
     std::filesystem::create_directories(configRoot, fileError);
-    std::filesystem::create_directories(managedRoot, fileError);
+    std::filesystem::create_directories(dataRoot, fileError);
     std::filesystem::create_directories(desktopRoot, fileError);
 
     WidgetWindow* widgetForCleanup = nullptr;
@@ -3043,12 +6172,17 @@ int RunSmokeWidgetDropLatency(HINSTANCE instance) {
         return fail(L"Widget drop latency smoke setup failed", 51);
     }
     {
-        std::ofstream file(managedPath, std::ios::binary);
+        std::ofstream file(desktopPath, std::ios::binary);
         file << "isolated widget drop latency fixture";
         if (!file) {
             return fail(L"Widget drop latency fixture creation failed", 52);
         }
     }
+    const auto originalIdentity = ReadStableFileIdentity(desktopPath);
+    const auto originalBytes = ReadFileBytes(desktopPath.wstring());
+    const size_t originalDesktopCount = static_cast<size_t>(std::distance(
+        std::filesystem::directory_iterator(desktopRoot),
+        std::filesystem::directory_iterator{}));
 
     HMONITOR monitor = MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTONEAREST);
     MONITORINFOEXW monitorInfo{};
@@ -3062,7 +6196,7 @@ int RunSmokeWidgetDropLatency(HINSTANCE instance) {
     config.settings.singleClickOpen = false;
     ItemConfig item;
     item.id = L"widget-drop-latency-item";
-    item.path = managedPath.wstring();
+    item.path = desktopPath.wstring();
     item.displayName = L"延迟测试";
     item.originalDesktopPath = desktopPath.wstring();
     config.items.push_back(item);
@@ -3221,7 +6355,7 @@ int RunSmokeWidgetDropLatency(HINSTANCE instance) {
         CompareStringOrdinal(
             ownerState.request.sourcePath.c_str(),
             -1,
-            managedPath.c_str(),
+            desktopPath.c_str(),
             -1,
             TRUE) != CSTR_EQUAL ||
         CompareStringOrdinal(
@@ -3260,8 +6394,15 @@ int RunSmokeWidgetDropLatency(HINSTANCE instance) {
             L"Widget drop latency background transaction failed: " + commitError,
             73);
     }
-    if (std::filesystem::exists(managedPath) || !std::filesystem::exists(desktopPath)) {
-        return fail(L"Widget drop latency fixture was not moved to the isolated desktop", 67);
+    const size_t finalDesktopCount = static_cast<size_t>(std::distance(
+        std::filesystem::directory_iterator(desktopRoot),
+        std::filesystem::directory_iterator{}));
+    if (!SameStableFileIdentity(
+            originalIdentity, ReadStableFileIdentity(desktopPath)) ||
+        originalBytes != ReadFileBytes(desktopPath.wstring()) ||
+        finalDesktopCount != originalDesktopCount ||
+        std::filesystem::exists(dataRoot / L"ManagedShortcuts")) {
+        return fail(L"Widget drop latency changed the original-path fixture", 67);
     }
     const AppConfig persisted = configStore.LoadAppConfig();
     const bool itemStillRegistered = std::any_of(
@@ -3434,6 +6575,8 @@ int RunSmokeWidgetDropPlacement(HINSTANCE instance) {
         L"拖放落点隔离测试-" + std::to_wstring(GetCurrentProcessId());
     const std::filesystem::path managedRoot =
         dataRoot / L"ManagedShortcuts" / categoryName;
+    const std::filesystem::path referenceRoot =
+        dataRoot / L"ReferenceFixtures";
 
     WidgetWindow* widgetForCleanup = nullptr;
     HWND ownerWindow = nullptr;
@@ -3469,23 +6612,24 @@ int RunSmokeWidgetDropPlacement(HINSTANCE instance) {
 
     std::error_code fileError;
     for (const std::filesystem::path& directory :
-         std::array<std::filesystem::path, 4>{
-             configRoot, dataRoot, desktopRoot, managedRoot}) {
+         std::array<std::filesystem::path, 5>{
+             configRoot, dataRoot, desktopRoot, managedRoot, referenceRoot}) {
         std::filesystem::create_directories(directory, fileError);
         if (fileError) {
             return fail(L"Widget drop placement directory setup failed", 85);
         }
     }
     if (!SetEnvironmentVariableW(L"DESKTOP_ORGANIZER_CONFIG_DIR", configRoot.c_str()) ||
-        !SetEnvironmentVariableW(L"DESKTOP_ORGANIZER_DATA_DIR", dataRoot.c_str())) {
+        !SetEnvironmentVariableW(L"DESKTOP_ORGANIZER_DATA_DIR", dataRoot.c_str()) ||
+        !SetEnvironmentVariableW(L"DESKTOP_ORGANIZER_DESKTOP_DIR", desktopRoot.c_str())) {
         return fail(L"Widget drop placement environment setup failed", 85);
     }
 
     const std::array<std::filesystem::path, 4> basePaths{
-        managedRoot / L"A.txt",
-        managedRoot / L"B.txt",
-        managedRoot / L"C.txt",
-        managedRoot / L"D.txt",
+        referenceRoot / L"A.txt",
+        referenceRoot / L"B.txt",
+        referenceRoot / L"C.txt",
+        referenceRoot / L"D.txt",
     };
     const std::array<std::filesystem::path, 4> incomingPaths{
         desktopRoot / L"N1.txt",
@@ -3498,7 +6642,7 @@ int RunSmokeWidgetDropPlacement(HINSTANCE instance) {
     const std::filesystem::path collisionManagedPath =
         managedRoot / collisionOriginalPath.filename();
     for (size_t index = 0; index < basePaths.size(); ++index) {
-        if (!writeFixture(basePaths[index], "managed base fixture")) {
+        if (!writeFixture(basePaths[index], "reference base fixture")) {
             return fail(L"Widget drop placement base fixture creation failed", 85);
         }
     }
@@ -3731,10 +6875,17 @@ int RunSmokeWidgetDropPlacement(HINSTANCE instance) {
     const std::uint64_t gridGenerationBefore =
         WidgetWindowSmokeAccess::GridItemsGeneration(widget);
     const ULONGLONG dropStartedAt = GetTickCount64();
-    if (!WidgetWindowSmokeAccess::QueuePaths(
+    const std::vector<std::pair<std::wstring, POINT>> incomingDesktopPositions{
+        {incomingPaths[0].wstring(), POINT{40, 40}},
+        {incomingPaths[1].wstring(), POINT{120, 40}},
+        {incomingPaths[2].wstring(), POINT{200, 40}},
+        {incomingPaths[3].wstring(), POINT{280, 40}},
+    };
+    if (!WidgetWindowSmokeAccess::QueuePathsWithDesktopPositions(
             widget,
             dropPaths,
-            insertionPoint)) {
+            insertionPoint,
+            incomingDesktopPositions)) {
         return fail(L"Widget drop placement batch queue returned false", 87);
     }
     const ULONGLONG queueDurationMs = GetTickCount64() - dropStartedAt;
@@ -3807,6 +6958,12 @@ int RunSmokeWidgetDropPlacement(HINSTANCE instance) {
             0,
             reinterpret_cast<LPARAM>(&result));
         if (!result.succeeded) {
+            std::ofstream diagnostic(
+                std::filesystem::path(baseValue) /
+                    L"widget-drop-placement-error.txt",
+                std::ios::trunc);
+            diagnostic << "index=" << index << "\nerror="
+                       << Utf8Text(result.errorMessage) << "\n";
             return fail(
                 L"Widget drop placement atomic background transaction failed: " +
                     result.errorMessage,
@@ -3867,7 +7024,9 @@ int RunSmokeWidgetDropPlacement(HINSTANCE instance) {
         std::vector<const ItemConfig*> matches;
         for (const ItemConfig& item : persisted.items) {
             if (samePath(item.path, incomingPaths[index].wstring()) &&
-                item.originalDesktopPath.empty()) {
+                samePath(
+                    item.originalDesktopPath,
+                    incomingPaths[index].wstring())) {
                 matches.push_back(&item);
             }
         }
@@ -3923,7 +7082,9 @@ int RunSmokeWidgetDropPlacement(HINSTANCE instance) {
         if (configCount != 1 || categoryCount != 1 ||
             registered == persisted.items.end() ||
             !samePath(registered->path, incomingPaths[index].wstring()) ||
-            !registered->originalDesktopPath.empty() ||
+            !samePath(
+                registered->originalDesktopPath,
+                incomingPaths[index].wstring()) ||
             !std::filesystem::exists(incomingPaths[index]) ||
             std::filesystem::exists(
                 managedRoot / incomingPaths[index].filename()) ||
@@ -4013,6 +7174,7 @@ int RunSmokeWidgetDropPlacement(HINSTANCE instance) {
     collisionItem.id = collisionId;
     collisionItem.path = collisionManagedPath.wstring();
     collisionItem.displayName = L"旧托管项";
+    collisionItem.originalDesktopPath = collisionOriginalPath.wstring();
     persisted.items.push_back(collisionItem);
     persistedCategory = std::find_if(
         persisted.categories.begin(),
@@ -4059,10 +7221,11 @@ int RunSmokeWidgetDropPlacement(HINSTANCE instance) {
     };
     const int collectionRequestCountBeforeCollision =
         ownerState.collectionRequestCount;
-    if (!WidgetWindowSmokeAccess::QueuePaths(
+    if (!WidgetWindowSmokeAccess::QueuePathsWithDesktopPositions(
             widget,
             collisionDropPaths,
-            collisionInsertionPoint)) {
+            collisionInsertionPoint,
+            {{collisionOriginalPath.wstring(), POINT{360, 40}}})) {
         return fail(L"Widget drop placement reappeared-path queue returned false", 120);
     }
     if (!WidgetWindowSmokeAccess::DispatchQueuedDrop(widget)) {
@@ -4153,8 +7316,12 @@ int RunSmokeWidgetDropPlacement(HINSTANCE instance) {
         newCollisionIds.size() != 1 ||
         oldCollisionItem == collisionPersisted.items.end() ||
         newCollisionItem == collisionPersisted.items.end() ||
-        !oldCollisionItem->originalDesktopPath.empty() ||
-        !newCollisionItem->originalDesktopPath.empty() ||
+        !samePath(
+            oldCollisionItem->originalDesktopPath,
+            collisionOriginalPath.wstring()) ||
+        !samePath(
+            newCollisionItem->originalDesktopPath,
+            collisionOriginalPath.wstring()) ||
         std::count(
             collisionCategory->itemIds.begin(),
             collisionCategory->itemIds.end(),
@@ -4257,7 +7424,7 @@ int RunDialogPreview(HINSTANCE instance) {
     MessageDialog::Show(
         instance,
         nullptr,
-        L"解散格子后，其中的桌面项目会移回原桌面位置。\n\n这个操作不会删除任何文件，是否继续？",
+        L"解散格子后，其中项目会取消格子显示归属并重新显示在桌面；原件路径不会改变。\n\n是否继续？",
         L"确认解散",
         MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2);
     return 0;
@@ -4645,6 +7812,244 @@ int RunSmokeRealDesktopSessionRestore() {
     return passed ? 0 : 26;
 }
 
+int RunSmokeRealDesktopTakeoverInvariants(HINSTANCE instance) {
+    AttachParentConsole();
+    const auto environmentValue = [](const wchar_t* name) {
+        const DWORD required = GetEnvironmentVariableW(name, nullptr, 0);
+        if (required == 0) return std::wstring{};
+        std::wstring value(required, L'\0');
+        const DWORD copied = GetEnvironmentVariableW(name, value.data(), required);
+        if (copied == 0 || copied >= required) return std::wstring{};
+        value.resize(copied);
+        return value;
+    };
+    ConfigStore configStore;
+    ManagedShortcutStore managedStore;
+    DesktopLayout layout;
+    const std::filesystem::path configDirectory =
+        std::filesystem::path(configStore.ConfigPath()).parent_path();
+    std::ofstream result(
+        configDirectory / L"real-desktop-takeover-result.txt",
+        std::ios::trunc);
+    const std::wstring markerPath = environmentValue(L"LATTICE_REAL_DESKTOP_MARKER");
+    const std::wstring publicPath = environmentValue(L"LATTICE_REAL_PUBLIC_DESKTOP_ITEM");
+    const std::wstring dropSourcePath = environmentValue(L"LATTICE_REAL_DROP_SOURCE");
+    const std::wstring markerName = std::filesystem::path(markerPath).filename().wstring();
+    const DWORD publicAttributes = GetFileAttributesW(publicPath.c_str());
+    const DWORD sourceAttributes = GetFileAttributesW(dropSourcePath.c_str());
+    if (markerPath.empty() || publicPath.empty() ||
+        dropSourcePath.empty() ||
+        !managedStore.IsDesktopPath(markerPath) ||
+        !managedStore.IsPublicDesktopPath(publicPath) ||
+        markerName.rfind(L".lattice-grid-restart-", 0) != 0 ||
+        GetFileAttributesW(markerPath.c_str()) != INVALID_FILE_ATTRIBUTES ||
+        sourceAttributes == INVALID_FILE_ATTRIBUTES ||
+        (sourceAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0 ||
+        std::filesystem::path(dropSourcePath).filename() != markerName ||
+        publicAttributes == INVALID_FILE_ATTRIBUTES ||
+        (publicAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+        result << "INPUT_REJECTED=1\nSTATUS=FAIL\n";
+        return 30;
+    }
+
+    DesktopViewSnapshot dropSnapshot;
+    std::wstring errorMessage;
+    if (!layout.CaptureViewSnapshot(dropSnapshot, errorMessage)) {
+        result << "DROP_SNAPSHOT_FAILED=1\nSTATUS=FAIL\n";
+        return 31;
+    }
+    DesktopSurfaceWindow dropSurface(instance);
+    if (!dropSurface.Create({}, errorMessage)) {
+        result << "DROP_SURFACE_FAILED=1\nSTATUS=FAIL\n";
+        return 31;
+    }
+    Microsoft::WRL::ComPtr<IDataObject> dropData;
+    PIDLIST_ABSOLUTE absolute = nullptr;
+    HRESULT dropResult = SHParseDisplayName(
+        dropSourcePath.c_str(), nullptr, &absolute, 0, nullptr);
+    if (SUCCEEDED(dropResult) && absolute != nullptr) {
+        Microsoft::WRL::ComPtr<IShellFolder> parent;
+        PCUITEMID_CHILD child = nullptr;
+        dropResult = SHBindToParent(
+            absolute, IID_PPV_ARGS(parent.GetAddressOf()), &child);
+        if (SUCCEEDED(dropResult) && parent != nullptr && child != nullptr) {
+            dropResult = parent->GetUIObjectOf(
+                dropSurface.Window(), 1, &child, IID_IDataObject, nullptr,
+                reinterpret_cast<void**>(dropData.GetAddressOf()));
+        }
+        CoTaskMemFree(absolute);
+    }
+    IDropTarget* dropTarget = DesktopSurfaceWindowSmokeAccess::DropTarget(dropSurface);
+    POINTL dropPoint{
+        dropSnapshot.screenRect.right - 128,
+        dropSnapshot.screenRect.bottom - 128};
+    DWORD dropEffect = DROPEFFECT_COPY;
+    if (FAILED(dropResult) || dropData == nullptr || dropTarget == nullptr ||
+        FAILED(dropTarget->DragEnter(
+            dropData.Get(), MK_LBUTTON, dropPoint, &dropEffect)) ||
+        dropEffect == DROPEFFECT_NONE ||
+        FAILED(dropTarget->Drop(
+            dropData.Get(), 0, dropPoint, &dropEffect)) ||
+        dropEffect == DROPEFFECT_NONE) {
+        if (dropTarget != nullptr) {
+            dropTarget->DragLeave();
+        }
+        dropSurface.Close();
+        result << "NATIVE_BACKGROUND_DROP_FAILED=1\nSTATUS=FAIL\n";
+        return 31;
+    }
+    dropSurface.Close();
+
+    DesktopViewSnapshot before;
+    std::vector<DesktopPosition> positionsBefore;
+    const std::array<std::wstring, 2> expectedPaths{markerPath, publicPath};
+    bool captured = false;
+    for (int attempt = 0; attempt < 80; ++attempt) {
+        if (layout.CaptureViewSnapshot(before, errorMessage) &&
+            std::all_of(
+                expectedPaths.begin(), expectedPaths.end(),
+                [&](const std::wstring& expected) {
+                    return std::any_of(before.items.begin(), before.items.end(),
+                        [&](const DesktopViewItem& item) {
+                            return CompareStringOrdinal(item.path.c_str(), -1,
+                                expected.c_str(), -1, TRUE) == CSTR_EQUAL;
+                        });
+                })) {
+            captured = true;
+            break;
+        }
+        Sleep(25);
+    }
+    if (!captured || !layout.CaptureAllPositions(positionsBefore, errorMessage)) {
+        result << "SNAPSHOT_FAILED=1\nSTATUS=FAIL\n";
+        return 32;
+    }
+    POINT droppedPoint1{};
+    POINT droppedPoint2{};
+    const bool droppedPositionStable =
+        layout.CaptureScreenPosition(markerPath, droppedPoint1, errorMessage) &&
+        (Sleep(100), layout.CaptureScreenPosition(
+            markerPath, droppedPoint2, errorMessage)) &&
+        droppedPoint1.x == droppedPoint2.x && droppedPoint1.y == droppedPoint2.y;
+    const auto markerIdentity = ReadStableFileIdentity(markerPath);
+    const auto publicIdentity = ReadStableFileIdentity(publicPath);
+    const auto markerBytes = ReadFileBytes(markerPath);
+    const auto publicBytes = ReadFileBytes(publicPath);
+    const auto countTopLevel = [](const std::filesystem::path& directory) {
+        size_t count = 0;
+        std::error_code error;
+        for (std::filesystem::directory_iterator it(directory, error), end;
+             !error && it != end; it.increment(error)) ++count;
+        return error ? (std::numeric_limits<size_t>::max)() : count;
+    };
+    const std::filesystem::path userRoot = std::filesystem::path(markerPath).parent_path();
+    const std::filesystem::path publicRoot = std::filesystem::path(publicPath).parent_path();
+    const size_t userCount = countTopLevel(userRoot);
+    const size_t publicCount = countTopLevel(publicRoot);
+
+    AppConfig config;
+    config.settings.showPublicDesktopItems = true;
+    CategoryConfig category;
+    category.id = L"real-takeover";
+    category.name = L"真实原路径接管";
+    config.categories.push_back(category);
+    for (const DesktopPosition& position : positionsBefore) {
+        config.desktopLayout.push_back(
+            DesktopPlacementConfig{position.path, position.point.x, position.point.y});
+    }
+    if (!configStore.SaveAppConfig(config)) {
+        result << "CONFIG_SETUP_FAILED=1\nSTATUS=FAIL\n";
+        return 33;
+    }
+    DesktopCollectionItemRequest userRequest;
+    userRequest.categoryId = category.id;
+    userRequest.path = markerPath;
+    userRequest.insertionIndex = 0;
+    DesktopCollectionItemRequest publicRequest = userRequest;
+    publicRequest.path = publicPath;
+    publicRequest.insertionIndex = 1;
+    const DesktopCollectionItemResult userCollected =
+        CommitDesktopCollectionItemTransaction(userRequest);
+    const DesktopCollectionItemResult publicCollected =
+        CommitDesktopCollectionItemTransaction(publicRequest);
+    if (!userCollected.succeeded || !publicCollected.succeeded ||
+        CompareStringOrdinal(userCollected.destinationPath.c_str(), -1,
+            markerPath.c_str(), -1, TRUE) != CSTR_EQUAL ||
+        CompareStringOrdinal(publicCollected.destinationPath.c_str(), -1,
+            publicPath.c_str(), -1, TRUE) != CSTR_EQUAL) {
+        result << "COLLECTION_FAILED=1\nSTATUS=FAIL\n";
+        return 34;
+    }
+
+    const std::vector<std::wstring> assigned{markerPath, publicPath};
+    bool partitionStable = true;
+    for (int restart = 0; restart < 2; ++restart) {
+        DesktopSurfaceWindow surface(instance);
+        if (!surface.Create(assigned, errorMessage)) {
+            partitionStable = false;
+            break;
+        }
+        surface.Show();
+        const DesktopViewSnapshot& snapshot = surface.Snapshot();
+        const bool assignedPresent = std::all_of(
+            assigned.begin(), assigned.end(), [&](const std::wstring& expected) {
+                return std::any_of(snapshot.items.begin(), snapshot.items.end(),
+                    [&](const DesktopViewItem& item) {
+                        return CompareStringOrdinal(item.path.c_str(), -1,
+                            expected.c_str(), -1, TRUE) == CSTR_EQUAL;
+                    });
+            });
+        partitionStable = partitionStable && assignedPresent &&
+            surface.VisibleItemCount() + assigned.size() == snapshot.items.size();
+        surface.Close();
+        if (!partitionStable) break;
+    }
+
+    DesktopViewSnapshot after;
+    std::vector<DesktopPosition> positionsAfter;
+    const bool afterCaptured = layout.CaptureViewSnapshot(after, errorMessage) &&
+        layout.CaptureAllPositions(positionsAfter, errorMessage);
+    const auto comparable = [](const std::vector<DesktopPosition>& positions) {
+        std::vector<std::tuple<std::wstring, LONG, LONG>> values;
+        for (const DesktopPosition& position : positions) {
+            std::wstring path = position.path;
+            std::transform(path.begin(), path.end(), path.begin(),
+                [](wchar_t value) { return static_cast<wchar_t>(std::towlower(value)); });
+            values.emplace_back(path, position.point.x, position.point.y);
+        }
+        std::sort(values.begin(), values.end());
+        return values;
+    };
+    const AppConfig persisted = configStore.LoadAppConfig();
+    const bool metadataStable = persisted.categories.size() == 1 &&
+        persisted.categories.front().itemIds ==
+            std::vector<std::wstring>{userCollected.itemId, publicCollected.itemId};
+    const bool pathInvariant =
+        SameStableFileIdentity(markerIdentity, ReadStableFileIdentity(markerPath)) &&
+        SameStableFileIdentity(publicIdentity, ReadStableFileIdentity(publicPath)) &&
+        markerBytes == ReadFileBytes(markerPath) &&
+        markerBytes == ReadFileBytes(dropSourcePath) &&
+        publicBytes == ReadFileBytes(publicPath) &&
+        countTopLevel(userRoot) == userCount &&
+        countTopLevel(publicRoot) == publicCount &&
+        !std::filesystem::exists(std::filesystem::path(managedStore.RootPath()));
+    const bool explorerInvariant = afterCaptured &&
+        after.viewFlags == before.viewFlags &&
+        comparable(positionsAfter) == comparable(positionsBefore) &&
+        IsWindowVisible(after.listViewWindow) != FALSE &&
+        IsWindowEnabled(after.listViewWindow) != FALSE;
+    const bool passed = droppedPositionStable && partitionStable && metadataStable &&
+        pathInvariant && explorerInvariant;
+    result << "NATIVE_BACKGROUND_DROP_GRID_STABLE=" << droppedPositionStable << "\n";
+    result << "DROP_EFFECT=" << dropEffect << "\n";
+    result << "PARTITION_RESTART_STABLE=" << partitionStable << "\n";
+    result << "METADATA_STABLE=" << metadataStable << "\n";
+    result << "PATH_FILEID_CONTENT_COUNT_STABLE=" << pathInvariant << "\n";
+    result << "EXPLORER_FLAGS_COORDS_RESTORED=" << explorerInvariant << "\n";
+    result << "STATUS=" << (passed ? "PASS" : "FAIL") << "\n";
+    return passed ? 0 : 35;
+}
+
 int RunSmokeRealDesktopGridCleanup() {
     AttachParentConsole();
     const auto environmentValue = [](const wchar_t* name) {
@@ -4664,10 +8069,21 @@ int RunSmokeRealDesktopGridCleanup() {
     std::ofstream result(
         configDirectory / L"real-desktop-grid-cleanup-result.txt",
         std::ios::trunc);
-    const std::wstring markerPath = environmentValue(L"LATTICE_REAL_DESKTOP_MARKER");
-    const std::wstring markerName = std::filesystem::path(markerPath).filename().wstring();
-    if (markerPath.empty() || !managedStore.IsDesktopPath(markerPath) ||
-        markerName.rfind(L".lattice-grid-restart-", 0) != 0) {
+    const std::wstring markerPath = environmentValue(
+        L"LATTICE_REAL_DESKTOP_MARKER");
+    const std::wstring secondMarkerPath = environmentValue(
+        L"LATTICE_INTERNAL_DRAG_MARKER_B");
+    const auto validMarker = [&](const std::wstring& path) {
+        if (path.empty() || !managedStore.IsDesktopPath(path)) {
+            return false;
+        }
+        const std::wstring name =
+            std::filesystem::path(path).filename().wstring();
+        return name.rfind(L".lattice-grid-restart-", 0) == 0 ||
+            name.rfind(L".lattice-internal-drag-", 0) == 0;
+    };
+    if (!validMarker(markerPath) ||
+        (!secondMarkerPath.empty() && !validMarker(secondMarkerPath))) {
         result << "MARKER_REJECTED=1\nSTATUS=FAIL\n";
         return 10;
     }
@@ -4707,12 +8123,19 @@ int RunSmokeRealDesktopGridCleanup() {
             }),
         expected.end());
     bool markerRemoved = true;
-    if (GetFileAttributesW(markerPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
-        markerRemoved = DeleteFileW(markerPath.c_str()) != FALSE;
-        if (markerRemoved) {
+    const std::array<std::wstring, 2> markerPaths{
+        markerPath, secondMarkerPath};
+    for (const std::wstring& path : markerPaths) {
+        if (path.empty() ||
+            GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES) {
+            continue;
+        }
+        const bool removed = DeleteFileW(path.c_str()) != FALSE;
+        markerRemoved = markerRemoved && removed;
+        if (removed) {
             SHChangeNotify(
                 SHCNE_DELETE, SHCNF_PATHW | SHCNF_FLUSHNOWAIT,
-                markerPath.c_str(), nullptr);
+                path.c_str(), nullptr);
         }
     }
 
@@ -4755,6 +8178,1201 @@ int RunSmokeRealDesktopGridCleanup() {
     return passed ? 0 : 12;
 }
 
+int RunSmokeLegacyStorageMigration() {
+    AttachParentConsole();
+    const DWORD required = GetEnvironmentVariableW(
+        L"DESKTOP_ORGANIZER_SMOKE_ITEMS_DIR", nullptr, 0);
+    if (required == 0) {
+        std::wcerr << L"Explicit legacy migration smoke directory is required\n";
+        return 1;
+    }
+    std::wstring baseValue(required, L'\0');
+    const DWORD copied = GetEnvironmentVariableW(
+        L"DESKTOP_ORGANIZER_SMOKE_ITEMS_DIR",
+        baseValue.data(), required);
+    if (copied == 0 || copied >= required) {
+        std::wcerr << L"Legacy migration smoke directory is invalid\n";
+        return 1;
+    }
+    baseValue.resize(copied);
+    const std::filesystem::path root =
+        std::filesystem::absolute(baseValue).lexically_normal() /
+        (L"legacy-migration-" + std::to_wstring(GetCurrentProcessId()));
+    const std::filesystem::path configRoot = root / L"Config";
+    const std::filesystem::path dataRoot = root / L"Data";
+    const std::filesystem::path desktopRoot = root / L"Desktop";
+    const std::filesystem::path publicRoot = root / L"PublicDesktop";
+    const std::filesystem::path managedRoot =
+        dataRoot / L"ManagedShortcuts" / L"legacy";
+    const std::filesystem::path managedUser = managedRoot / L"用户.txt";
+    const std::filesystem::path managedPublic = managedRoot / L"公共文件夹";
+    const std::filesystem::path userTarget = desktopRoot / managedUser.filename();
+    const std::filesystem::path publicTarget = publicRoot / managedPublic.filename();
+    const std::filesystem::path hiddenTarget = desktopRoot / L"旧隐藏.txt";
+    const std::filesystem::path conflictManaged = managedRoot / L"冲突.txt";
+    const std::filesystem::path conflictTarget = desktopRoot / conflictManaged.filename();
+    const std::filesystem::path rollbackManaged =
+        dataRoot / L"ManagedShortcuts" / L"rollback" / L"回滚.txt";
+    const std::filesystem::path rollbackTarget = desktopRoot / rollbackManaged.filename();
+    std::error_code fileError;
+    std::filesystem::create_directories(configRoot, fileError);
+    std::filesystem::create_directories(managedPublic, fileError);
+    std::filesystem::create_directories(desktopRoot, fileError);
+    std::filesystem::create_directories(publicRoot, fileError);
+    const auto cleanup = [&]() {
+        std::error_code cleanupError;
+        std::filesystem::remove_all(root, cleanupError);
+    };
+    const auto fail = [&](const std::wstring& message, int code) {
+        std::wcerr << message << L"\n";
+        cleanup();
+        return code;
+    };
+    if (fileError ||
+        !SetEnvironmentVariableW(
+            L"DESKTOP_ORGANIZER_CONFIG_DIR", configRoot.c_str()) ||
+        !SetEnvironmentVariableW(
+            L"DESKTOP_ORGANIZER_DATA_DIR", dataRoot.c_str()) ||
+        !SetEnvironmentVariableW(
+            L"DESKTOP_ORGANIZER_DESKTOP_DIR", desktopRoot.c_str()) ||
+        !SetEnvironmentVariableW(
+            L"DESKTOP_ORGANIZER_PUBLIC_DESKTOP_DIR", publicRoot.c_str())) {
+        return fail(L"Legacy migration smoke setup failed", 121);
+    }
+    {
+        std::ofstream user(managedUser, std::ios::binary);
+        std::ofstream child(
+            managedPublic / L"内容.md", std::ios::binary);
+        std::ofstream hidden(hiddenTarget, std::ios::binary);
+        std::ofstream conflictSource(conflictManaged, std::ios::binary);
+        std::ofstream conflictDestination(conflictTarget, std::ios::binary);
+        user << "legacy user bytes";
+        child << "legacy public folder bytes";
+        hidden << "legacy hidden bytes";
+        conflictSource << std::string(840, 'S');
+        conflictDestination << std::string(189, 'T');
+    }
+    const DWORD hiddenOriginal = GetFileAttributesW(hiddenTarget.c_str());
+    if (hiddenOriginal == INVALID_FILE_ATTRIBUTES ||
+        SetFileAttributesW(
+            hiddenTarget.c_str(),
+            hiddenOriginal | FILE_ATTRIBUTE_HIDDEN |
+                FILE_ATTRIBUTE_SYSTEM) == FALSE) {
+        return fail(L"Legacy hidden fixture setup failed", 122);
+    }
+
+    ConfigStore configStore;
+    ManagedShortcutStore managedStore(
+        dataRoot.wstring(), desktopRoot.wstring(), publicRoot.wstring());
+    AppConfig config;
+    config.window.x = 271;
+    config.window.y = 183;
+    config.window.width = 397;
+    config.window.height = 421;
+    config.uncategorizedItemIds = {L"legacy-user", L"legacy-hidden"};
+    CategoryConfig category;
+    category.id = L"legacy-category";
+    category.name = L"迁移分类";
+    category.itemIds = {L"legacy-public", L"legacy-conflict"};
+    config.categories.push_back(category);
+    ItemConfig userItem;
+    userItem.id = L"legacy-user";
+    userItem.path = managedUser.wstring();
+    userItem.originalDesktopPath = userTarget.wstring();
+    userItem.displayName = L"用户";
+    ItemConfig publicItem;
+    publicItem.id = L"legacy-public";
+    publicItem.path = managedPublic.wstring();
+    publicItem.originalDesktopPath = publicTarget.wstring();
+    publicItem.displayName = L"公共文件夹";
+    ItemConfig hiddenItem;
+    hiddenItem.id = L"legacy-hidden";
+    hiddenItem.path = hiddenTarget.wstring();
+    hiddenItem.originalDesktopPath = hiddenTarget.wstring();
+    hiddenItem.displayName = L"旧隐藏";
+    hiddenItem.desktopVisibilityMode = 1;
+    hiddenItem.desktopVisibilityOriginalFlags = static_cast<int>(
+        hiddenOriginal & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM));
+    ItemConfig conflictItem;
+    conflictItem.id = L"legacy-conflict";
+    conflictItem.path = conflictManaged.wstring();
+    conflictItem.originalDesktopPath = conflictTarget.wstring();
+    conflictItem.displayName = L"冲突";
+    config.items = {userItem, publicItem, hiddenItem, conflictItem};
+    if (!configStore.SaveAppConfig(config)) {
+        return fail(L"Legacy migration config setup failed", 123);
+    }
+
+    HWND owner = CreateWindowExW(
+        0, L"STATIC", L"Lattice legacy migration smoke owner",
+        WS_POPUP, 0, 0, 1, 1, nullptr, nullptr,
+        GetModuleHandleW(nullptr), nullptr);
+    if (owner == nullptr) {
+        return fail(L"Legacy migration owner creation failed", 124);
+    }
+    LegacyStorageMigrator migrator;
+    std::wstring errorMessage;
+    const std::optional<std::string> configBeforeConflict =
+        ReadFileBytes(configStore.ConfigPath());
+    const std::optional<std::string> conflictSourceBytes =
+        ReadFileBytes(conflictManaged.wstring());
+    const std::optional<std::string> conflictTargetBytes =
+        ReadFileBytes(conflictTarget.wstring());
+    const LegacyStorageMigrator::StartupAttempt conflictAttempt =
+        migrator.AttemptForStartup(
+            configStore, managedStore, owner);
+    errorMessage = conflictAttempt.warning;
+    const bool conflictRejected =
+        conflictAttempt.required && !conflictAttempt.completed;
+    const std::optional<std::string> configAfterConflict =
+        ReadFileBytes(configStore.ConfigPath());
+    if (!conflictRejected ||
+        !configBeforeConflict.has_value() ||
+        configAfterConflict != configBeforeConflict ||
+        ReadFileBytes(conflictManaged.wstring()) != conflictSourceBytes ||
+        ReadFileBytes(conflictTarget.wstring()) != conflictTargetBytes ||
+        !std::filesystem::exists(managedUser) ||
+        !std::filesystem::exists(managedPublic) ||
+        std::filesystem::exists(userTarget) ||
+        std::filesystem::exists(publicTarget) ||
+        std::filesystem::exists(
+            dataRoot / L"ManagedShortcuts" / L"move-journal.bin")) {
+        DestroyWindow(owner);
+        return fail(
+            L"Legacy migration conflict preflight changed an endpoint or config",
+            126);
+    }
+    std::filesystem::remove(conflictTarget, fileError);
+    if (fileError) {
+        DestroyWindow(owner);
+        return fail(L"Legacy migration conflict cleanup failed", 127);
+    }
+    const bool migrated = migrator.Migrate(
+        configStore, managedStore, owner, errorMessage);
+    const AppConfig after = configStore.LoadAppConfig();
+    const std::optional<std::string> firstConfigBytes =
+        ReadFileBytes(configStore.ConfigPath());
+    const bool idempotent = migrated && migrator.Migrate(
+        configStore, managedStore, owner, errorMessage);
+    const std::optional<std::string> secondConfigBytes =
+        ReadFileBytes(configStore.ConfigPath());
+
+    const auto findItem = [&](const std::wstring& id) {
+        return std::find_if(
+            after.items.begin(), after.items.end(),
+            [&](const ItemConfig& item) { return item.id == id; });
+    };
+    const auto migratedUser = findItem(L"legacy-user");
+    const auto migratedPublic = findItem(L"legacy-public");
+    const auto migratedHidden = findItem(L"legacy-hidden");
+    const auto migratedConflict = findItem(L"legacy-conflict");
+    const DWORD hiddenAfter = GetFileAttributesW(hiddenTarget.c_str());
+    const bool configStable =
+        after.window.x == config.window.x &&
+        after.window.y == config.window.y &&
+        after.window.width == config.window.width &&
+        after.window.height == config.window.height &&
+        after.uncategorizedItemIds == config.uncategorizedItemIds &&
+        after.categories.size() == 1 &&
+        after.categories.front().id == category.id &&
+        after.categories.front().itemIds == category.itemIds &&
+        after.items.size() == 4 &&
+        migratedUser != after.items.end() &&
+        migratedUser->path == userTarget.wstring() &&
+        migratedPublic != after.items.end() &&
+        migratedPublic->path == publicTarget.wstring() &&
+        migratedHidden != after.items.end() &&
+        migratedHidden->path == hiddenTarget.wstring() &&
+        migratedHidden->desktopVisibilityMode == 0 &&
+        migratedConflict != after.items.end() &&
+        migratedConflict->path == conflictTarget.wstring();
+    const bool endpointsStable =
+        !std::filesystem::exists(managedUser) &&
+        !std::filesystem::exists(managedPublic) &&
+        !std::filesystem::exists(conflictManaged) &&
+        std::filesystem::exists(userTarget) &&
+        std::filesystem::exists(publicTarget / L"内容.md") &&
+        ReadFileBytes(userTarget.wstring()) ==
+            std::optional<std::string>("legacy user bytes") &&
+        ReadFileBytes((publicTarget / L"内容.md").wstring()) ==
+            std::optional<std::string>("legacy public folder bytes") &&
+        ReadFileBytes(conflictTarget.wstring()) == conflictSourceBytes &&
+        hiddenAfter != INVALID_FILE_ATTRIBUTES &&
+        (hiddenAfter & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM)) ==
+            (hiddenOriginal & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM)) &&
+        !std::filesystem::exists(
+            dataRoot / L"ManagedShortcuts" / L"move-journal.bin");
+    const bool stableSecondRun = idempotent &&
+        firstConfigBytes.has_value() && secondConfigBytes.has_value() &&
+        *firstConfigBytes == *secondConfigBytes;
+    if (!migrated || !configStable || !endpointsStable ||
+        !stableSecondRun) {
+        DestroyWindow(owner);
+        return fail(
+            L"Legacy migration invariant failed: " + errorMessage,
+            125);
+    }
+    std::filesystem::create_directories(
+        rollbackManaged.parent_path(), fileError);
+    {
+        std::ofstream rollback(rollbackManaged, std::ios::binary);
+        rollback << "legacy rollback bytes";
+    }
+    const std::optional<std::string> rollbackBytes =
+        ReadFileBytes(rollbackManaged.wstring());
+    std::vector<std::pair<std::wstring, std::wstring>> rollbackDestinations;
+    const bool rollbackUnexpectedlyCommitted =
+        managedStore.MoveToOriginalDesktopBatch(
+            {{L"legacy-rollback", rollbackManaged.wstring(),
+              rollbackTarget.wstring(), true}},
+            [](const auto&) { return false; },
+            rollbackDestinations,
+            errorMessage,
+            owner);
+    DestroyWindow(owner);
+    if (fileError || rollbackUnexpectedlyCommitted ||
+        !rollbackDestinations.empty() ||
+        ReadFileBytes(rollbackManaged.wstring()) != rollbackBytes ||
+        std::filesystem::exists(rollbackTarget) ||
+        std::filesystem::exists(
+            dataRoot / L"ManagedShortcuts" / L"move-journal.bin")) {
+        return fail(
+            L"Legacy migration persistence failure did not roll back cleanly",
+            128);
+    }
+
+    std::filesystem::create_directories(
+        conflictManaged.parent_path(), fileError);
+    {
+        std::ofstream conflictSource(conflictManaged, std::ios::binary);
+        std::ofstream conflictDestination(conflictTarget, std::ios::binary);
+        conflictSource << std::string(840, 'S');
+        conflictDestination << std::string(189, 'T');
+    }
+    AppConfig startupConfig;
+    startupConfig.window = config.window;
+    CategoryConfig startupCategory = category;
+    startupCategory.itemIds = {conflictItem.id};
+    startupConfig.categories = {startupCategory};
+    startupConfig.items = {conflictItem};
+    const bool startupConfigSaved =
+        !fileError && configStore.SaveAppConfig(startupConfig);
+    const std::optional<std::string> startupConfigBefore =
+        ReadFileBytes(configStore.ConfigPath());
+    const std::optional<std::string> startupSourceBefore =
+        ReadFileBytes(conflictManaged.wstring());
+    const std::optional<std::string> startupTargetBefore =
+        ReadFileBytes(conflictTarget.wstring());
+    bool appInitialized = false;
+    bool mainWindowCreated = false;
+    {
+        App app(GetModuleHandleW(nullptr));
+        appInitialized = app.Initialize(SW_HIDE);
+        const HWND testMainWindow = FindCurrentProcessMainWindow();
+        mainWindowCreated = testMainWindow != nullptr;
+        if (testMainWindow != nullptr) {
+            DestroyWindow(testMainWindow);
+        }
+    }
+    const bool applicationConflictSafe =
+        startupConfigSaved && appInitialized && mainWindowCreated &&
+        FindCurrentProcessMainWindow() == nullptr &&
+        ReadFileBytes(configStore.ConfigPath()) == startupConfigBefore &&
+        ReadFileBytes(conflictManaged.wstring()) == startupSourceBefore &&
+        ReadFileBytes(conflictTarget.wstring()) == startupTargetBefore &&
+        !std::filesystem::exists(
+            dataRoot / L"ManagedShortcuts" / L"move-journal.bin");
+    if (!applicationConflictSafe) {
+        std::ofstream diagnostic(
+            std::filesystem::path(baseValue) /
+                L"app-conflict-startup-diagnostics.txt",
+            std::ios::binary | std::ios::trunc);
+        diagnostic
+            << "STARTUP_CONFIG_SAVED=" << (startupConfigSaved ? 1 : 0) << "\n"
+            << "APP_INITIALIZED=" << (appInitialized ? 1 : 0) << "\n"
+            << "MAIN_WINDOW_CREATED=" << (mainWindowCreated ? 1 : 0) << "\n"
+            << "MAIN_WINDOW_DESTROYED="
+            << (FindCurrentProcessMainWindow() == nullptr ? 1 : 0) << "\n"
+            << "CONFIG_UNCHANGED="
+            << (ReadFileBytes(configStore.ConfigPath()) == startupConfigBefore ? 1 : 0) << "\n"
+            << "SOURCE_UNCHANGED="
+            << (ReadFileBytes(conflictManaged.wstring()) == startupSourceBefore ? 1 : 0) << "\n"
+            << "TARGET_UNCHANGED="
+            << (ReadFileBytes(conflictTarget.wstring()) == startupTargetBefore ? 1 : 0) << "\n"
+            << "JOURNAL_ABSENT="
+            << (!std::filesystem::exists(
+                    dataRoot / L"ManagedShortcuts" / L"move-journal.bin")
+                    ? 1 : 0)
+            << "\n";
+        return fail(
+            L"Legacy migration conflict still blocked full application startup or changed an endpoint",
+            129);
+    }
+    cleanup();
+    std::wcout
+        << L"Legacy ManagedShortcuts conflict preflight, full application startup, endpoint contents, migration, idempotent restart, and persistence rollback passed\n";
+    return 0;
+}
+
+HWND FindShellPocListViewInRoot(HWND root) {
+    if (root == nullptr || IsWindow(root) == FALSE) {
+        return nullptr;
+    }
+    for (HWND defView = FindWindowExW(
+             root, nullptr, L"SHELLDLL_DefView", nullptr);
+         defView != nullptr;
+         defView = FindWindowExW(
+             root, defView, L"SHELLDLL_DefView", nullptr)) {
+        const HWND listView = FindWindowExW(
+            defView, nullptr, L"SysListView32", nullptr);
+        if (listView != nullptr && IsWindow(listView) != FALSE) {
+            return listView;
+        }
+    }
+    return nullptr;
+}
+
+HWND FindShellPocListView() {
+    const HWND progman = FindWindowW(L"Progman", nullptr);
+    if (const HWND listView = FindShellPocListViewInRoot(progman)) {
+        return listView;
+    }
+    if (progman != nullptr) {
+        for (HWND worker = FindWindowExW(
+                 progman, nullptr, L"WorkerW", nullptr);
+             worker != nullptr;
+             worker = FindWindowExW(
+                 progman, worker, L"WorkerW", nullptr)) {
+            if (const HWND listView = FindShellPocListViewInRoot(worker)) {
+                return listView;
+            }
+        }
+    }
+    for (HWND worker = FindWindowExW(
+             nullptr, nullptr, L"WorkerW", nullptr);
+         worker != nullptr;
+         worker = FindWindowExW(
+             nullptr, worker, L"WorkerW", nullptr)) {
+        if (const HWND listView = FindShellPocListViewInRoot(worker)) {
+            return listView;
+        }
+    }
+    return nullptr;
+}
+
+int RunSmokeShellDesktopBridge() {
+    AttachParentConsole();
+    const DWORD required = GetEnvironmentVariableW(
+        L"DESKTOP_ORGANIZER_SHELL_POC_RESULT", nullptr, 0);
+    if (required == 0) {
+        std::wcerr << L"Shell bridge PoC result path is missing\n";
+        return 150;
+    }
+    std::wstring resultValue(required, L'\0');
+    const DWORD copied = GetEnvironmentVariableW(
+        L"DESKTOP_ORGANIZER_SHELL_POC_RESULT",
+        resultValue.data(), required);
+    if (copied == 0 || copied >= required) {
+        std::wcerr << L"Shell bridge PoC result path is invalid\n";
+        return 150;
+    }
+    resultValue.resize(copied);
+    std::ofstream result(
+        std::filesystem::path(resultValue), std::ios::trunc);
+    if (!result) {
+        std::wcerr << L"Shell bridge PoC result file could not be opened\n";
+        return 150;
+    }
+    const auto setStage = [&](const char* stage) {
+        result << "STAGE=" << stage << "\n";
+        result.flush();
+    };
+    const auto fail = [&](const char* stage, HRESULT error, int exitCode) {
+        result << "FAILED_STAGE=" << stage << "\n"
+               << "HRESULT=" << static_cast<long long>(error) << "\n"
+               << "STATUS=FAIL\n";
+        result.flush();
+        return exitCode;
+    };
+
+    setStage("SysListView32");
+    const HWND directListView = FindShellPocListView();
+    if (directListView == nullptr) {
+        return fail("SysListView32", HRESULT_FROM_WIN32(ERROR_NOT_FOUND), 151);
+    }
+    result << "LISTVIEW_HWND="
+           << static_cast<unsigned long long>(
+                  reinterpret_cast<std::uintptr_t>(directListView))
+           << "\n";
+
+    setStage("CoCreateInstance(CLSID_ShellWindows)");
+    Microsoft::WRL::ComPtr<IShellWindows> shellWindows;
+    HRESULT error = CoCreateInstance(
+        CLSID_ShellWindows, nullptr, CLSCTX_ALL,
+        IID_PPV_ARGS(&shellWindows));
+    if (FAILED(error) || shellWindows == nullptr) {
+        return fail("CoCreateInstance(CLSID_ShellWindows)", error, 152);
+    }
+
+    setStage("IShellWindows::FindWindowSW");
+    VARIANT location{};
+    location.vt = VT_I4;
+    location.lVal = CSIDL_DESKTOP;
+    VARIANT root{};
+    root.vt = VT_EMPTY;
+    long desktopHwnd = 0;
+    Microsoft::WRL::ComPtr<IDispatch> dispatch;
+    error = shellWindows->FindWindowSW(
+        &location, &root, SWC_DESKTOP, &desktopHwnd,
+        SWFO_NEEDDISPATCH, &dispatch);
+    if (FAILED(error) || dispatch == nullptr) {
+        return fail("IShellWindows::FindWindowSW", error, 153);
+    }
+
+    setStage("IServiceProvider::QueryService");
+    Microsoft::WRL::ComPtr<IServiceProvider> serviceProvider;
+    error = dispatch.As(&serviceProvider);
+    if (FAILED(error) || serviceProvider == nullptr) {
+        return fail("IDispatch::QueryInterface(IServiceProvider)", error, 154);
+    }
+    Microsoft::WRL::ComPtr<IShellBrowser> shellBrowser;
+    error = serviceProvider->QueryService(
+        SID_STopLevelBrowser, IID_PPV_ARGS(&shellBrowser));
+    if (FAILED(error) || shellBrowser == nullptr) {
+        return fail("IServiceProvider::QueryService", error, 155);
+    }
+
+    setStage("IShellBrowser::QueryActiveShellView");
+    Microsoft::WRL::ComPtr<IShellView> shellView;
+    error = shellBrowser->QueryActiveShellView(&shellView);
+    if (FAILED(error) || shellView == nullptr) {
+        return fail("IShellBrowser::QueryActiveShellView", error, 156);
+    }
+    HWND shellViewWindow = nullptr;
+    error = shellView->GetWindow(&shellViewWindow);
+    if (FAILED(error) || shellViewWindow == nullptr) {
+        return fail("IShellView::GetWindow", error, 157);
+    }
+
+    setStage("IFolderView");
+    Microsoft::WRL::ComPtr<IFolderView> folderView;
+    error = shellView.As(&folderView);
+    if (FAILED(error) || folderView == nullptr) {
+        return fail("IShellView::QueryInterface(IFolderView)", error, 158);
+    }
+    int itemCount = 0;
+    error = folderView->ItemCount(SVGIO_ALLVIEW, &itemCount);
+    if (FAILED(error)) {
+        return fail("IFolderView::ItemCount", error, 159);
+    }
+    const HWND folderListView = FindWindowExW(
+        shellViewWindow, nullptr, L"SysListView32", nullptr);
+    if (folderListView == nullptr || folderListView != directListView) {
+        return fail("FolderView/ListView identity", E_UNEXPECTED, 160);
+    }
+
+    setStage("IFolderView2");
+    Microsoft::WRL::ComPtr<IFolderView2> folderView2;
+    error = folderView.As(&folderView2);
+    if (FAILED(error) || folderView2 == nullptr) {
+        return fail("IFolderView::QueryInterface(IFolderView2)", error, 161);
+    }
+    DWORD viewFlags = 0;
+    error = folderView2->GetCurrentFolderFlags(&viewFlags);
+    if (FAILED(error)) {
+        return fail("IFolderView2::GetCurrentFolderFlags", error, 162);
+    }
+    FOLDERVIEWMODE viewMode = FVM_AUTO;
+    int iconSize = 0;
+    error = folderView2->GetViewModeAndIconSize(&viewMode, &iconSize);
+    if (FAILED(error)) {
+        return fail("IFolderView2::GetViewModeAndIconSize", error, 163);
+    }
+    result << "SHELL_VIEW_HWND="
+           << static_cast<unsigned long long>(
+                  reinterpret_cast<std::uintptr_t>(shellViewWindow))
+           << "\n"
+           << "ITEM_COUNT=" << itemCount << "\n"
+           << "VIEW_FLAGS=" << viewFlags << "\n"
+           << "VIEW_MODE=" << static_cast<int>(viewMode) << "\n"
+           << "ICON_SIZE=" << iconSize << "\n"
+           << "STATUS=PASS\n";
+    result.flush();
+    std::wcout << L"Shell desktop bridge PoC passed\n";
+    return 0;
+}
+
+int RunSmokeResourceIdle(HINSTANCE instance) {
+    AttachParentConsole();
+    SetThreadDpiAwarenessContext(
+        DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    const DWORD required = GetEnvironmentVariableW(
+        L"DESKTOP_ORGANIZER_SMOKE_ITEMS_DIR", nullptr, 0);
+    if (required == 0) {
+        std::wcerr << L"Resource smoke directory is missing\n";
+        return 139;
+    }
+    std::wstring baseValue(required, L'\0');
+    const DWORD copied = GetEnvironmentVariableW(
+        L"DESKTOP_ORGANIZER_SMOKE_ITEMS_DIR",
+        baseValue.data(),
+        required);
+    if (copied == 0 || copied >= required) {
+        std::wcerr << L"Resource smoke directory is invalid\n";
+        return 139;
+    }
+    baseValue.resize(copied);
+    wchar_t visibleValue[2]{};
+    const bool visibleMode = GetEnvironmentVariableW(
+        L"DESKTOP_ORGANIZER_SMOKE_RESOURCE_VISIBLE",
+        visibleValue,
+        static_cast<DWORD>(_countof(visibleValue))) > 0 &&
+        visibleValue[0] == L'1';
+    const std::filesystem::path fixtureRoot =
+        std::filesystem::absolute(baseValue).lexically_normal() /
+        (L"resource-idle-" + std::to_wstring(GetCurrentProcessId()));
+    const std::filesystem::path desktopRoot = fixtureRoot / L"Desktop";
+    std::error_code fileError;
+    std::filesystem::create_directories(desktopRoot, fileError);
+    if (fileError) {
+        std::wcerr << L"Resource smoke fixture directory failed\n";
+        return 140;
+    }
+    SetEnvironmentVariableW(
+        L"DESKTOP_ORGANIZER_DESKTOP_DIR", desktopRoot.c_str());
+
+    HMONITOR monitor = MonitorFromPoint(
+        POINT{0, 0}, MONITOR_DEFAULTTONEAREST);
+    MONITORINFOEXW monitorInfo{};
+    monitorInfo.cbSize = sizeof(monitorInfo);
+    if (monitor == nullptr ||
+        GetMonitorInfoW(monitor, &monitorInfo) == FALSE) {
+        std::wcerr << L"Resource smoke monitor lookup failed\n";
+        return 141;
+    }
+    AppConfig config;
+    config.settings.startHidden = !visibleMode;
+    config.settings.restoreHiddenState = false;
+    config.settings.lastVisible = visibleMode;
+    config.settings.iconCacheSize = 256;
+    config.window.monitorId = monitorInfo.szDevice;
+    config.window.x = monitorInfo.rcWork.left + 40;
+    config.window.y = monitorInfo.rcWork.top + 40;
+    config.window.width = 390;
+    config.window.height = 489;
+    config.window.normalHeight = 489;
+    for (int categoryIndex = 0; categoryIndex < 10; ++categoryIndex) {
+        CategoryConfig category;
+        category.id = L"resource-category-" +
+            std::to_wstring(categoryIndex);
+        category.name = L"资源夹具 " +
+            std::to_wstring(categoryIndex + 1);
+        category.storageFolder = category.name;
+        category.layout = config.window;
+        category.layout.width = 260;
+        category.layout.height = 250;
+        category.layout.normalHeight = 250;
+        category.layout.x = monitorInfo.rcWork.left +
+            40 + (categoryIndex % 5) * 285;
+        category.layout.y = monitorInfo.rcWork.top +
+            80 + (categoryIndex / 5) * 285;
+        for (int itemIndex = 0; itemIndex < 8; ++itemIndex) {
+            const std::wstring itemId =
+                L"resource-item-" + std::to_wstring(categoryIndex) +
+                L"-" + std::to_wstring(itemIndex);
+            const std::filesystem::path itemPath =
+                desktopRoot / (itemId + L".txt");
+            {
+                std::ofstream itemFile(itemPath, std::ios::binary);
+                itemFile << "resource fixture";
+            }
+            if (!std::filesystem::exists(itemPath)) {
+                std::wcerr << L"Resource smoke item creation failed\n";
+                return 142;
+            }
+            ItemConfig item{
+                itemId,
+                itemPath.wstring(),
+                L"资源项目 " + std::to_wstring(itemIndex + 1)};
+            item.originalDesktopPath = itemPath.wstring();
+            config.items.push_back(std::move(item));
+            category.itemIds.push_back(itemId);
+        }
+        config.categories.push_back(std::move(category));
+    }
+    ConfigStore configStore;
+    if (!configStore.SaveAppConfig(config)) {
+        std::wcerr << L"Resource smoke config save failed\n";
+        return 143;
+    }
+    App app(instance);
+    if (!app.Initialize(
+            visibleMode ? SW_SHOWNOACTIVATE : SW_HIDE)) {
+        std::wcerr << L"Resource smoke application initialization failed\n";
+        return 144;
+    }
+    const HWND mainWindow = FindCurrentProcessMainWindow();
+    if (mainWindow == nullptr) {
+        std::wcerr << L"Resource smoke main window missing\n";
+        return 145;
+    }
+    {
+        std::ofstream ready(
+            std::filesystem::path(baseValue) / L"resource-ready.txt",
+            std::ios::trunc);
+        ready << "PID=" << GetCurrentProcessId() << "\n"
+              << "VISIBLE=" << (visibleMode ? 1 : 0) << "\n"
+              << "CATEGORIES=10\n"
+              << "ITEMS=80\n";
+    }
+    const ULONGLONG deadline = GetTickCount64() + 22000;
+    while (GetTickCount64() < deadline) {
+        MSG message{};
+        while (PeekMessageW(
+                &message, nullptr, 0, 0, PM_REMOVE)) {
+            if (message.message == WM_QUIT) {
+                return static_cast<int>(message.wParam);
+            }
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+        const ULONGLONG remaining = deadline - GetTickCount64();
+        MsgWaitForMultipleObjects(
+            0,
+            nullptr,
+            FALSE,
+            static_cast<DWORD>((std::min<ULONGLONG>)(remaining, 100)),
+            QS_ALLINPUT);
+    }
+    DestroyWindow(mainWindow);
+    return app.Run();
+}
+
+int RunSmokeCollapseSelectionLogic(HINSTANCE instance) {
+    AttachParentConsole();
+    if (WidgetWindowSmokeAccess::WallpaperDrawMode() !=
+            WallpaperBackdropDrawMode::CropTopLeft ||
+        DesktopSurfaceWindowSmokeAccess::WallpaperDrawMode() !=
+            WallpaperBackdropDrawMode::StretchToDestination) {
+        std::wcerr << L"Wallpaper draw policies are bound to the wrong window type\n";
+        return 171;
+    }
+
+    WallpaperBackdropDrawGeometry collapsedGeometry{};
+    const D2D1_RECT_F collapsedTarget =
+        D2D1::RectF(0.0f, 0.0f, 390.0f, 32.0f);
+    if (!CalculateWallpaperBackdropDrawGeometry(
+            D2D1::SizeF(390.0f, 489.0f),
+            collapsedTarget,
+            WallpaperBackdropDrawMode::CropTopLeft,
+            collapsedGeometry) ||
+        collapsedGeometry.source.left != 0.0f ||
+        collapsedGeometry.source.top != 0.0f ||
+        collapsedGeometry.source.right != 390.0f ||
+        collapsedGeometry.source.bottom != 32.0f ||
+        collapsedGeometry.destination.left != 0.0f ||
+        collapsedGeometry.destination.top != 0.0f ||
+        collapsedGeometry.destination.right != 390.0f ||
+        collapsedGeometry.destination.bottom != 32.0f) {
+        std::wcerr << L"Collapsed wallpaper crop geometry regressed\n";
+        return 172;
+    }
+    WallpaperBackdropDrawGeometry equalCropGeometry{};
+    const D2D1_RECT_F equalCropTarget =
+        D2D1::RectF(5.0f, 7.0f, 395.0f, 496.0f);
+    if (!CalculateWallpaperBackdropDrawGeometry(
+            D2D1::SizeF(390.0f, 489.0f),
+            equalCropTarget,
+            WallpaperBackdropDrawMode::CropTopLeft,
+            equalCropGeometry) ||
+        equalCropGeometry.source.right != 390.0f ||
+        equalCropGeometry.source.bottom != 489.0f ||
+        equalCropGeometry.destination.left != 5.0f ||
+        equalCropGeometry.destination.top != 7.0f ||
+        equalCropGeometry.destination.right != 395.0f ||
+        equalCropGeometry.destination.bottom != 496.0f) {
+        std::wcerr << L"Equal-size wallpaper crop geometry regressed\n";
+        return 173;
+    }
+    WallpaperBackdropDrawGeometry smallCropGeometry{};
+    const D2D1_RECT_F largeCropTarget =
+        D2D1::RectF(5.0f, 7.0f, 395.0f, 39.0f);
+    if (!CalculateWallpaperBackdropDrawGeometry(
+            D2D1::SizeF(200.0f, 16.0f),
+            largeCropTarget,
+            WallpaperBackdropDrawMode::CropTopLeft,
+            smallCropGeometry) ||
+        smallCropGeometry.source.right != 200.0f ||
+        smallCropGeometry.source.bottom != 16.0f ||
+        smallCropGeometry.destination.left != 5.0f ||
+        smallCropGeometry.destination.top != 7.0f ||
+        smallCropGeometry.destination.right != 205.0f ||
+        smallCropGeometry.destination.bottom != 23.0f) {
+        std::wcerr << L"Wallpaper crop unexpectedly upscaled a small bitmap\n";
+        return 174;
+    }
+    WallpaperBackdropDrawGeometry stretchGeometry{};
+    const D2D1_RECT_F stretchTarget =
+        D2D1::RectF(11.0f, 13.0f, 401.0f, 45.0f);
+    if (!CalculateWallpaperBackdropDrawGeometry(
+            D2D1::SizeF(390.0f, 489.0f),
+            stretchTarget,
+            WallpaperBackdropDrawMode::StretchToDestination,
+            stretchGeometry) ||
+        stretchGeometry.source.left != 0.0f ||
+        stretchGeometry.source.top != 0.0f ||
+        stretchGeometry.source.right != 390.0f ||
+        stretchGeometry.source.bottom != 489.0f ||
+        stretchGeometry.destination.left != 11.0f ||
+        stretchGeometry.destination.top != 13.0f ||
+        stretchGeometry.destination.right != 401.0f ||
+        stretchGeometry.destination.bottom != 45.0f) {
+        std::wcerr << L"Desktop wallpaper stretch geometry regressed\n";
+        return 175;
+    }
+
+    const RECT bounds{0, 0, 200, 160};
+    const RECT expected{20, 10, 81, 71};
+    const std::array<std::pair<POINT, POINT>, 4> directions{{
+        {{20, 10}, {80, 70}},
+        {{80, 10}, {20, 70}},
+        {{20, 70}, {80, 10}},
+        {{80, 70}, {20, 10}},
+    }};
+    for (const auto& direction : directions) {
+        const RECT actual =
+            DesktopSurfaceWindowSmokeAccess::NormalizeMarqueeRect(
+                direction.first, direction.second, bounds);
+        if (!EqualRect(&actual, &expected)) {
+            std::wcerr << L"Marquee direction normalization regressed\n";
+            return 176;
+        }
+    }
+    const RECT clamped =
+        DesktopSurfaceWindowSmokeAccess::NormalizeMarqueeRect(
+            POINT{-50, -25}, POINT{280, 210}, bounds);
+    if (!EqualRect(&clamped, &bounds)) {
+        std::wcerr << L"Marquee client-bound clamping regressed\n";
+        return 177;
+    }
+
+    const std::vector<DesktopViewItem> items{
+        DesktopViewItem{L"identity-a", L"A", {}, {10, 10}},
+        DesktopViewItem{L"identity-b", L"B", {}, {100, 10}},
+        DesktopViewItem{L"identity-c", L"C", {}, {190, 10}},
+    };
+    DesktopSurfaceWindow surface(instance);
+
+    const int dragThreshold =
+        (std::max)(1, GetSystemMetrics(SM_CXDRAG));
+    DesktopSurfaceWindowSmokeAccess::ConfigureSelectionFixture(
+        surface, items, {});
+    const RECT firstCell =
+        DesktopSurfaceWindowSmokeAccess::CellRect(surface, 0);
+    const POINT firstCellGap{0, 25};
+    if (!PtInRect(&firstCell, firstCellGap) ||
+        !DesktopSurfaceWindowSmokeAccess::IsBlankPoint(
+            surface, firstCellGap)) {
+        std::wcerr
+            << L"Desktop cell gap was still treated as an item\n";
+        return 195;
+    }
+    DesktopSurfaceWindowSmokeAccess::BeginPointerGesture(
+        surface, POINT{0, 100}, false);
+    const POINT belowThreshold{
+        dragThreshold > 1 ? dragThreshold - 1 : 0,
+        100};
+    if (!DesktopSurfaceWindowSmokeAccess::ContinuePointerGesture(
+            surface, belowThreshold).empty() ||
+        !DesktopSurfaceWindowSmokeAccess::IsMarqueePending(surface)) {
+        std::wcerr << L"Blank pointer exceeded the marquee threshold too early\n";
+        return 178;
+    }
+    DesktopSurfaceWindowSmokeAccess::ContinuePointerGesture(
+        surface, POINT{dragThreshold, 100});
+    if (!DesktopSurfaceWindowSmokeAccess::IsMarqueeActive(surface)) {
+        std::wcerr << L"Blank pointer did not activate at the drag threshold\n";
+        return 179;
+    }
+
+    DesktopSurfaceWindowSmokeAccess::ConfigureSelectionFixture(
+        surface, items, {});
+    DesktopSurfaceWindowSmokeAccess::BeginPointerGesture(
+        surface, POINT{0, 100}, false);
+    DesktopSurfaceWindowSmokeAccess::ContinuePointerGesture(
+        surface, POINT{150, 0});
+    DesktopSurfaceWindowSmokeAccess::ContinuePointerGesture(
+        surface, POINT{50, 0});
+    if (!DesktopSurfaceWindowSmokeAccess::IsSelected(
+            surface, L"identity-a") ||
+        DesktopSurfaceWindowSmokeAccess::IsSelected(
+            surface, L"identity-b")) {
+        std::wcerr << L"Shrunk marquee did not recompute from its baseline\n";
+        return 180;
+    }
+    DesktopSurfaceWindowSmokeAccess::ContinuePointerGesture(
+        surface, POINT{150, 0});
+    if (!DesktopSurfaceWindowSmokeAccess::IsSelected(
+            surface, L"identity-a") ||
+        !DesktopSurfaceWindowSmokeAccess::IsSelected(
+            surface, L"identity-b")) {
+        std::wcerr << L"Expanded marquee accumulated an incorrect toggle state\n";
+        return 181;
+    }
+    DesktopSurfaceWindowSmokeAccess::ContinuePointerGesture(
+        surface, POINT{1, 99});
+    if (!DesktopSurfaceWindowSmokeAccess::IsMarqueeActive(surface) ||
+        !DesktopSurfaceWindowSmokeAccess::SelectedPaths(surface).empty()) {
+        std::wcerr << L"Active marquee stopped updating after moving back inside the threshold\n";
+        return 182;
+    }
+
+    DesktopSurfaceWindowSmokeAccess::ConfigureSelectionFixture(
+        surface, items, {});
+    DesktopSurfaceWindowSmokeAccess::BeginPointerGesture(
+        surface, POINT{0, 25}, false);
+    DesktopSurfaceWindowSmokeAccess::ContinuePointerGesture(
+        surface, POINT{10, 25});
+    if (!DesktopSurfaceWindowSmokeAccess::IsSelected(
+            surface, L"identity-a") ||
+        DesktopSurfaceWindowSmokeAccess::IsSelected(
+            surface, L"identity-b")) {
+        std::wcerr << L"Thin marquee did not select a touched desktop cell\n";
+        return 183;
+    }
+
+    DesktopSurfaceWindowSmokeAccess::ConfigureSelectionFixture(
+        surface, items, {L"identity-c"});
+    DesktopSurfaceWindowSmokeAccess::BeginPointerGesture(
+        surface, POINT{0, 100}, false);
+    DesktopSurfaceWindowSmokeAccess::ContinuePointerGesture(
+        surface, POINT{150, 0});
+    if (!DesktopSurfaceWindowSmokeAccess::IsMarqueeActive(surface) ||
+        !DesktopSurfaceWindowSmokeAccess::IsSelected(
+            surface, L"identity-a") ||
+        !DesktopSurfaceWindowSmokeAccess::IsSelected(
+            surface, L"identity-b") ||
+        DesktopSurfaceWindowSmokeAccess::IsSelected(
+            surface, L"identity-c")) {
+        std::wcerr << L"Plain marquee replacement selection regressed\n";
+        return 184;
+    }
+    DesktopSurfaceWindowSmokeAccess::CompletePointerGesture(surface);
+
+    DesktopSurfaceWindowSmokeAccess::ConfigureSelectionFixture(
+        surface, items, {L"identity-a"});
+    DesktopSurfaceWindowSmokeAccess::BeginPointerGesture(
+        surface, POINT{0, 100}, true);
+    DesktopSurfaceWindowSmokeAccess::ContinuePointerGesture(
+        surface, POINT{150, 0});
+    if (DesktopSurfaceWindowSmokeAccess::IsSelected(
+            surface, L"identity-a") ||
+        !DesktopSurfaceWindowSmokeAccess::IsSelected(
+            surface, L"identity-b")) {
+        std::wcerr << L"Control marquee baseline XOR regressed\n";
+        return 185;
+    }
+    DesktopSurfaceWindowSmokeAccess::CancelPointerGesture(surface);
+    if (!DesktopSurfaceWindowSmokeAccess::HasNoPointerGesture(surface) ||
+        !DesktopSurfaceWindowSmokeAccess::IsSelected(
+            surface, L"identity-b")) {
+        std::wcerr << L"Capture cancellation corrupted stable selection\n";
+        return 186;
+    }
+
+    DesktopSurfaceWindowSmokeAccess::ConfigureSelectionFixture(
+        surface, items, {L"identity-a"});
+    DesktopSurfaceWindowSmokeAccess::BeginPointerGesture(
+        surface, POINT{270, 180}, false);
+    DesktopSurfaceWindowSmokeAccess::CompletePointerGesture(surface);
+    if (!DesktopSurfaceWindowSmokeAccess::SelectedPaths(surface).empty()) {
+        std::wcerr << L"Plain blank click did not clear selection\n";
+        return 187;
+    }
+    DesktopSurfaceWindowSmokeAccess::ConfigureSelectionFixture(
+        surface, items, {L"identity-a"});
+    DesktopSurfaceWindowSmokeAccess::BeginPointerGesture(
+        surface, POINT{270, 180}, true);
+    DesktopSurfaceWindowSmokeAccess::CompletePointerGesture(surface);
+    if (!DesktopSurfaceWindowSmokeAccess::IsSelected(
+            surface, L"identity-a")) {
+        std::wcerr << L"Control blank click did not preserve selection\n";
+        return 188;
+    }
+
+    DesktopSurfaceWindowSmokeAccess::ConfigureSelectionFixture(
+        surface, items, {L"identity-a", L"identity-b"});
+    DesktopSurfaceWindowSmokeAccess::BeginPointerGesture(
+        surface, POINT{20, 20}, true);
+    DesktopSurfaceWindowSmokeAccess::CompletePointerGesture(surface);
+    if (DesktopSurfaceWindowSmokeAccess::IsSelected(
+            surface, L"identity-a") ||
+        !DesktopSurfaceWindowSmokeAccess::IsSelected(
+            surface, L"identity-b")) {
+        std::wcerr << L"Control item toggle regressed\n";
+        return 189;
+    }
+
+    DesktopSurfaceWindowSmokeAccess::ConfigureSelectionFixture(
+        surface, items, {L"identity-b", L"identity-a"});
+    DesktopSurfaceWindowSmokeAccess::BeginPointerGesture(
+        surface, POINT{20, 20}, false);
+    const std::vector<std::wstring> belowThresholdDrag =
+        DesktopSurfaceWindowSmokeAccess::ContinuePointerGesture(
+            surface,
+            POINT{
+                20 + (dragThreshold > 1
+                    ? dragThreshold - 1
+                    : 0),
+                20});
+    if (!belowThresholdDrag.empty() ||
+        !DesktopSurfaceWindowSmokeAccess::IsItemPressed(surface)) {
+        std::wcerr << L"Selected item drag exceeded its threshold too early\n";
+        return 190;
+    }
+    const std::vector<std::wstring> dragPaths =
+        DesktopSurfaceWindowSmokeAccess::ContinuePointerGesture(
+            surface, POINT{20 + dragThreshold, 20});
+    if (dragPaths !=
+            std::vector<std::wstring>{
+                L"identity-a", L"identity-b"} ||
+        !DesktopSurfaceWindowSmokeAccess::HasNoPointerGesture(surface)) {
+        std::wcerr << L"Selected group drag ordering regressed\n";
+        return 191;
+    }
+    const std::vector<DesktopPosition> offsetPositions =
+        DesktopSurfaceWindowSmokeAccess::OffsetDragPositions(
+            std::vector<DesktopPosition>{
+                {L"identity-a", POINT{10, 20}},
+                {L"identity-b", POINT{100, 70}}},
+            POINT{25, 35},
+            POINT{205, 155});
+    if (offsetPositions.size() != 2 ||
+        offsetPositions[0].point.x != 190 ||
+        offsetPositions[0].point.y != 140 ||
+        offsetPositions[1].point.x != 280 ||
+        offsetPositions[1].point.y != 190 ||
+        offsetPositions[1].point.x - offsetPositions[0].point.x != 90 ||
+        offsetPositions[1].point.y - offsetPositions[0].point.y != 50) {
+        std::wcerr << L"Internal desktop drag did not preserve group geometry\n";
+        return 196;
+    }
+
+    const RECT plannerBounds{0, 0, 320, 250};
+    const std::vector<DesktopPosition> plannerVisible{
+        {L"planner-a", POINT{20, 0}},
+        {L"planner-b", POINT{20, 50}},
+        {L"planner-c", POINT{100, 0}},
+        {L"planner-d", POINT{100, 50}},
+    };
+    const auto plannedPoint = [](
+        const std::vector<DesktopPosition>& positions,
+        const std::wstring& identity) -> std::optional<POINT> {
+        const auto item = std::find_if(
+            positions.begin(), positions.end(),
+            [&](const DesktopPosition& value) {
+                return CompareStringOrdinal(
+                           value.path.c_str(), -1,
+                           identity.c_str(), -1, TRUE) == CSTR_EQUAL;
+            });
+        return item == positions.end()
+            ? std::nullopt
+            : std::optional<POINT>(item->point);
+    };
+    std::vector<DesktopPosition> planned;
+    if (!DesktopSurfaceWindowSmokeAccess::PlanVisibleGridDrop(
+            plannerVisible,
+            {plannerVisible[0]},
+            POINT{30, 10},
+            POINT{110, 60},
+            plannerBounds,
+            80,
+            50,
+            40,
+            planned) ||
+        planned.size() != 2 ||
+        !plannedPoint(planned, L"planner-a").has_value() ||
+        plannedPoint(planned, L"planner-a")->x != 100 ||
+        plannedPoint(planned, L"planner-a")->y != 50 ||
+        !plannedPoint(planned, L"planner-d").has_value() ||
+        plannedPoint(planned, L"planner-d")->x != 100 ||
+        plannedPoint(planned, L"planner-d")->y != 100) {
+        std::wcerr << L"Visible-only occupied-cell cascade regressed";
+        return 197;
+    }
+
+    planned.clear();
+    if (!DesktopSurfaceWindowSmokeAccess::PlanVisibleGridDrop(
+            plannerVisible,
+            {plannerVisible[0]},
+            POINT{30, 10},
+            POINT{80, 40},
+            plannerBounds,
+            80,
+            50,
+            40,
+            planned) ||
+        !plannedPoint(planned, L"planner-a").has_value() ||
+        plannedPoint(planned, L"planner-a")->x != 100 ||
+        plannedPoint(planned, L"planner-a")->y != 50) {
+        std::wcerr << L"Non-grid desktop release did not snap";
+        return 198;
+    }
+
+    planned.clear();
+    if (!DesktopSurfaceWindowSmokeAccess::PlanVisibleGridDrop(
+            plannerVisible,
+            {plannerVisible[0], plannerVisible[1]},
+            POINT{30, 10},
+            POINT{1000, 1000},
+            plannerBounds,
+            80,
+            50,
+            40,
+            planned) ||
+        !plannedPoint(planned, L"planner-a").has_value() ||
+        plannedPoint(planned, L"planner-a")->x != 260 ||
+        plannedPoint(planned, L"planner-a")->y != 150 ||
+        !plannedPoint(planned, L"planner-b").has_value() ||
+        plannedPoint(planned, L"planner-b")->x != 260 ||
+        plannedPoint(planned, L"planner-b")->y != 200) {
+        std::wcerr << L"Multi-item edge clamping changed group geometry";
+        return 199;
+    }
+
+    const std::vector<DesktopPosition> visibleWithoutAssigned{
+        {L"planner-a", POINT{20, 0}},
+        {L"planner-b", POINT{20, 50}},
+    };
+    planned.clear();
+    if (!DesktopSurfaceWindowSmokeAccess::PlanVisibleGridDrop(
+            visibleWithoutAssigned,
+            {visibleWithoutAssigned[0]},
+            POINT{30, 10},
+            POINT{110, 10},
+            plannerBounds,
+            80,
+            50,
+            40,
+            planned) ||
+        planned.size() != 1 ||
+        !plannedPoint(planned, L"planner-a").has_value() ||
+        plannedPoint(planned, L"planner-a")->x != 100 ||
+        plannedPoint(planned, L"planner-a")->y != 0) {
+        std::wcerr << L"Assigned items affected the visible-only layout";
+        return 200;
+    }
+
+    planned.clear();
+    if (!DesktopSurfaceWindowSmokeAccess::PlanVisibleGridDrop(
+            plannerVisible,
+            {plannerVisible[3]},
+            POINT{110, 60},
+            POINT{-1000, -1000},
+            plannerBounds,
+            80,
+            50,
+            40,
+            planned) ||
+        !plannedPoint(planned, L"planner-d").has_value() ||
+        plannedPoint(planned, L"planner-d")->x != 20 ||
+        plannedPoint(planned, L"planner-d")->y != 0) {
+        std::wcerr << L"Reverse edge clamping regressed";
+        return 201;
+    }
+
+    DesktopSurfaceWindowSmokeAccess::ConfigureSelectionFixture(
+        surface, items, {L"identity-a", L"identity-b"});
+    DesktopSurfaceWindowSmokeAccess::ReconcileSelection(
+        surface,
+        std::vector<DesktopViewItem>{items[0], items[2]},
+        {});
+    if (!DesktopSurfaceWindowSmokeAccess::IsSelected(
+            surface, L"identity-a") ||
+        DesktopSurfaceWindowSmokeAccess::IsSelected(
+            surface, L"identity-b")) {
+        std::wcerr << L"Selection identity reconciliation regressed\n";
+        return 192;
+    }
+
+    wchar_t smokeRoot[32768]{};
+    const DWORD smokeRootLength = GetEnvironmentVariableW(
+        L"DESKTOP_ORGANIZER_SMOKE_ITEMS_DIR",
+        smokeRoot,
+        ARRAYSIZE(smokeRoot));
+    if (smokeRootLength == 0 ||
+        smokeRootLength >= ARRAYSIZE(smokeRoot)) {
+        std::wcerr << L"Selection smoke root is unavailable\n";
+        return 193;
+    }
+    const std::filesystem::path firstPath =
+        std::filesystem::path(smokeRoot) / L"multi-drag-a.txt";
+    const std::filesystem::path secondPath =
+        std::filesystem::path(smokeRoot) / L"multi-drag-b.txt";
+    {
+        std::ofstream first(firstPath, std::ios::binary);
+        std::ofstream second(secondPath, std::ios::binary);
+        first << "A";
+        second << "B";
+    }
+    Microsoft::WRL::ComPtr<IDataObject> dataObject;
+    const std::vector<std::wstring> filePaths{
+        firstPath.wstring(), secondPath.wstring()};
+    const HRESULT createResult = CreateShellDragDataObject(
+        nullptr, filePaths, dataObject.GetAddressOf());
+    const auto extractedPaths = ExtractShellDropPaths(dataObject.Get());
+    if (FAILED(createResult) || dataObject == nullptr ||
+        extractedPaths != filePaths) {
+        std::ofstream diagnostic(
+            std::filesystem::path(smokeRoot) / L"multi-drag-result.txt");
+        diagnostic << "create=" << createResult << " count=" << extractedPaths.size() << "\n";
+        Microsoft::WRL::ComPtr<IShellItemArray> array;
+        const HRESULT arrayResult = dataObject == nullptr ? E_POINTER :
+            SHCreateShellItemArrayFromDataObject(dataObject.Get(), IID_PPV_ARGS(array.GetAddressOf()));
+        diagnostic << "array=" << arrayResult << "\n";
+        for (const auto& path : extractedPaths) {
+            diagnostic << Utf8Text(path) << "\n";
+        }
+        std::wcerr << L"Multi-file CF_HDROP round trip regressed\n";
+        return 194;
+    }
+    FORMATETC dropFormat{
+        CF_HDROP, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
+    STGMEDIUM dropMedium{};
+    if (FAILED(dataObject->GetData(
+            &dropFormat, &dropMedium)) ||
+        dropMedium.tymed != TYMED_HGLOBAL ||
+        dropMedium.hGlobal == nullptr) {
+        std::wcerr << L"Multi-file CF_HDROP storage is unavailable\n";
+        return 195;
+    }
+    bool hasDoubleTerminator = false;
+    const auto* dropFiles = static_cast<const DROPFILES*>(
+        GlobalLock(dropMedium.hGlobal));
+    const SIZE_T dropBytes = GlobalSize(dropMedium.hGlobal);
+    if (dropFiles != nullptr &&
+        dropFiles->pFiles <= dropBytes) {
+        const SIZE_T characterCount =
+            (dropBytes - dropFiles->pFiles) /
+                sizeof(wchar_t);
+        const auto* values =
+            reinterpret_cast<const wchar_t*>(
+                reinterpret_cast<const BYTE*>(dropFiles) +
+                dropFiles->pFiles);
+        hasDoubleTerminator =
+            characterCount >= 2 &&
+            values[characterCount - 1] == L'\0' &&
+            values[characterCount - 2] == L'\0';
+        GlobalUnlock(dropMedium.hGlobal);
+    }
+    ReleaseStgMedium(&dropMedium);
+    if (!hasDoubleTerminator) {
+        std::wcerr << L"Multi-file CF_HDROP lost its double terminator\n";
+        return 196;
+    }
+    return 0;
+}
+
 
 bool HasArgument(PWSTR commandLine, const wchar_t* target) {
     int argc = 0;
@@ -4794,6 +9412,9 @@ std::optional<int> RunSmokeOrPreviewCommand(
     if (HasArgument(commandLine, L"--smoke-managed-items")) {
         return RunSmokeManagedItems();
     }
+    if (HasArgument(commandLine, L"--smoke-legacy-storage-migration")) {
+        return RunSmokeLegacyStorageMigration();
+    }
     if (HasArgument(commandLine, L"--smoke-category-storage")) {
         return RunSmokeCategoryStorage();
     }
@@ -4805,6 +9426,43 @@ std::optional<int> RunSmokeOrPreviewCommand(
     }
     if (HasArgument(commandLine, L"--smoke-widget-desktop-layer")) {
         return RunSmokeWidgetDesktopLayer(instance);
+    }
+    if (HasArgument(commandLine, L"--smoke-desktop-targeted")) {
+        const int fidelityResult = RunSmokeDesktopIconFidelity(instance);
+        return fidelityResult == 0
+            ? RunSmokeDesktopDisplayTakeover(instance)
+            : fidelityResult;
+    }
+    if (HasArgument(
+            commandLine,
+            L"--smoke-desktop-icon-fidelity")) {
+        return RunSmokeDesktopIconFidelity(instance);
+    }
+    if (HasArgument(commandLine, L"--smoke-shell-desktop-bridge")) {
+        return RunSmokeShellDesktopBridge();
+    }
+    if (HasArgument(commandLine, L"--smoke-resource-idle")) {
+        return RunSmokeResourceIdle(instance);
+    }
+    if (HasArgument(
+            commandLine,
+            L"--smoke-collapse-selection-logic")) {
+        return RunSmokeCollapseSelectionLogic(instance);
+    }
+    if (HasArgument(
+            commandLine,
+            L"--smoke-desktop-display-takeover")) {
+        return RunSmokeDesktopDisplayTakeover(instance);
+    }
+    if (HasArgument(
+            commandLine,
+            L"--smoke-desktop-internal-drag")) {
+        return RunSmokeDesktopInternalDrag(instance);
+    }
+    if (HasArgument(
+            commandLine,
+            L"--smoke-desktop-native-drag-oracle")) {
+        return RunSmokeDesktopNativeDragOracle();
     }
     if (HasArgument(commandLine, L"--smoke-widget-interaction")) {
         return RunSmokeWidgetInteraction(instance);
@@ -4821,14 +9479,11 @@ std::optional<int> RunSmokeOrPreviewCommand(
     if (HasArgument(commandLine, L"--smoke-update-dialog")) {
         return RunSmokeUpdateAndDialog();
     }
-    if (HasArgument(commandLine, L"--smoke-real-shell-visibility")) {
-        return RunSmokeRealShellVisibility();
-    }
     if (HasArgument(commandLine, L"--smoke-real-desktop-grid-snapshot")) {
         return RunSmokeRealDesktopGridSnapshot();
     }
-    if (HasArgument(commandLine, L"--smoke-real-desktop-session-restore")) {
-        return RunSmokeRealDesktopSessionRestore();
+    if (HasArgument(commandLine, L"--smoke-real-desktop-takeover-invariants")) {
+        return RunSmokeRealDesktopTakeoverInvariants(instance);
     }
     if (HasArgument(commandLine, L"--smoke-real-desktop-grid-cleanup")) {
         return RunSmokeRealDesktopGridCleanup();

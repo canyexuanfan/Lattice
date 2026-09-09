@@ -77,6 +77,7 @@ struct AppConfig {
     std::wstring uncategorizedStorageFolder = L"uncategorized";
     std::vector<ItemConfig> items;
     std::vector<DesktopPlacementConfig> desktopLayout;
+    std::vector<DesktopPlacementConfig> desktopDisplayLayout;
     std::vector<std::wstring> uncategorizedItemIds;
     std::vector<CategoryConfig> categories;
 };
@@ -96,6 +97,8 @@ public:
         const WindowConfig& layout,
         const std::vector<std::wstring>& itemIds,
         bool updateItemOrder) const;
+    bool SaveDesktopDisplayPositionsAsync(
+        const std::vector<DesktopPlacementConfig>& positions) const;
     static bool DrainPendingWrites(unsigned long timeoutMilliseconds);
     bool ExportAppConfig(const std::wstring& path) const;
     bool ImportAppConfig(const std::wstring& path) const;

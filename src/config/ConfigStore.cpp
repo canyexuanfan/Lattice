@@ -247,9 +247,13 @@ struct InteractionMutation {
     std::wstring categoryId;
     WindowConfig layout;
     std::vector<std::wstring> itemIds;
+    std::vector<DesktopPlacementConfig> desktopDisplayPositionUpdates;
     bool updateItemOrder = false;
     std::uint64_t version = 0;
 };
+
+constexpr wchar_t kDesktopDisplayMutationKey[] =
+    L"\x1fdesktop-display-layout";
 
 std::mutex& InteractionMutationMutex() {
     static std::mutex mutex;
@@ -376,6 +380,26 @@ void ApplyInteractionMutations(
     const std::vector<InteractionMutation>& mutations,
     AppConfig& config) {
     for (const InteractionMutation& mutation : mutations) {
+        if (mutation.categoryId == kDesktopDisplayMutationKey) {
+            for (const DesktopPlacementConfig& update :
+                 mutation.desktopDisplayPositionUpdates) {
+                const auto existing = std::find_if(
+                    config.desktopDisplayLayout.begin(),
+                    config.desktopDisplayLayout.end(),
+                    [&](const DesktopPlacementConfig& value) {
+                        return CompareStringOrdinal(
+                                   value.path.c_str(), -1,
+                                   update.path.c_str(), -1,
+                                   TRUE) == CSTR_EQUAL;
+                    });
+                if (existing == config.desktopDisplayLayout.end()) {
+                    config.desktopDisplayLayout.push_back(update);
+                } else {
+                    *existing = update;
+                }
+            }
+            continue;
+        }
         if (mutation.categoryId == L"uncategorized") {
             config.window = mutation.layout;
             if (mutation.updateItemOrder) {
@@ -731,6 +755,25 @@ AppConfig ConfigStore::LoadAppConfigFromDisk() const {
         config.desktopLayout.push_back(std::move(placement));
     }
 
+    const int desktopDisplayLayoutCount =
+        readInt(L"desktopDisplayLayout.count", 0);
+    for (int layoutIndex = 0;
+         layoutIndex < desktopDisplayLayoutCount;
+         ++layoutIndex) {
+        const std::wstring prefix =
+            L"desktopDisplayLayout." +
+            std::to_wstring(layoutIndex) + L".";
+        const auto pathIt = values.find(prefix + L"path");
+        if (pathIt == values.end() || pathIt->second.empty()) {
+            continue;
+        }
+        DesktopPlacementConfig placement;
+        placement.path = pathIt->second;
+        placement.x = readInt(prefix + L"x", 0);
+        placement.y = readInt(prefix + L"y", 0);
+        config.desktopDisplayLayout.push_back(std::move(placement));
+    }
+
     int uncategorizedItemCount = 0;
     const auto uncategorizedCountIt = values.find(L"uncategorized.item.count");
     if (uncategorizedCountIt != values.end()) {
@@ -855,6 +898,53 @@ bool ConfigStore::SaveInteractionStateAsync(
         [store]() { return store.FlushInteractionStateToDisk(); });
 }
 
+bool ConfigStore::SaveDesktopDisplayPositionsAsync(
+    const std::vector<DesktopPlacementConfig>& positions) const {
+    if (positions.empty()) {
+        return true;
+    }
+    {
+        std::lock_guard<std::mutex> lock(InteractionMutationMutex());
+        std::uint64_t& nextVersion = NextInteractionMutationVersion();
+        if (nextVersion == 0) {
+            ++nextVersion;
+        }
+        auto& pending = PendingInteractionMutations()[configPath_];
+        InteractionMutation mutation;
+        const auto current = pending.find(kDesktopDisplayMutationKey);
+        if (current != pending.end()) {
+            mutation = current->second;
+        }
+        mutation.categoryId = kDesktopDisplayMutationKey;
+        for (const DesktopPlacementConfig& position : positions) {
+            const auto existing = std::find_if(
+                mutation.desktopDisplayPositionUpdates.begin(),
+                mutation.desktopDisplayPositionUpdates.end(),
+                [&](const DesktopPlacementConfig& value) {
+                    return CompareStringOrdinal(
+                               value.path.c_str(), -1,
+                               position.path.c_str(), -1,
+                               TRUE) == CSTR_EQUAL;
+                });
+            if (existing ==
+                mutation.desktopDisplayPositionUpdates.end()) {
+                mutation.desktopDisplayPositionUpdates.push_back(
+                    position);
+            } else {
+                *existing = position;
+            }
+        }
+        mutation.version = nextVersion++;
+        pending.insert_or_assign(
+            kDesktopDisplayMutationKey,
+            std::move(mutation));
+    }
+    const ConfigStore store = *this;
+    return AsyncConfigWriter::Instance().Enqueue(
+        configPath_,
+        [store]() { return store.FlushInteractionStateToDisk(); });
+}
+
 bool ConfigStore::DrainPendingWrites(unsigned long timeoutMilliseconds) {
     return AsyncConfigWriter::Instance().Drain(timeoutMilliseconds);
 }
@@ -930,6 +1020,20 @@ bool ConfigStore::SaveAppConfigToDisk(const AppConfig& config) const {
         output << "desktopLayout." << layoutIndex << ".path=" << WideToUtf8(config.desktopLayout[layoutIndex].path) << "\n";
         output << "desktopLayout." << layoutIndex << ".x=" << config.desktopLayout[layoutIndex].x << "\n";
         output << "desktopLayout." << layoutIndex << ".y=" << config.desktopLayout[layoutIndex].y << "\n";
+    }
+    output << "desktopDisplayLayout.count="
+           << config.desktopDisplayLayout.size() << "\n";
+    for (size_t layoutIndex = 0;
+         layoutIndex < config.desktopDisplayLayout.size();
+         ++layoutIndex) {
+        output << "desktopDisplayLayout." << layoutIndex << ".path="
+               << WideToUtf8(
+                      config.desktopDisplayLayout[layoutIndex].path)
+               << "\n";
+        output << "desktopDisplayLayout." << layoutIndex << ".x="
+               << config.desktopDisplayLayout[layoutIndex].x << "\n";
+        output << "desktopDisplayLayout." << layoutIndex << ".y="
+               << config.desktopDisplayLayout[layoutIndex].y << "\n";
     }
     output << "uncategorized.item.count=" << config.uncategorizedItemIds.size() << "\n";
     for (size_t itemIndex = 0; itemIndex < config.uncategorizedItemIds.size(); ++itemIndex) {

@@ -1,9 +1,16 @@
 #include "app/App.h"
 
-#include "desktop/CategoryStorageManager.h"
+#include <algorithm>
+
+#include "rendering/IconCache.h"
 #include "ui/MessageDialog.h"
 
 App::App(HINSTANCE instance) : instance_(instance) {}
+
+App::~App() {
+    mainWindow_.reset();
+    IconCache::ShutdownSharedLoader();
+}
 
 bool App::Initialize(int showCommand) {
     return InitializeInternal(showCommand, true);
@@ -13,8 +20,7 @@ bool App::InitializeForIsolatedSmoke(int showCommand) {
     return InitializeInternal(showCommand, false);
 }
 
-bool App::InitializeInternal(int showCommand, bool activateDesktopSession) {
-    interactiveDesktopSession_ = activateDesktopSession;
+bool App::InitializeInternal(int showCommand, bool enableDesktopTakeover) {
     if (!singleInstance_.IsPrimary()) {
         return false;
     }
@@ -27,45 +33,64 @@ bool App::InitializeInternal(int showCommand, bool activateDesktopSession) {
              L"\n\n为避免覆盖文件，本次未继续移动该项目。").c_str(),
             L"Lattice 桌面项目恢复",
             MB_OK | MB_ICONWARNING);
+        return false;
     }
-
-    CategoryStorageManager storageManager(configStore_, shortcutStore_);
-    std::wstring storageError;
-    if (!storageManager.SynchronizeAll(storageError) && !storageError.empty()) {
-        MessageDialog::Show(instance_,
-            nullptr,
-            (L"部分格子文件夹没有同步为格子名称，原文件夹和文件均已保留：\n\n" + storageError).c_str(),
-            L"Lattice 格子文件夹同步",
-            MB_OK | MB_ICONWARNING);
-    }
-
-    if (activateDesktopSession) {
-        std::wstring activationError;
-        if (!desktopSession_.Activate(configStore_, shortcutStore_, activationError) && !activationError.empty()) {
-            MessageDialog::Show(instance_,
-                nullptr,
-                (L"为保护原桌面布局，以下项目没有被移入格子：\n\n" + activationError).c_str(),
-                L"Lattice 桌面布局保护",
-                MB_OK | MB_ICONWARNING);
-        }
-    }
-
     mainWindow_ = std::make_unique<MainWindow>(
         instance_,
-        [this](HWND ownerWindow, std::wstring& errorMessage) {
-            if (desktopSessionDeactivated_) {
-                errorMessage.clear();
-                return true;
-            }
-            if (!desktopSession_.RestoreItems(configStore_, shortcutStore_, errorMessage, ownerWindow)) {
-                return false;
-            }
-            desktopItemsRestored_ = true;
+        [](HWND, std::wstring& errorMessage) {
+            errorMessage.clear();
             return true;
         },
-        activateDesktopSession);
+        false);
     if (!mainWindow_->Create()) {
         return false;
+    }
+
+    if (enableDesktopTakeover) {
+        const LegacyStorageMigrator::StartupAttempt migration =
+            legacyStorageMigrator_.AttemptForStartup(
+                configStore_, shortcutStore_, mainWindow_->Window());
+        if (migration.required) {
+            mainWindow_->ReloadPersistedState();
+        }
+        const int effectiveShowCommand =
+            mainWindow_->ShouldStartHidden() ? SW_HIDE : showCommand;
+        if (effectiveShowCommand != SW_HIDE) {
+            std::wstring takeoverError;
+            if (!mainWindow_->EnableDesktopDisplayTakeover(
+                    takeoverError)) {
+                if (takeoverError.find(L"stage=bounded-timeout") !=
+                    std::wstring::npos) {
+                    OutputDebugStringW(
+                        (L"Lattice cancelled desktop display takeover at the bounded startup deadline: " +
+                         takeoverError + L"\n").c_str());
+                    return false;
+                }
+                MessageDialog::Show(
+                    instance_,
+                    mainWindow_->Window(),
+                    (L"无法安全接管 Explorer 桌面图标显示层：\n\n" +
+                     takeoverError +
+                     L"\n\nLattice 未启动格子，以避免桌面项目重复显示。").c_str(),
+                    L"Lattice 桌面显示",
+                    MB_OK | MB_ICONWARNING);
+                return false;
+            }
+        }
+        if (!migration.completed) {
+            const std::wstring diagnostic =
+                L"Lattice deferred a legacy ManagedShortcuts migration and continued desktop display takeover: " +
+                migration.warning + L"\n";
+            OutputDebugStringW(diagnostic.c_str());
+        }
+
+        mainWindow_->Show(effectiveShowCommand);
+        if (!migration.completed) {
+            mainWindow_->ShowNonBlockingNotice(
+                L"Lattice 历史项目待处理",
+                L"一个旧版受管项目与当前桌面项目冲突。两端均已保留，Lattice 已继续正常运行；新收纳不会移动桌面原件。");
+        }
+        return true;
     }
 
     mainWindow_->Show(mainWindow_->ShouldStartHidden() ? SW_HIDE : showCommand);
@@ -89,34 +114,14 @@ int App::Run() {
     if (mainWindow_ != nullptr) {
         mainWindow_->FinishPendingDesktopPlacements();
     }
-    if (mainWindow_ != nullptr && mainWindow_->WasNormalExitCompleted() && desktopItemsRestored_) {
-        normalExitFinalizationError_.clear();
-        if (desktopSession_.RestoreLayout(configStore_, shortcutStore_, normalExitFinalizationError_)) {
-            desktopSessionDeactivated_ = true;
-        } else if (interactiveDesktopSession_) {
-            MessageDialog::Show(
-                instance_,
-                nullptr,
-                (L"Lattice 已安全归还桌面项目，但部分图标坐标没有完全恢复：\n\n" +
-                 normalExitFinalizationError_).c_str(),
-                L"Lattice 桌面布局恢复",
-                MB_OK | MB_ICONWARNING);
-        }
-    }
     if (mainWindow_ != nullptr && mainWindow_->WasUpdateExitRequested()) {
         OutputDebugStringW(
-            L"Lattice update exit preserved managed desktop items and user configuration in place.\n");
-    } else if (!desktopSessionDeactivated_) {
-        OutputDebugStringW(
-            L"Lattice window ended without a completed normal desktop restore; managed items and the saved layout were left unchanged.\n");
+            L"Lattice update exit closed the desktop display surface and preserved original desktop paths.\n");
     }
     return static_cast<int>(message.wParam);
 }
 
 const std::wstring& App::LastNormalExitError() const noexcept {
     static const std::wstring empty;
-    if (!normalExitFinalizationError_.empty()) {
-        return normalExitFinalizationError_;
-    }
     return mainWindow_ == nullptr ? empty : mainWindow_->LastNormalExitError();
 }

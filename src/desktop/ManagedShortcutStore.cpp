@@ -483,7 +483,14 @@ ManagedShortcutStore::ManagedShortcutStore() {
         desktopPath_ = KnownFolderPath(FOLDERID_Desktop);
     }
     desktopPath_ = FullPath(desktopPath_);
-    publicDesktopPath_ = FullPath(KnownFolderPath(FOLDERID_PublicDesktop));
+    publicDesktopPath_ = EnvironmentPath(
+        L"DESKTOP_ORGANIZER_PUBLIC_DESKTOP_DIR");
+    if (publicDesktopPath_.empty()) {
+        publicDesktopPath_ = KnownFolderPath(FOLDERID_PublicDesktop);
+    } else {
+        publicDesktopRequiresElevation_ = false;
+    }
+    publicDesktopPath_ = FullPath(publicDesktopPath_);
     journalPath_ = JoinPath(rootPath_, L"move-journal.bin");
     journalTempPath_ = journalPath_ + L".tmp";
 }
@@ -509,9 +516,10 @@ bool ManagedShortcutStore::IsSupportedDesktopItem(const std::wstring& path) cons
     if (attributes == INVALID_FILE_ATTRIBUTES) {
         return IsShellNamespaceItem(path);
     }
-    return
-           !PathsEqual(path, desktopPath_) && !PathsEqual(path, publicDesktopPath_) && !PathIsInside(path, rootPath_) &&
-           !fileName.empty() && fileName != L"." && fileName != L"..";
+    const std::wstring parent = ParentDirectory(FullPath(path));
+    return !fileName.empty() && fileName != L"." && fileName != L".." &&
+        (PathsEqual(parent, desktopPath_) ||
+         PathsEqual(parent, publicDesktopPath_));
 }
 
 bool ManagedShortcutStore::IsSupportedShortcut(const std::wstring& path) const {
@@ -522,15 +530,9 @@ bool ManagedShortcutStore::IsSupportedShortcut(const std::wstring& path) const {
 }
 
 bool ManagedShortcutStore::RequiresManagedStorage(const std::wstring& path) const {
-    if (IsManagedPath(path)) {
-        return true;
-    }
-
-    // Explorer has no durable per-item hide API for ordinary filesystem
-    // objects. User and Public Desktop items therefore share the same unique
-    // original move transaction. Public Desktop permission elevation, when it
-    // is actually required, is handled by the move operation itself.
-    return IsDesktopPath(path) && IsSupportedDesktopItem(path);
+    // ManagedShortcuts is a legacy migration source only. New desktop
+    // collection keeps the original Shell identity and absolute path.
+    return IsManagedPath(path);
 }
 
 bool ManagedShortcutStore::IsManagedPath(const std::wstring& path) const {
@@ -553,6 +555,7 @@ bool ManagedShortcutStore::IsShellNamespaceItem(const std::wstring& path) const 
     return SUCCEEDED(SHCreateItemFromParsingName(path.c_str(), nullptr, IID_PPV_ARGS(&item))) && item != nullptr;
 }
 
+#if defined(_DEBUG)
 bool ManagedShortcutStore::IsDesktopPositionSuppressed(const ItemConfig& item) const noexcept {
     return item.desktopVisibilityMode == kOffscreenVisibilityMode;
 }
@@ -640,6 +643,7 @@ bool ManagedShortcutStore::PrepareForManagedStorage(
     item.desktopVisibilityClassicValue = -1;
     return true;
 }
+#endif
 
 bool ManagedShortcutStore::RestoreDesktopVisibility(
     const ItemConfig& item,
@@ -694,6 +698,7 @@ bool ManagedShortcutStore::RestoreDesktopVisibility(
     return true;
 }
 
+#if defined(_DEBUG)
 std::wstring ManagedShortcutStore::CategoryPath(const std::wstring& categoryId) const {
     return JoinPath(rootPath_, SafeFolderName(categoryId));
 }
@@ -745,6 +750,7 @@ bool ManagedShortcutStore::MoveToDesktop(
         {},
         ownerWindow);
 }
+#endif
 
 bool ManagedShortcutStore::MoveToOriginalDesktop(
     const std::wstring& itemId,
@@ -817,7 +823,7 @@ bool ManagedShortcutStore::MoveToOriginalDesktopBatch(
         return true;
     }
     if (!persistDestinations || ownerWindow == nullptr || IsWindow(ownerWindow) == FALSE) {
-        errorMessage = L"归还共享桌面项目需要仍然有效的 Lattice 窗口；本次未移动任何项目。";
+        errorMessage = L"历史桌面迁移需要仍然有效的 Lattice 窗口；本次未移动任何项目。";
         return false;
     }
 
@@ -830,21 +836,29 @@ bool ManagedShortcutStore::MoveToOriginalDesktopBatch(
         journal.destinationPath = FullPath(request.destinationPath);
         journal.releaseToDesktop = true;
         const DWORD attributes = GetFileAttributesW(journal.sourcePath.c_str());
+        const std::wstring destinationDirectory =
+            ParentDirectory(journal.destinationPath);
         if (journal.itemId.empty() || !IsManagedPath(journal.sourcePath) ||
-            !IsPublicDesktopPath(journal.destinationPath) ||
-            !PathsEqual(ParentDirectory(journal.destinationPath), publicDesktopPath_) ||
+            !IsDesktopPath(journal.destinationPath) ||
+            (!PathsEqual(destinationDirectory, desktopPath_) &&
+             !PathsEqual(destinationDirectory, publicDesktopPath_)) ||
             attributes == INVALID_FILE_ATTRIBUTES) {
-            errorMessage = L"共享桌面批量归还包含无效路径；本次未移动任何项目。";
+            errorMessage = L"历史桌面批量迁移包含无效路径；本次未移动任何项目。";
             return false;
         }
         if (GetFileAttributesW(journal.destinationPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
-            errorMessage = L"共享桌面的原位置已被占用，未覆盖任何项目：" + journal.destinationPath;
+            errorMessage =
+                (IsPublicDesktopPath(journal.destinationPath)
+                    ? std::wstring(L"Public Desktop")
+                    : std::wstring(L"User Desktop")) +
+                L" 的原位置已被不同项目占用，已保留两端且未覆盖：" +
+                journal.destinationPath;
             return false;
         }
         if (std::any_of(journals.begin(), journals.end(), [&](const JournalEntry& value) {
                 return PathsEqual(value.destinationPath, journal.destinationPath) || value.itemId == journal.itemId;
             })) {
-            errorMessage = L"共享桌面批量归还包含重复目标；本次未移动任何项目。";
+            errorMessage = L"历史桌面批量迁移包含重复目标；本次未移动任何项目。";
             return false;
         }
         journals.push_back(std::move(journal));
@@ -854,7 +868,6 @@ bool ManagedShortcutStore::MoveToOriginalDesktopBatch(
     }
 
     Microsoft::WRL::ComPtr<IFileOperation> operation;
-    Microsoft::WRL::ComPtr<IShellItem> destinationFolder;
     HRESULT result = CoCreateInstance(CLSID_FileOperation, nullptr, CLSCTX_ALL, IID_PPV_ARGS(&operation));
     if (SUCCEEDED(result)) {
         result = operation->SetOwnerWindow(ownerWindow);
@@ -863,19 +876,28 @@ bool ManagedShortcutStore::MoveToOriginalDesktopBatch(
         DWORD flags =
             FOF_SILENT | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_NOCONFIRMMKDIR |
             FOFX_EARLYFAILURE;
-        if (publicDesktopRequiresElevation_) {
+        const bool needsPublicDesktop = std::any_of(
+            journals.begin(), journals.end(),
+            [&](const JournalEntry& journal) {
+                return IsPublicDesktopPath(journal.destinationPath);
+            });
+        if (publicDesktopRequiresElevation_ && needsPublicDesktop) {
             flags |= FOFX_SHOWELEVATIONPROMPT | FOFX_REQUIREELEVATION;
         }
         result = operation->SetOperationFlags(flags);
     }
-    if (SUCCEEDED(result)) {
-        result = SHCreateItemFromParsingName(
-            publicDesktopPath_.c_str(), nullptr, IID_PPV_ARGS(&destinationFolder));
-    }
     for (size_t index = 0; SUCCEEDED(result) && index < journals.size(); ++index) {
         Microsoft::WRL::ComPtr<IShellItem> sourceItem;
+        Microsoft::WRL::ComPtr<IShellItem> destinationFolder;
         result = SHCreateItemFromParsingName(
             journals[index].sourcePath.c_str(), nullptr, IID_PPV_ARGS(&sourceItem));
+        if (SUCCEEDED(result)) {
+            const std::wstring destinationDirectory =
+                ParentDirectory(journals[index].destinationPath);
+            result = SHCreateItemFromParsingName(
+                destinationDirectory.c_str(), nullptr,
+                IID_PPV_ARGS(&destinationFolder));
+        }
         if (SUCCEEDED(result)) {
             result = operation->MoveItem(
                 sourceItem.Get(),
@@ -938,8 +960,8 @@ bool ManagedShortcutStore::MoveToOriginalDesktopBatch(
         }
         errorMessage = ErrorText(
             rolledBack && endpointsUnambiguous
-                ? L"共享桌面批量归还没有完成，已恢复到退出前状态"
-                : L"共享桌面批量归还没有完成，且自动回滚未完全成功；移动日志已保留",
+                ? L"历史桌面批量迁移没有完成，已恢复到迁移前状态"
+                : L"历史桌面批量迁移没有完成，且自动回滚未完全成功；移动日志已保留",
             error);
         return false;
     }
@@ -958,8 +980,8 @@ bool ManagedShortcutStore::MoveToOriginalDesktopBatch(
         const bool rolledBack = rollbackMoved();
         destinations.clear();
         errorMessage = rolledBack
-            ? L"无法保存共享桌面归还结果，全部项目已恢复到退出前状态。"
-            : L"无法保存共享桌面归还结果，且自动回滚未完全成功；移动日志已保留。";
+            ? L"无法保存历史桌面迁移结果，全部项目已恢复到迁移前状态。"
+            : L"无法保存历史桌面迁移结果，且自动回滚未完全成功；移动日志已保留。";
         return false;
     }
 

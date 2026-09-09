@@ -97,9 +97,12 @@
     <ClCompile Include="src\config\ConfigStore.cpp" />
     <ClCompile Include="src\desktop\CategoryStorageManager.cpp" />
     <ClCompile Include="src\desktop\DesktopLayout.cpp" />
+    <ClCompile Include="src\desktop\LegacyStorageMigrator.cpp" />
     <ClCompile Include="src\desktop\DesktopPlacementCoordinator.cpp" />
     <ClCompile Include="src\desktop\DesktopScanner.cpp" />
-    <ClCompile Include="src\desktop\DesktopSession.cpp" />
+    <ClCompile Include="src\desktop\DesktopSession.cpp">
+      <ExcludedFromBuild Condition="'$(Configuration)'=='Release'">true</ExcludedFromBuild>
+    </ClCompile>
     <ClCompile Include="src\desktop\DesktopWatcher.cpp" />
     <ClCompile Include="src\desktop\ManagedShortcutStore.cpp" />
     <ClCompile Include="src\desktop\ShortcutResolver.cpp" />
@@ -108,11 +111,13 @@
     <ClCompile Include="src\rendering\WallpaperBackdrop.cpp" />
     <ClCompile Include="src\shell\ShellLauncher.cpp" />
     <ClCompile Include="src\shell\ShellDragDrop.cpp" />
+    <ClCompile Include="src\shell\ShellItemReference.cpp" />
     <ClCompile Include="src\shell\ShellDropTarget.cpp" />
     <ClCompile Include="src\testing\SmokeCommands.cpp">
       <ExcludedFromBuild Condition="'$(Configuration)'=='Release'">true</ExcludedFromBuild>
     </ClCompile>
     <ClCompile Include="src\ui\DragGhostWindow.cpp" />
+    <ClCompile Include="src\ui\DesktopSurfaceWindow.cpp" />
     <ClCompile Include="src\ui\IconGrid.cpp" />
     <ClCompile Include="src\ui\InputDialog.cpp" />
     <ClCompile Include="src\ui\MessageDialog.cpp" />
@@ -131,6 +136,7 @@
     <ClInclude Include="src\config\ConfigStore.h" />
     <ClInclude Include="src\desktop\CategoryStorageManager.h" />
     <ClInclude Include="src\desktop\DesktopLayout.h" />
+    <ClInclude Include="src\desktop\LegacyStorageMigrator.h" />
     <ClInclude Include="src\desktop\DesktopPlacementCoordinator.h" />
     <ClInclude Include="src\desktop\DesktopItem.h" />
     <ClInclude Include="src\desktop\DesktopSession.h" />
@@ -143,9 +149,11 @@
     <ClInclude Include="src\rendering\WallpaperBackdrop.h" />
     <ClInclude Include="src\shell\ShellLauncher.h" />
     <ClInclude Include="src\shell\ShellDragDrop.h" />
+    <ClInclude Include="src\shell\ShellItemReference.h" />
     <ClInclude Include="src\shell\ShellDropTarget.h" />
     <ClInclude Include="src\testing\SmokeCommands.h" />
     <ClInclude Include="src\ui\DragGhostWindow.h" />
+    <ClInclude Include="src\ui\DesktopSurfaceWindow.h" />
     <ClInclude Include="src\ui\IconGrid.h" />
     <ClInclude Include="src\ui\InputDialog.h" />
     <ClInclude Include="src\ui\MessageDialog.h" />

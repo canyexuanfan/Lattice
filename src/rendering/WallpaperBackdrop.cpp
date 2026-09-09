@@ -219,22 +219,70 @@ bool FileWriteTime(const std::wstring& path, FILETIME& writeTime) {
     return true;
 }
 
-std::shared_ptr<const DecodedWallpaper> CachedWallpaper(const std::wstring& path) {
-    static std::mutex cacheMutex;
-    static std::wstring cachedPath;
-    static FILETIME cachedWriteTime{};
-    static std::shared_ptr<const DecodedWallpaper> cachedImage;
+constexpr UINT kDecodedWallpaperReleaseDelayMilliseconds = 750;
 
+struct DecodedWallpaperCache {
+    std::mutex mutex;
+    std::wstring path;
+    FILETIME writeTime{};
+    std::shared_ptr<const DecodedWallpaper> image;
+    UINT_PTR releaseTimer = 0;
+};
+
+DecodedWallpaperCache& SharedDecodedWallpaperCache() {
+    static DecodedWallpaperCache cache;
+    return cache;
+}
+
+void CALLBACK ReleaseDecodedWallpaperCache(
+    HWND,
+    UINT,
+    UINT_PTR timerId,
+    DWORD) {
+    DecodedWallpaperCache& cache = SharedDecodedWallpaperCache();
+    std::lock_guard<std::mutex> lock(cache.mutex);
+    if (cache.releaseTimer != timerId) {
+        return;
+    }
+    KillTimer(nullptr, timerId);
+    cache.releaseTimer = 0;
+    cache.image.reset();
+    cache.path.clear();
+    cache.writeTime = {};
+}
+
+void ScheduleDecodedWallpaperReleaseLocked(
+    DecodedWallpaperCache& cache) {
+    if (cache.releaseTimer != 0) {
+        KillTimer(nullptr, cache.releaseTimer);
+        cache.releaseTimer = 0;
+    }
+    cache.releaseTimer = SetTimer(
+        nullptr,
+        0,
+        kDecodedWallpaperReleaseDelayMilliseconds,
+        ReleaseDecodedWallpaperCache);
+    if (cache.releaseTimer == 0) {
+        cache.image.reset();
+        cache.path.clear();
+        cache.writeTime = {};
+    }
+}
+
+std::shared_ptr<const DecodedWallpaper> CachedWallpaper(const std::wstring& path) {
+    DecodedWallpaperCache& cache = SharedDecodedWallpaperCache();
     FILETIME writeTime{};
     if (!FileWriteTime(path, writeTime)) {
         return {};
     }
     {
-        std::lock_guard<std::mutex> lock(cacheMutex);
-        if (cachedImage != nullptr &&
-            CompareStringOrdinal(cachedPath.c_str(), -1, path.c_str(), -1, TRUE) == CSTR_EQUAL &&
-            CompareFileTime(&cachedWriteTime, &writeTime) == 0) {
-            return cachedImage;
+        std::lock_guard<std::mutex> lock(cache.mutex);
+        if (cache.image != nullptr &&
+            CompareStringOrdinal(cache.path.c_str(), -1, path.c_str(), -1, TRUE) == CSTR_EQUAL &&
+            CompareFileTime(&cache.writeTime, &writeTime) == 0) {
+            const std::shared_ptr<const DecodedWallpaper> result = cache.image;
+            ScheduleDecodedWallpaperReleaseLocked(cache);
+            return result;
         }
     }
 
@@ -242,11 +290,13 @@ std::shared_ptr<const DecodedWallpaper> CachedWallpaper(const std::wstring& path
     if (!DecodeWallpaper(path, *decoded)) {
         return {};
     }
-    std::lock_guard<std::mutex> lock(cacheMutex);
-    cachedPath = path;
-    cachedWriteTime = writeTime;
-    cachedImage = decoded;
-    return cachedImage;
+    std::lock_guard<std::mutex> lock(cache.mutex);
+    cache.path = path;
+    cache.writeTime = writeTime;
+    cache.image = decoded;
+    const std::shared_ptr<const DecodedWallpaper> result = cache.image;
+    ScheduleDecodedWallpaperReleaseLocked(cache);
+    return result;
 }
 
 BgraPixel BackgroundPixel(COLORREF color) {
@@ -469,7 +519,8 @@ bool WallpaperBackdrop::Refresh(
     HWND hwnd,
     ID2D1RenderTarget* renderTarget,
     int minimumWidthPixels,
-    int minimumHeightPixels) {
+    int minimumHeightPixels,
+    bool blur) {
     bitmap_.Reset();
     pixelSize_ = {};
     if (hwnd == nullptr || renderTarget == nullptr) {
@@ -501,7 +552,7 @@ bool WallpaperBackdrop::Refresh(
         return false;
     }
 
-    const int padding = kBlurRadius * kBlurPasses;
+    const int padding = blur ? kBlurRadius * kBlurPasses : 0;
     const int sampleWidth = outputWidth + padding * 2;
     const int sampleHeight = outputHeight + padding * 2;
     if (sampleWidth <= 0 || sampleHeight <= 0 ||
@@ -523,7 +574,9 @@ bool WallpaperBackdrop::Refresh(
             sampled[offset + 3U] = 255;
         }
     }
-    BlurPixels(sampled, sampleWidth, sampleHeight);
+    if (blur) {
+        BlurPixels(sampled, sampleWidth, sampleHeight);
+    }
 
     std::vector<BYTE> output(static_cast<size_t>(outputWidth) * outputHeight * 4U);
     const size_t outputStride = static_cast<size_t>(outputWidth) * 4U;
@@ -552,28 +605,56 @@ bool WallpaperBackdrop::Refresh(
     return created;
 }
 
-bool WallpaperBackdrop::Draw(ID2D1RenderTarget* renderTarget, const D2D1_RECT_F& destination) const {
+bool CalculateWallpaperBackdropDrawGeometry(
+    D2D1_SIZE_F bitmapSize,
+    const D2D1_RECT_F& destination,
+    WallpaperBackdropDrawMode mode,
+    WallpaperBackdropDrawGeometry& geometry) noexcept {
+    const FLOAT destinationWidth = destination.right - destination.left;
+    const FLOAT destinationHeight = destination.bottom - destination.top;
+    if (bitmapSize.width <= 0.0f || bitmapSize.height <= 0.0f ||
+        destinationWidth <= 0.0f || destinationHeight <= 0.0f) {
+        return false;
+    }
+    if (mode == WallpaperBackdropDrawMode::StretchToDestination) {
+        geometry.destination = destination;
+        geometry.source = D2D1::RectF(
+            0.0f, 0.0f, bitmapSize.width, bitmapSize.height);
+        return true;
+    }
+
+    const FLOAT visibleWidth =
+        (std::min)(bitmapSize.width, destinationWidth);
+    const FLOAT visibleHeight =
+        (std::min)(bitmapSize.height, destinationHeight);
+    geometry.destination = D2D1::RectF(
+        destination.left,
+        destination.top,
+        destination.left + visibleWidth,
+        destination.top + visibleHeight);
+    geometry.source = D2D1::RectF(
+        0.0f, 0.0f, visibleWidth, visibleHeight);
+    return true;
+}
+
+bool WallpaperBackdrop::Draw(
+    ID2D1RenderTarget* renderTarget,
+    const D2D1_RECT_F& destination,
+    WallpaperBackdropDrawMode mode) const {
     if (renderTarget == nullptr || bitmap_ == nullptr) {
         return false;
     }
-    const D2D1_SIZE_F bitmapSize = bitmap_->GetSize();
-    const FLOAT sourceWidth = (std::min)(bitmapSize.width, destination.right - destination.left);
-    const FLOAT sourceHeight = (std::min)(bitmapSize.height, destination.bottom - destination.top);
-    if (sourceWidth <= 0.0f || sourceHeight <= 0.0f) {
+    WallpaperBackdropDrawGeometry geometry{};
+    if (!CalculateWallpaperBackdropDrawGeometry(
+            bitmap_->GetSize(), destination, mode, geometry)) {
         return false;
     }
-    const D2D1_RECT_F visibleDestination = D2D1::RectF(
-        destination.left,
-        destination.top,
-        destination.left + sourceWidth,
-        destination.top + sourceHeight);
-    const D2D1_RECT_F source = D2D1::RectF(0.0f, 0.0f, sourceWidth, sourceHeight);
     renderTarget->DrawBitmap(
         bitmap_.Get(),
-        visibleDestination,
+        geometry.destination,
         1.0f,
         D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
-        &source);
+        &geometry.source);
     return true;
 }
 

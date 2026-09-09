@@ -22,15 +22,24 @@ class IconCache {
 public:
     IconCache();
     ~IconCache();
+    static void ShutdownSharedLoader();
     ID2D1Bitmap* GetIcon(
         ID2D1RenderTarget* target,
         const std::wstring& path,
         const std::wstring& displayName = L"",
         IconPlaceholderKind placeholderKind = IconPlaceholderKind::File,
-        bool* usedPlaceholder = nullptr);
+        bool* usedPlaceholder = nullptr,
+        int systemImageIndex = -1,
+        int overlayIndex = 0,
+        int desiredPixelSize = 0);
     bool IsIconReady(ID2D1RenderTarget* target, const std::wstring& path);
     HICON CopyReadyIconForDrag(const std::wstring& path);
     void Preload(const std::wstring& path);
+    void PreloadShellIcon(
+        const std::wstring& path,
+        int systemImageIndex,
+        int overlayIndex,
+        int desiredPixelSize);
     void Alias(const std::wstring& sourcePath, const std::wstring& destinationPath);
     void Clear();
     size_t Size() const noexcept;
@@ -40,7 +49,11 @@ public:
 private:
     void EnsureTargetResources(ID2D1RenderTarget* target);
     void ProcessCompleted(ID2D1RenderTarget* target);
-    void Enqueue(const std::wstring& path);
+    void Enqueue(
+        const std::wstring& path,
+        int systemImageIndex = -1,
+        int overlayIndex = 0,
+        int desiredPixelSize = 0);
     ID2D1Bitmap* GetPlaceholder(
         ID2D1RenderTarget* target,
         IconPlaceholderKind placeholderKind);

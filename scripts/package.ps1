@@ -1,3 +1,7 @@
+param(
+    [switch]$SkipBuild
+)
+
 $ErrorActionPreference = "Stop"
 
 $projectRoot = Split-Path -Parent $PSScriptRoot
@@ -35,7 +39,7 @@ $resourceSource = Get-Content -LiteralPath $resourceScript -Raw
 $iconCacheSource = Get-Content -LiteralPath $iconCacheSourcePath -Raw
 $iconGridSource = Get-Content -LiteralPath $iconGridSourcePath -Raw
 if (
-    $installerSource -notmatch 'Name:\s*"shortcutoverlay"' -or
+    $installerSource -match '(?m)^\s*Name:\s*"shortcutoverlay"' -or
     $installerSource -notmatch 'ShellIconsKey\s*=\s*''Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Shell Icons''' -or
     $installerSource -notmatch 'OverlayValueName\s*=\s*''29''' -or
     $installerSource -notmatch 'SnapshotShortcutOverlay' -or
@@ -46,7 +50,7 @@ if (
     $iconCacheSource -match 'BuildShortcutOverlayPixels|GetShortcutOverlay' -or
     $iconGridSource -match 'GetShortcutOverlay'
 ) {
-    throw "Shortcut overlay packaging contract is incomplete or manual grid composition returned."
+    throw "Automatic shortcut overlay packaging contract is incomplete, a user-selectable task returned, or manual grid composition returned."
 }
 if ($installerSource -match 'WaitForProductExit\s*\(\s*\d{3,}\s*\)') {
     throw "Installer contains a minute-scale product exit wait."
@@ -71,7 +75,9 @@ if (
     throw "Installer product exit wait exceeds the 5-second UX budget: $maximumProductExitWaitMilliseconds ms."
 }
 
-& $buildScript -Configuration Release
+if (!$SkipBuild) {
+    & $buildScript -Configuration Release
+}
 $releaseExe = Join-Path $releaseDir "Lattice.exe"
 if (!(Test-Path -LiteralPath $releaseExe)) {
     throw "Release executable not found: $releaseExe"

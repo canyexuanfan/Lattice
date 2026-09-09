@@ -42,6 +42,25 @@ bool TrayIcon::Initialize(HWND owner, HINSTANCE instance) {
     return true;
 }
 
+bool TrayIcon::ShowNotification(
+    const std::wstring& title,
+    const std::wstring& message,
+    DWORD flags) {
+    if (!visible_ || owner_ == nullptr ||
+        IsWindow(owner_) == FALSE || message.empty()) {
+        return false;
+    }
+    NOTIFYICONDATAW data{};
+    data.cbSize = sizeof(data);
+    data.hWnd = owner_;
+    data.uID = id_;
+    data.uFlags = NIF_INFO;
+    data.dwInfoFlags = flags;
+    lstrcpynW(data.szInfoTitle, title.c_str(), ARRAYSIZE(data.szInfoTitle));
+    lstrcpynW(data.szInfo, message.c_str(), ARRAYSIZE(data.szInfo));
+    return Shell_NotifyIconW(NIM_MODIFY, &data) != FALSE;
+}
+
 void TrayIcon::Remove() {
     if (!visible_ || owner_ == nullptr) {
         return;

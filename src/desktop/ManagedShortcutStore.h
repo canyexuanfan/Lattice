@@ -31,8 +31,8 @@ public:
     bool IsDesktopPath(const std::wstring& path) const;
     bool IsPublicDesktopPath(const std::wstring& path) const;
     bool IsShellNamespaceItem(const std::wstring& path) const;
+#if defined(_DEBUG)
     bool IsDesktopPositionSuppressed(const ItemConfig& item) const noexcept;
-
     bool CaptureAndSuppressDesktopVisibility(
         const std::wstring& path,
         ItemConfig& item,
@@ -41,11 +41,13 @@ public:
     bool PrepareForManagedStorage(
         ItemConfig& item,
         std::wstring& errorMessage) const;
+#endif
     bool RestoreDesktopVisibility(
         const ItemConfig& item,
         std::wstring& errorMessage,
         const POINT* releaseScreenPoint = nullptr) const;
 
+#if defined(_DEBUG)
     bool MoveIntoCategory(
         const std::wstring& itemId,
         const std::wstring& sourcePath,
@@ -62,6 +64,7 @@ public:
         std::wstring& destinationPath,
         std::wstring& errorMessage,
         HWND ownerWindow = nullptr);
+#endif
 
     bool MoveToOriginalDesktop(
         const std::wstring& itemId,
@@ -89,8 +92,10 @@ public:
 
     const std::wstring& RootPath() const noexcept { return rootPath_; }
     const std::wstring& DesktopPath() const noexcept { return desktopPath_; }
+#if defined(_DEBUG)
     std::wstring CategoryPath(const std::wstring& categoryId) const;
     bool EnsureCategoryDirectory(const std::wstring& categoryId) const;
+#endif
 
 private:
     struct JournalEntry {

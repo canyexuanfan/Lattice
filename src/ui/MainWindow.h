@@ -21,6 +21,7 @@
 #include "rendering/IconCache.h"
 #include "shell/ShellLauncher.h"
 #include "ui/IconGrid.h"
+#include "ui/DesktopSurfaceWindow.h"
 #include "ui/SettingsDialog.h"
 #include "ui/WidgetWindow.h"
 
@@ -35,6 +36,12 @@ public:
     ~MainWindow();
 
     bool Create();
+    HWND Window() const noexcept { return hwnd_; }
+    bool EnableDesktopDisplayTakeover(std::wstring& errorMessage);
+    void ReloadPersistedState();
+    void ShowNonBlockingNotice(
+        const std::wstring& title,
+        const std::wstring& message);
     void Show(int showCommand);
     bool ShouldStartHidden() const noexcept {
         return organizerConfig_.settings.startHidden ||
@@ -61,6 +68,8 @@ private:
     LRESULT HandleMessage(UINT message, WPARAM wParam, LPARAM lParam);
 
     void LoadDesktopItems();
+    std::vector<std::wstring> AssignedDesktopIdentities() const;
+    void RefreshDesktopSurfaceAssignments();
     void ScheduleDesktopRefresh();
     void ToggleAllVisible();
     void ToggleAllLocked();
@@ -185,6 +194,7 @@ private:
     int hoverTabIndex_ = -1;
     int hoverButtonIndex_ = -1;
     std::vector<std::unique_ptr<WidgetWindow>> widgetWindows_;
+    std::unique_ptr<DesktopSurfaceWindow> desktopSurface_;
     std::vector<TileView> tileViews_;
     std::unordered_map<std::wstring, bool> tileCollapsed_;
     int tileScrollOffset_ = 0;

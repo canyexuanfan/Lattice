@@ -10,6 +10,13 @@
 #include <wrl/client.h>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <cstring>
+#include <memory>
+#include <mutex>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -82,9 +89,13 @@ void NotifyDesktopItemsCreated(
     }
 }
 
-HRESULT GetDesktopFolderView(
+HRESULT GetDesktopFolderViewOnce(
     ComPtr<IFolderView>& folderView,
     HWND* viewWindow = nullptr) {
+    folderView.Reset();
+    if (viewWindow != nullptr) {
+        *viewWindow = nullptr;
+    }
     ComPtr<IShellWindows> shellWindows;
     HRESULT result = CoCreateInstance(CLSID_ShellWindows, nullptr, CLSCTX_ALL, IID_PPV_ARGS(&shellWindows));
     if (FAILED(result)) {
@@ -99,8 +110,8 @@ HRESULT GetDesktopFolderView(
     long desktopHwnd = 0;
     ComPtr<IDispatch> dispatch;
     result = shellWindows->FindWindowSW(&location, &root, SWC_DESKTOP, &desktopHwnd, SWFO_NEEDDISPATCH, &dispatch);
-    if (FAILED(result)) {
-        return result;
+    if (FAILED(result) || dispatch == nullptr) {
+        return FAILED(result) ? result : E_NOINTERFACE;
     }
 
     ComPtr<IServiceProvider> serviceProvider;
@@ -128,6 +139,23 @@ HRESULT GetDesktopFolderView(
     return shellView.As(&folderView);
 }
 
+HRESULT GetDesktopFolderView(
+    ComPtr<IFolderView>& folderView,
+    HWND* viewWindow = nullptr) {
+    HRESULT result = E_FAIL;
+    for (int attempt = 0; attempt < 6; ++attempt) {
+        result = GetDesktopFolderViewOnce(folderView, viewWindow);
+        if (SUCCEEDED(result) && folderView != nullptr &&
+            (viewWindow == nullptr || *viewWindow != nullptr)) {
+            return result;
+        }
+        if (attempt + 1 < 6) {
+            Sleep(static_cast<DWORD>(20 * (attempt + 1)));
+        }
+    }
+    return FAILED(result) ? result : E_NOINTERFACE;
+}
+
 bool ItemPath(IShellFolder* folder, PCUITEMID_CHILD item, std::wstring& path) {
     STRRET displayName{};
     if (FAILED(folder->GetDisplayNameOf(item, SHGDN_FORPARSING, &displayName))) {
@@ -139,6 +167,74 @@ bool ItemPath(IShellFolder* folder, PCUITEMID_CHILD item, std::wstring& path) {
     }
     path = buffer.data();
     return !path.empty();
+}
+
+std::wstring ItemDisplayName(
+    IShellFolder* folder,
+    PCUITEMID_CHILD item,
+    const std::wstring& fallback) {
+    STRRET displayName{};
+    if (folder == nullptr ||
+        FAILED(folder->GetDisplayNameOf(item, SHGDN_NORMAL, &displayName))) {
+        return fallback;
+    }
+    std::vector<wchar_t> buffer(32768);
+    if (FAILED(StrRetToBufW(
+            &displayName,
+            item,
+            buffer.data(),
+            static_cast<UINT>(buffer.size()))) ||
+        buffer[0] == L'\0') {
+        return fallback;
+    }
+    return buffer.data();
+}
+
+void ReadShellImageIdentity(
+    IShellFolder* folder,
+    PCUITEMID_CHILD child,
+    int& systemImageIndex,
+    int& overlayIndex) {
+    systemImageIndex = -1;
+    overlayIndex = 0;
+    if (folder == nullptr || child == nullptr) {
+        return;
+    }
+    ComPtr<IShellItem> shellItem;
+    if (FAILED(SHCreateItemWithParent(
+            nullptr,
+            folder,
+            child,
+            IID_PPV_ARGS(shellItem.GetAddressOf()))) ||
+        shellItem == nullptr) {
+        return;
+    }
+    PIDLIST_ABSOLUTE absolutePidl = nullptr;
+    if (FAILED(SHGetIDListFromObject(
+            shellItem.Get(), &absolutePidl)) ||
+        absolutePidl == nullptr) {
+        return;
+    }
+    SHFILEINFOW fileInfo{};
+    constexpr UINT flags = SHGFI_PIDL | SHGFI_ICON | SHGFI_SYSICONINDEX |
+        SHGFI_ADDOVERLAYS | SHGFI_OVERLAYINDEX;
+    const DWORD_PTR result = SHGetFileInfoW(
+        reinterpret_cast<LPCWSTR>(absolutePidl),
+        0,
+        &fileInfo,
+        sizeof(fileInfo),
+        flags);
+    CoTaskMemFree(absolutePidl);
+    if (result == 0) {
+        return;
+    }
+    const unsigned int packed =
+        static_cast<unsigned int>(fileInfo.iIcon);
+    systemImageIndex = static_cast<int>(packed & 0x00FFFFFFU);
+    overlayIndex = static_cast<int>((packed >> 24U) & 0xFFU);
+    if (fileInfo.hIcon != nullptr) {
+        DestroyIcon(fileInfo.hIcon);
+    }
 }
 
 struct ShellDesktopItem {
@@ -218,7 +314,11 @@ bool EnumerateDesktopItems(IFolderView* view, std::vector<ShellDesktopItem>& ite
     for (int index = 0; index < count; ++index) {
         ShellDesktopItem item;
         item.viewIndex = index;
-        if (SUCCEEDED(view->Item(index, &item.pidl)) && item.pidl != nullptr && ItemPath(folder.Get(), item.pidl, item.path)) {
+        if (SUCCEEDED(view->Item(index, &item.pidl)) &&
+            item.pidl != nullptr &&
+            !ILIsEmpty(item.pidl) &&
+            ILIsEmpty(ILNext(item.pidl)) &&
+            ItemPath(folder.Get(), item.pidl, item.path)) {
             items.push_back(std::move(item));
         }
     }
@@ -295,7 +395,211 @@ bool PositionViewItemAndConfirm(
     return false;
 }
 
+bool CaptureViewSnapshotCore(
+    DesktopViewSnapshot& snapshot,
+    std::wstring& errorMessage) {
+    errorMessage.clear();
+    snapshot = {};
+    ComPtr<IFolderView> view;
+    HWND shellViewWindow = nullptr;
+    const HRESULT viewResult =
+        GetDesktopFolderView(view, &shellViewWindow);
+    if (FAILED(viewResult) ||
+        view == nullptr || shellViewWindow == nullptr) {
+        errorMessage =
+            L"无法连接 Explorer 桌面视图，未建立显示快照；stage=GetDesktopFolderView，HRESULT=" +
+            std::to_wstring(static_cast<long long>(viewResult)) + L"。";
+        return false;
+    }
+    const HWND listViewWindow = FindWindowExW(
+        shellViewWindow, nullptr, L"SysListView32", nullptr);
+    if (listViewWindow == nullptr ||
+        IsWindow(listViewWindow) == FALSE ||
+        !GetWindowRect(listViewWindow, &snapshot.screenRect)) {
+        errorMessage =
+            L"无法取得 Explorer 桌面图标窗口，未建立显示快照；stage=SysListView32。";
+        snapshot = {};
+        return false;
+    }
+    std::vector<ShellDesktopItem> shellItems;
+    if (!EnumerateDesktopItems(view.Get(), shellItems, errorMessage)) {
+        if (errorMessage.empty()) {
+            errorMessage =
+                L"无法枚举 Explorer 桌面项目；stage=SVGIO_ALLVIEW。";
+        }
+        snapshot = {};
+        return false;
+    }
+    ComPtr<IShellFolder> folder;
+    if (FAILED(view->GetFolder(IID_PPV_ARGS(&folder))) || folder == nullptr) {
+        errorMessage =
+            L"无法读取 Explorer 桌面项目名称，未建立显示快照；stage=IFolderView::GetFolder。";
+        snapshot = {};
+        return false;
+    }
+    HWND desktopHost = GetParent(shellViewWindow);
+    wchar_t desktopHostClass[64]{};
+    if (desktopHost == nullptr ||
+        GetClassNameW(
+            desktopHost,
+            desktopHostClass,
+            ARRAYSIZE(desktopHostClass)) == 0 ||
+        (wcscmp(desktopHostClass, L"WorkerW") != 0 &&
+         wcscmp(desktopHostClass, L"Progman") != 0)) {
+        desktopHost = GetAncestor(listViewWindow, GA_ROOT);
+    }
+    snapshot.desktopHost = desktopHost;
+    snapshot.shellViewWindow = shellViewWindow;
+    snapshot.listViewWindow = listViewWindow;
+    ComPtr<IFolderView2> view2;
+    if (SUCCEEDED(view.As(&view2)) && view2 != nullptr) {
+        view2->GetCurrentFolderFlags(&snapshot.viewFlags);
+        FOLDERVIEWMODE viewMode = FVM_AUTO;
+        int viewIconSize = 0;
+        if (SUCCEEDED(view2->GetViewModeAndIconSize(
+                &viewMode, &viewIconSize)) &&
+            viewIconSize >= 16 && viewIconSize <= 256) {
+            snapshot.viewIconSize = viewIconSize;
+        }
+    }
+    snapshot.items.reserve(shellItems.size());
+    for (const ShellDesktopItem& shellItem : shellItems) {
+        POINT viewPoint{};
+        if (FAILED(view->GetItemPosition(shellItem.pidl, &viewPoint))) {
+            continue;
+        }
+        POINT screenPoint = viewPoint;
+        if (ClientToScreen(listViewWindow, &screenPoint) == FALSE) {
+            continue;
+        }
+        int systemImageIndex = -1;
+        int overlayIndex = 0;
+        ReadShellImageIdentity(
+            folder.Get(),
+            shellItem.pidl,
+            systemImageIndex,
+            overlayIndex);
+        const UINT shellChildPidlSize =
+            ILGetSize(shellItem.pidl);
+        if (shellChildPidlSize <
+            sizeof(USHORT) * 2U) {
+            continue;
+        }
+        std::vector<BYTE> shellChildPidl(
+            shellChildPidlSize);
+        std::memcpy(
+            shellChildPidl.data(),
+            shellItem.pidl,
+            shellChildPidlSize);
+        snapshot.items.push_back(DesktopViewItem{
+            shellItem.path,
+            ItemDisplayName(
+                folder.Get(), shellItem.pidl, FileName(shellItem.path)),
+            viewPoint,
+            screenPoint,
+            shellItem.viewIndex,
+            systemImageIndex,
+            overlayIndex,
+            std::move(shellChildPidl)});
+    }
+    if (!shellItems.empty() && snapshot.items.empty()) {
+        errorMessage = L"Explorer 未返回任何可定位桌面项目，未建立显示快照。";
+        snapshot = {};
+        return false;
+    }
+    if (snapshot.desktopHost == nullptr ||
+        IsWindow(snapshot.desktopHost) == FALSE) {
+        errorMessage =
+            L"Explorer 桌面根窗口在建立快照时已失效。";
+        snapshot = {};
+        return false;
+    }
+    return true;
+}
+
+constexpr auto kDesktopSnapshotTimeout = std::chrono::seconds(5);
+std::atomic<bool> gDesktopSnapshotInFlight{false};
+
+struct DesktopSnapshotState {
+    std::mutex mutex;
+    std::condition_variable completed;
+    std::atomic<DWORD> threadId{0};
+    bool done = false;
+    bool succeeded = false;
+    DesktopViewSnapshot snapshot;
+    std::wstring errorMessage;
+};
+
 }  // namespace
+
+bool DesktopLayout::CaptureViewSnapshot(
+    DesktopViewSnapshot& snapshot,
+    std::wstring& errorMessage) const {
+    snapshot = {};
+    errorMessage.clear();
+    if (gDesktopSnapshotInFlight.exchange(true)) {
+        errorMessage =
+            L"Explorer 桌面快照仍在等待上一轮有界调用结束，未重复发起接管。";
+        return false;
+    }
+
+    const auto state = std::make_shared<DesktopSnapshotState>();
+    try {
+        std::thread([state]() {
+            state->threadId.store(GetCurrentThreadId());
+            const HRESULT initializeResult = OleInitialize(nullptr);
+            const bool initialized = SUCCEEDED(initializeResult);
+            const HRESULT cancellationResult = initialized
+                ? CoEnableCallCancellation(nullptr)
+                : initializeResult;
+            DesktopViewSnapshot captured;
+            std::wstring captureError;
+            const bool succeeded = initialized &&
+                CaptureViewSnapshotCore(captured, captureError);
+            if (!initialized) {
+                captureError =
+                    L"无法初始化有界 Explorer 桌面快照线程，HRESULT=" +
+                    std::to_wstring(
+                        static_cast<long long>(initializeResult)) + L"。";
+            }
+            if (SUCCEEDED(cancellationResult)) {
+                CoDisableCallCancellation(nullptr);
+            }
+            if (initialized) {
+                OleUninitialize();
+            }
+            {
+                std::lock_guard<std::mutex> lock(state->mutex);
+                state->succeeded = succeeded;
+                state->snapshot = std::move(captured);
+                state->errorMessage = std::move(captureError);
+                state->done = true;
+            }
+            gDesktopSnapshotInFlight.store(false);
+            state->completed.notify_one();
+        }).detach();
+    } catch (...) {
+        gDesktopSnapshotInFlight.store(false);
+        errorMessage = L"无法启动有界 Explorer 桌面快照线程。";
+        return false;
+    }
+
+    std::unique_lock<std::mutex> lock(state->mutex);
+    if (!state->completed.wait_for(
+            lock, kDesktopSnapshotTimeout,
+            [&]() { return state->done; })) {
+        const DWORD threadId = state->threadId.load();
+        if (threadId != 0) {
+            CoCancelCall(threadId, 0);
+        }
+        errorMessage =
+            L"Explorer 桌面快照超过 5 秒有界门，已取消本次显示接管；stage=bounded-timeout。";
+        return false;
+    }
+    snapshot = std::move(state->snapshot);
+    errorMessage = std::move(state->errorMessage);
+    return state->succeeded;
+}
 
 bool DesktopLayout::CaptureViewFlags(DWORD& flags, std::wstring& errorMessage) const {
     errorMessage.clear();
@@ -346,7 +650,7 @@ bool DesktopLayout::CapturePosition(const std::wstring& path, POINT& point, std:
     errorMessage.clear();
     ComPtr<IFolderView> view;
     if (FAILED(GetDesktopFolderView(view))) {
-        errorMessage = L"无法连接 Explorer 桌面视图，未移动该项目。";
+        errorMessage = L"无法连接 Explorer 桌面视图，未读取该项目坐标。";
         return false;
     }
     ShellDesktopItem parsedItem;
@@ -366,11 +670,11 @@ bool DesktopLayout::CapturePosition(const std::wstring& path, POINT& point, std:
             if (SUCCEEDED(view->GetItemPosition(item.pidl, &point))) {
                 return true;
             }
-            errorMessage = L"Explorer 没有返回该桌面项目的坐标，未移动该项目。";
+            errorMessage = L"Explorer 没有返回该桌面项目的坐标。";
             return false;
         }
     }
-    errorMessage = L"Explorer 桌面视图中没有找到该项目，未移动该项目。";
+    errorMessage = L"Explorer 桌面视图中没有找到该项目。";
     return false;
 }
 
@@ -483,6 +787,82 @@ bool DesktopLayout::RestoreScreenPositionOnce(
             SVSI_POSITIONITEM | SVSI_NOSTATECHANGE,
             restoredPoint, errorMessage)) {
         return false;
+    }
+    return true;
+}
+
+bool DesktopLayout::PositionScreenItemsOnce(
+    const std::vector<DesktopPosition>& screenPositions,
+    std::vector<DesktopPosition>& confirmedScreenPositions,
+    std::wstring& errorMessage) const {
+    errorMessage.clear();
+    confirmedScreenPositions.clear();
+    if (screenPositions.empty()) {
+        return true;
+    }
+
+    ComPtr<IFolderView> view;
+    HWND viewHwnd = nullptr;
+    if (FAILED(GetDesktopFolderView(view, &viewHwnd)) || view == nullptr) {
+        errorMessage = L"无法连接 Explorer 桌面视图，未移动桌面项目。";
+        return false;
+    }
+    const HWND listView = viewHwnd == nullptr
+        ? nullptr
+        : FindWindowExW(viewHwnd, nullptr, L"SysListView32", nullptr);
+    if (listView == nullptr || IsWindow(listView) == FALSE) {
+        errorMessage = L"无法取得 Explorer 桌面视图窗口，未移动桌面项目。";
+        return false;
+    }
+
+    std::vector<ShellDesktopItem> items;
+    if (!EnumerateDesktopItems(view.Get(), items, errorMessage)) {
+        return false;
+    }
+    std::vector<PCUITEMID_CHILD> pidls;
+    std::vector<POINT> viewPoints;
+    pidls.reserve(screenPositions.size());
+    viewPoints.reserve(screenPositions.size());
+    for (const DesktopPosition& position : screenPositions) {
+        const auto item = std::find_if(
+            items.begin(), items.end(),
+            [&](const ShellDesktopItem& candidate) {
+                return PathsEqual(candidate.path, position.path);
+            });
+        if (item == items.end()) {
+            errorMessage = L"Explorer 桌面视图中没有找到全部待移动项目。";
+            return false;
+        }
+        POINT viewPoint = position.point;
+        if (ScreenToClient(listView, &viewPoint) == FALSE) {
+            errorMessage = L"无法把桌面释放点转换为 Explorer 视图坐标。";
+            return false;
+        }
+        pidls.push_back(item->pidl);
+        viewPoints.push_back(viewPoint);
+    }
+
+    if (FAILED(view->SelectAndPositionItems(
+            static_cast<UINT>(pidls.size()),
+            pidls.data(),
+            viewPoints.data(),
+            SVSI_POSITIONITEM | SVSI_NOSTATECHANGE))) {
+        errorMessage = L"Explorer 拒绝批量更新桌面项目位置。";
+        return false;
+    }
+
+    confirmedScreenPositions.reserve(screenPositions.size());
+    for (size_t index = 0; index < pidls.size(); ++index) {
+        POINT confirmed = viewPoints[index];
+        POINT actual{};
+        if (SUCCEEDED(view->GetItemPosition(pidls[index], &actual))) {
+            confirmed = actual;
+        }
+        if (ClientToScreen(listView, &confirmed) == FALSE) {
+            confirmed = screenPositions[index].point;
+        }
+        confirmedScreenPositions.push_back(
+            DesktopPosition{screenPositions[index].path, confirmed});
     }
     return true;
 }
@@ -728,7 +1108,7 @@ bool DesktopLayout::RestoreScreenPosition(
             return false;
         }
     }
-    errorMessage = L"文件已安全归还桌面，但 Explorer 未能把图标放到鼠标释放位置。";
+    errorMessage = L"显示归属已切换到桌面，但 Explorer 未能把图标放到鼠标释放位置；原件路径没有改变。";
     return false;
 }
 
