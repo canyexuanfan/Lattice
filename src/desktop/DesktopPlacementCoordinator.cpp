@@ -86,15 +86,22 @@ bool CommitDesktopMoveOutTransaction(
 
     ConfigStore configStore;
     ManagedShortcutStore shortcutStore;
-    const auto persistRemoval = [&]() {
+    const auto persistRemoval = [&](const std::wstring&) {
         return RemoveItemFromPersistedConfig(configStore, request.itemId);
     };
     if (shortcutStore.IsManagedPath(request.sourcePath)) {
-        errorMessage =
-            L"该项目仍处于旧版受管目录，请先完成一次性历史迁移。";
-        return false;
+        return shortcutStore.MoveToOriginalDesktop(
+            request.itemId,
+            request.sourcePath,
+            request.itemState.originalDesktopPath,
+            persistRemoval,
+            desktopPath,
+            errorMessage,
+            request.sourceWindow,
+            true,
+            true);
     }
-    if (!persistRemoval()) {
+    if (!persistRemoval({})) {
         errorMessage =
             L"项目原件未发生改变，但无法保存移出格子的显示归属。";
         return false;

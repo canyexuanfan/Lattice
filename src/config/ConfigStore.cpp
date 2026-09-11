@@ -249,6 +249,7 @@ struct InteractionMutation {
     WindowConfig layout;
     std::vector<std::wstring> itemIds;
     std::vector<DesktopPlacementConfig> desktopDisplayPositionUpdates;
+    std::vector<std::wstring> removedItemIds;
     std::wstring renamePreviousIdentity;
     std::wstring renameNewIdentity;
     std::wstring renameNewDisplayName;
@@ -258,6 +259,8 @@ struct InteractionMutation {
 
 constexpr wchar_t kDesktopDisplayMutationKey[] =
     L"\x1fdesktop-display-layout";
+constexpr wchar_t kRemovedItemsMutationKey[] =
+    L"\x1fremoved-items";
 constexpr wchar_t kShellRenameMutationKeyPrefix[] =
     L"\x1fshell-rename:";
 
@@ -404,6 +407,7 @@ void ApplyInteractionMutations(
     AppConfig& config) {
     std::vector<std::pair<std::wstring, std::wstring>>
         renameAliases;
+    std::vector<std::wstring> removedItemIds;
     const auto resolveIdentity = [&](std::wstring identity) {
         for (const auto& [previousIdentity, newIdentity] :
              renameAliases) {
@@ -417,6 +421,18 @@ void ApplyInteractionMutations(
         return identity;
     };
     for (const InteractionMutation& mutation : mutations) {
+        if (mutation.categoryId == kRemovedItemsMutationKey) {
+            for (const std::wstring& itemId : mutation.removedItemIds) {
+                if (!itemId.empty() &&
+                    std::find(
+                        removedItemIds.begin(),
+                        removedItemIds.end(),
+                        itemId) == removedItemIds.end()) {
+                    removedItemIds.push_back(itemId);
+                }
+            }
+            continue;
+        }
         if (!mutation.renamePreviousIdentity.empty()) {
             ApplyShellRename(
                 mutation.renamePreviousIdentity,
@@ -472,6 +488,75 @@ void ApplyInteractionMutations(
             category->itemIds = mutation.itemIds;
         }
     }
+    if (removedItemIds.empty()) {
+        return;
+    }
+
+    std::vector<std::wstring> removedIdentities;
+    for (const ItemConfig& item : config.items) {
+        if (std::find(
+                removedItemIds.begin(),
+                removedItemIds.end(),
+                item.id) == removedItemIds.end()) {
+            continue;
+        }
+        if (!item.path.empty()) {
+            removedIdentities.push_back(item.path);
+        }
+        if (!item.originalDesktopPath.empty()) {
+            removedIdentities.push_back(item.originalDesktopPath);
+        }
+    }
+    const auto isRemovedId = [&](const std::wstring& itemId) {
+        return std::find(
+                   removedItemIds.begin(),
+                   removedItemIds.end(),
+                   itemId) != removedItemIds.end();
+    };
+    config.items.erase(
+        std::remove_if(
+            config.items.begin(),
+            config.items.end(),
+            [&](const ItemConfig& item) {
+                return isRemovedId(item.id);
+            }),
+        config.items.end());
+    const auto removeMemberships = [&](std::vector<std::wstring>& itemIds) {
+        itemIds.erase(
+            std::remove_if(
+                itemIds.begin(),
+                itemIds.end(),
+                isRemovedId),
+            itemIds.end());
+    };
+    removeMemberships(config.uncategorizedItemIds);
+    for (CategoryConfig& category : config.categories) {
+        removeMemberships(category.itemIds);
+    }
+    const auto isRemovedIdentity = [&](const std::wstring& identity) {
+        return std::any_of(
+            removedIdentities.begin(),
+            removedIdentities.end(),
+            [&](const std::wstring& removedIdentity) {
+                return CompareStringOrdinal(
+                           identity.c_str(), -1,
+                           removedIdentity.c_str(), -1,
+                           TRUE) == CSTR_EQUAL;
+            });
+    };
+    const auto removeLayoutEntries =
+        [&](std::vector<DesktopPlacementConfig>& layout) {
+            layout.erase(
+                std::remove_if(
+                    layout.begin(),
+                    layout.end(),
+                    [&](const DesktopPlacementConfig& position) {
+                        return isRemovedIdentity(position.path);
+                    }),
+                layout.end());
+        };
+    removeLayoutEntries(config.desktopLayout);
+    removeLayoutEntries(config.desktopDisplayLayout);
 }
 
 void ApplyShellRename(
@@ -1087,6 +1172,51 @@ bool ConfigStore::SaveDesktopDisplayPositionsAsync(
         mutation.version = nextVersion++;
         pending.insert_or_assign(
             kDesktopDisplayMutationKey,
+            std::move(mutation));
+        PendingInteractionFlushTasks().insert_or_assign(
+            configPath_, flush);
+    }
+    (void)AsyncConfigWriter::Instance().Enqueue(
+        configPath_, flush);
+    return true;
+}
+
+bool ConfigStore::RemoveItemsAsync(
+    const std::vector<std::wstring>& itemIds) const {
+    if (itemIds.empty()) {
+        return true;
+    }
+    const ConfigStore store = *this;
+    const std::function<bool()> flush =
+        [store]() { return store.FlushInteractionStateToDisk(); };
+    {
+        std::lock_guard<std::mutex> lock(InteractionMutationMutex());
+        std::uint64_t& nextVersion = NextInteractionMutationVersion();
+        if (nextVersion == 0) {
+            ++nextVersion;
+        }
+        auto& pending = PendingInteractionMutations()[configPath_];
+        InteractionMutation mutation;
+        const auto current = pending.find(kRemovedItemsMutationKey);
+        if (current != pending.end()) {
+            mutation = current->second;
+        }
+        mutation.categoryId = kRemovedItemsMutationKey;
+        for (const std::wstring& itemId : itemIds) {
+            if (!itemId.empty() &&
+                std::find(
+                    mutation.removedItemIds.begin(),
+                    mutation.removedItemIds.end(),
+                    itemId) == mutation.removedItemIds.end()) {
+                mutation.removedItemIds.push_back(itemId);
+            }
+        }
+        if (mutation.removedItemIds.empty()) {
+            return true;
+        }
+        mutation.version = nextVersion++;
+        pending.insert_or_assign(
+            kRemovedItemsMutationKey,
             std::move(mutation));
         PendingInteractionFlushTasks().insert_or_assign(
             configPath_, flush);

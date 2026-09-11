@@ -47,7 +47,12 @@ std::wstring TrimLabel(const std::wstring& label) {
 void IconGrid::SetItems(std::vector<DesktopItem> items) {
     items_ = std::move(items);
     ++itemsGeneration_;
-    SetSelectedIndex(selectedIndex_);
+    std::erase_if(
+        selectedIndices_,
+        [&](int index) {
+            return index < 0 ||
+                index >= static_cast<int>(items_.size());
+        });
     SetDraggingIndex(draggingIndex_);
     RecalculateLayout();
 }
@@ -139,7 +144,23 @@ void IconGrid::SetSelectedIndex(int index) {
     if (index < -1 || index >= static_cast<int>(items_.size())) {
         index = -1;
     }
-    selectedIndex_ = index;
+    selectedIndices_.clear();
+    if (index >= 0) {
+        selectedIndices_.push_back(index);
+    }
+}
+
+void IconGrid::SetSelectedIndices(const std::vector<int>& indices) {
+    selectedIndices_.clear();
+    selectedIndices_.reserve(indices.size());
+    for (const int index : indices) {
+        if (index < 0 || index >= static_cast<int>(items_.size()) ||
+            std::find(selectedIndices_.begin(), selectedIndices_.end(), index) !=
+                selectedIndices_.end()) {
+            continue;
+        }
+        selectedIndices_.push_back(index);
+    }
 }
 
 void IconGrid::SetDraggingIndex(int index) {
@@ -158,6 +179,24 @@ bool IconGrid::ScrollBy(int deltaPixels) {
 void IconGrid::SetScrollOffset(int scrollOffset) {
     scrollOffset_ = std::clamp(scrollOffset, 0, MaxScrollOffset());
     RecalculateLayout();
+}
+
+bool IconGrid::EnsureItemVisible(size_t index) {
+    if (index >= cells_.size()) {
+        return false;
+    }
+    const RECT cell = cells_[index];
+    int nextOffset = scrollOffset_;
+    if (cell.top < bounds_.top) {
+        nextOffset -= bounds_.top - cell.top;
+    } else if (cell.bottom > bounds_.bottom) {
+        nextOffset += cell.bottom - bounds_.bottom;
+    }
+    if (nextOffset == scrollOffset_) {
+        return false;
+    }
+    SetScrollOffset(nextOffset);
+    return true;
 }
 
 const DesktopItem* IconGrid::ItemAt(size_t index) const {
@@ -333,7 +372,11 @@ void IconGrid::Draw(D2DContext& d2d, IconCache& iconCache) {
                 target->DrawRoundedRectangle(hoverRect, hoverBorderBrush.Get(), 1.0f);
             }
         }
-        if (static_cast<int>(index) == selectedIndex_ && selectedBorderBrush != nullptr) {
+        if (std::find(
+                selectedIndices_.begin(),
+                selectedIndices_.end(),
+                static_cast<int>(index)) != selectedIndices_.end() &&
+            selectedBorderBrush != nullptr) {
             const D2D1_ROUNDED_RECT selectedRect = D2D1::RoundedRect(ToD2DRect(cell), cellRadius, cellRadius);
             if (selectedFillBrush != nullptr && static_cast<int>(index) != hoverIndex_) {
                 target->FillRoundedRectangle(selectedRect, selectedFillBrush.Get());

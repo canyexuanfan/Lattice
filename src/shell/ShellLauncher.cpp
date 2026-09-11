@@ -45,9 +45,11 @@ HRESULT CreateSingleContextMenu(
     return result;
 }
 
-bool IsCanonicalRenameVerb(
+bool GetCanonicalVerb(
     IContextMenu* contextMenu,
-    UINT commandOffset) {
+    UINT commandOffset,
+    std::wstring& verb) {
+    verb.clear();
     wchar_t wideVerb[128]{};
     if (SUCCEEDED(contextMenu->GetCommandString(
             commandOffset,
@@ -55,26 +57,54 @@ bool IsCanonicalRenameVerb(
             nullptr,
             reinterpret_cast<LPSTR>(wideVerb),
             ARRAYSIZE(wideVerb) - 1)) &&
-        CompareStringOrdinal(
-            wideVerb, -1, L"rename", -1, TRUE) == CSTR_EQUAL) {
+        wideVerb[0] != L'\0') {
+        verb = wideVerb;
         return true;
     }
 
     char ansiVerb[128]{};
-    return SUCCEEDED(contextMenu->GetCommandString(
+    if (!SUCCEEDED(contextMenu->GetCommandString(
                commandOffset,
                GCS_VERBA,
                nullptr,
                ansiVerb,
-               ARRAYSIZE(ansiVerb) - 1)) &&
-           lstrcmpiA(ansiVerb, "rename") == 0;
+               ARRAYSIZE(ansiVerb) - 1)) ||
+        ansiVerb[0] == '\0') {
+        return false;
+    }
+    wchar_t convertedVerb[128]{};
+    const int length = MultiByteToWideChar(
+        CP_ACP,
+        0,
+        ansiVerb,
+        -1,
+        convertedVerb,
+        ARRAYSIZE(convertedVerb));
+    if (length <= 1) {
+        return false;
+    }
+    verb.assign(convertedVerb);
+    return true;
+}
+
+bool IsCanonicalVerb(
+    IContextMenu* contextMenu,
+    UINT commandOffset,
+    const wchar_t* expectedVerb) {
+    std::wstring verb;
+    return GetCanonicalVerb(contextMenu, commandOffset, verb) &&
+        CompareStringOrdinal(
+            verb.c_str(), -1, expectedVerb, -1, TRUE) == CSTR_EQUAL;
 }
 
 ShellContextMenuResult TrackShellContextMenu(
     HWND ownerWindow,
     IContextMenu* contextMenu,
     POINT screenPoint,
-    bool allowRename) {
+    bool allowRename,
+    const ShellMenuAppender& appendCommands = {},
+    UINT* customCommand = nullptr,
+    std::wstring* invokedVerb = nullptr) {
     if (contextMenu == nullptr) {
         return ShellContextMenuResult::Failed;
     }
@@ -83,7 +113,14 @@ ShellContextMenuResult TrackShellContextMenu(
         return ShellContextMenuResult::Failed;
     }
     constexpr UINT kFirstCommand = 1;
-    constexpr UINT kLastCommand = 0x7FFF;
+    constexpr UINT kLastCommand = 0x6FFF;
+    constexpr UINT kFirstCustomCommand = 0x7000;
+    if (customCommand != nullptr) {
+        *customCommand = 0;
+    }
+    if (invokedVerb != nullptr) {
+        invokedVerb->clear();
+    }
     UINT flags = CMF_NORMAL;
     if (allowRename) {
         flags |= CMF_CANRENAME;
@@ -107,12 +144,15 @@ ShellContextMenuResult TrackShellContextMenu(
         for (UINT commandOffset = 0;
              commandOffset < commandCount;
              ++commandOffset) {
-            if (IsCanonicalRenameVerb(
-                    contextMenu, commandOffset)) {
+            if (IsCanonicalVerb(
+                    contextMenu, commandOffset, L"rename")) {
                 renameCommandOffset = commandOffset;
                 break;
             }
         }
+    }
+    if (appendCommands) {
+        appendCommands(menu);
     }
     Microsoft::WRL::ComPtr<IContextMenu2> contextMenu2;
     Microsoft::WRL::ComPtr<IContextMenu3> contextMenu3;
@@ -135,12 +175,21 @@ ShellContextMenuResult TrackShellContextMenu(
     ShellContextMenuResult outcome = selected == 0
         ? ShellContextMenuResult::Cancelled
         : ShellContextMenuResult::Failed;
-    if (selected >= kFirstCommand &&
+    if (selected >= kFirstCustomCommand) {
+        if (customCommand != nullptr) {
+            *customCommand = selected;
+        }
+        outcome = ShellContextMenuResult::CustomCommand;
+    } else if (selected >= kFirstCommand &&
         selected <= kLastCommand) {
         const UINT commandOffset = selected - kFirstCommand;
         if (commandOffset == renameCommandOffset) {
             outcome = ShellContextMenuResult::RenameRequested;
         } else {
+            if (invokedVerb != nullptr) {
+                GetCanonicalVerb(
+                    contextMenu, commandOffset, *invokedVerb);
+            }
             CMINVOKECOMMANDINFOEX invoke{};
             invoke.cbSize = sizeof(invoke);
             invoke.fMask =
@@ -162,6 +211,48 @@ ShellContextMenuResult TrackShellContextMenu(
     DestroyMenu(menu);
     PostMessageW(ownerWindow, WM_NULL, 0, 0);
     return outcome;
+}
+
+bool InvokeShellContextMenuVerb(
+    HWND ownerWindow,
+    IContextMenu* contextMenu,
+    const std::wstring& canonicalVerb) {
+    if (ownerWindow == nullptr || contextMenu == nullptr ||
+        canonicalVerb.empty()) {
+        return false;
+    }
+    HMENU menu = CreatePopupMenu();
+    if (menu == nullptr) {
+        return false;
+    }
+    constexpr UINT kFirstCommand = 1;
+    constexpr UINT kLastCommand = 0x7FFF;
+    const HRESULT query = contextMenu->QueryContextMenu(
+        menu, 0, kFirstCommand, kLastCommand, CMF_NORMAL | CMF_CANRENAME);
+    bool invoked = false;
+    if (SUCCEEDED(query)) {
+        const UINT commandCount = (std::min)(
+            static_cast<UINT>(HRESULT_CODE(query)),
+            kLastCommand - kFirstCommand + 1);
+        for (UINT offset = 0; offset < commandCount; ++offset) {
+            if (!IsCanonicalVerb(
+                    contextMenu, offset, canonicalVerb.c_str())) {
+                continue;
+            }
+            CMINVOKECOMMANDINFOEX invoke{};
+            invoke.cbSize = sizeof(invoke);
+            invoke.fMask = CMIC_MASK_UNICODE;
+            invoke.hwnd = ownerWindow;
+            invoke.lpVerb = MAKEINTRESOURCEA(offset);
+            invoke.lpVerbW = MAKEINTRESOURCEW(offset);
+            invoke.nShow = SW_SHOWNORMAL;
+            invoked = SUCCEEDED(contextMenu->InvokeCommand(
+                reinterpret_cast<LPCMINVOKECOMMANDINFO>(&invoke)));
+            break;
+        }
+    }
+    DestroyMenu(menu);
+    return invoked;
 }
 
 }  // namespace
@@ -270,6 +361,92 @@ ShellContextMenuResult ShellLauncher::ShowDesktopContextMenu(
         contextMenu.Get(),
         screenPoint,
         allowRename && items.size() == 1);
+}
+
+ShellContextMenuResult ShellLauncher::ShowContextMenuWithExtensions(
+    HWND ownerWindow,
+    const std::wstring& path,
+    POINT screenPoint,
+    bool allowRename,
+    const ShellMenuAppender& appendCommands,
+    UINT& customCommand,
+    std::wstring& invokedVerb) const {
+    if (ownerWindow == nullptr || path.empty()) {
+        return ShellContextMenuResult::Failed;
+    }
+    Microsoft::WRL::ComPtr<IContextMenu> contextMenu;
+    const HRESULT result = CreateSingleContextMenu(
+        ownerWindow, path, contextMenu.GetAddressOf());
+    if (FAILED(result) || contextMenu == nullptr) {
+        return ShellContextMenuResult::Failed;
+    }
+    return TrackShellContextMenu(
+        ownerWindow,
+        contextMenu.Get(),
+        screenPoint,
+        allowRename,
+        appendCommands,
+        &customCommand,
+        &invokedVerb);
+}
+
+ShellContextMenuResult ShellLauncher::ShowDesktopContextMenuWithExtensions(
+    HWND ownerWindow,
+    const std::vector<ShellItemReference>& items,
+    POINT screenPoint,
+    bool allowRename,
+    const ShellMenuAppender& appendCommands,
+    UINT& customCommand,
+    std::wstring& invokedVerb) const {
+    if (ownerWindow == nullptr || items.empty()) {
+        return ShellContextMenuResult::Failed;
+    }
+    Microsoft::WRL::ComPtr<IContextMenu> contextMenu;
+    const HRESULT result = CreateDesktopShellSelectionObject(
+        ownerWindow,
+        items,
+        IID_IContextMenu,
+        reinterpret_cast<void**>(contextMenu.GetAddressOf()));
+    if (FAILED(result) || contextMenu == nullptr) {
+        return ShellContextMenuResult::Failed;
+    }
+    return TrackShellContextMenu(
+        ownerWindow,
+        contextMenu.Get(),
+        screenPoint,
+        allowRename && items.size() == 1,
+        appendCommands,
+        &customCommand,
+        &invokedVerb);
+}
+
+bool ShellLauncher::InvokeContextMenuVerb(
+    HWND ownerWindow,
+    const std::wstring& path,
+    const std::wstring& canonicalVerb) const {
+    Microsoft::WRL::ComPtr<IContextMenu> contextMenu;
+    return ownerWindow != nullptr && !path.empty() &&
+        SUCCEEDED(CreateSingleContextMenu(
+            ownerWindow, path, contextMenu.GetAddressOf())) &&
+        InvokeShellContextMenuVerb(
+            ownerWindow, contextMenu.Get(), canonicalVerb);
+}
+
+bool ShellLauncher::InvokeDesktopContextMenuVerb(
+    HWND ownerWindow,
+    const std::vector<ShellItemReference>& items,
+    const std::wstring& canonicalVerb) const {
+    if (ownerWindow == nullptr || items.empty()) {
+        return false;
+    }
+    Microsoft::WRL::ComPtr<IContextMenu> contextMenu;
+    return SUCCEEDED(CreateDesktopShellSelectionObject(
+               ownerWindow,
+               items,
+               IID_IContextMenu,
+               reinterpret_cast<void**>(contextMenu.GetAddressOf()))) &&
+        InvokeShellContextMenuVerb(
+            ownerWindow, contextMenu.Get(), canonicalVerb);
 }
 
 bool ShellLauncher::ForwardContextMenuMessage(

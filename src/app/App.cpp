@@ -93,7 +93,9 @@ bool App::InitializeInternal(int showCommand, bool enableDesktopTakeover) {
         return true;
     }
 
-    mainWindow_->Show(mainWindow_->ShouldStartHidden() ? SW_HIDE : showCommand);
+    mainWindow_->Show(
+        mainWindow_->ShouldStartHidden() ? SW_HIDE : showCommand,
+        false);
     return true;
 }
 

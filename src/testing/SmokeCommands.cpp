@@ -349,6 +349,47 @@ struct WidgetWindowSmokeAccess {
         return result;
     }
 
+    static std::vector<std::wstring> SelectedItemIds(
+        const WidgetWindow& widget) {
+        return widget.SelectedItemIdsInVisibleOrder();
+    }
+
+    static void SelectOnly(WidgetWindow& widget, int index) {
+        widget.SelectOnly(index);
+    }
+
+    static void ToggleSelection(WidgetWindow& widget, int index) {
+        widget.ToggleSelection(index);
+    }
+
+    static void SelectAll(WidgetWindow& widget) {
+        widget.SelectAllItems();
+    }
+
+    static void MoveKeyboardSelection(
+        WidgetWindow& widget,
+        UINT virtualKey) {
+        widget.MoveKeyboardSelection(virtualKey);
+    }
+
+    static RECT GridBounds(const WidgetWindow& widget) {
+        return widget.GridBounds();
+    }
+
+    static RECT CellAt(const WidgetWindow& widget, size_t index) {
+        return widget.iconGrid_.CellAt(index);
+    }
+
+    static void MarqueeSelect(
+        WidgetWindow& widget,
+        POINT start,
+        POINT end,
+        bool controlPressed) {
+        widget.BeginMarqueeSelection(start, controlPressed);
+        widget.UpdateMarqueeSelection(end);
+        widget.CompletePointerSelection(false);
+    }
+
     static std::uint64_t GridItemsGeneration(const WidgetWindow& widget) {
         return widget.iconGrid_.ItemsGeneration();
     }
@@ -635,6 +676,70 @@ struct DesktopSurfaceWindowSmokeAccess {
             });
     }
 
+    static std::vector<std::wstring> UnreadyVisibleIconPaths(
+        DesktopSurfaceWindow& surface) {
+        std::vector<std::wstring> paths;
+        if (surface.d2d_.Target() == nullptr) {
+            return paths;
+        }
+        for (const DesktopViewItem& item : surface.visibleItems_) {
+            if (!surface.iconCache_.IsIconReady(
+                    surface.d2d_.Target(), item.path)) {
+                paths.push_back(item.path);
+            }
+        }
+        return paths;
+    }
+
+    static size_t ReloadWithRotatedExplorerImageIndices(
+        DesktopSurfaceWindow& surface) {
+        if (surface.visibleItems_.size() < 2) {
+            return 0;
+        }
+        std::vector<int> indices;
+        indices.reserve(surface.visibleItems_.size());
+        for (const DesktopViewItem& item : surface.visibleItems_) {
+            indices.push_back(item.systemImageIndex);
+        }
+        size_t changed = 0;
+        for (size_t index = 0;
+             index < surface.visibleItems_.size(); ++index) {
+            int rotated = indices[(index + 1) % indices.size()];
+            if (rotated == surface.visibleItems_[index].systemImageIndex) {
+                const auto different = std::find_if(
+                    indices.begin(),
+                    indices.end(),
+                    [&](int candidate) {
+                        return candidate >= 0 &&
+                            candidate !=
+                                surface.visibleItems_[index].systemImageIndex;
+                    });
+                if (different != indices.end()) {
+                    rotated = *different;
+                }
+            }
+            if (rotated >= 0 &&
+                rotated != surface.visibleItems_[index].systemImageIndex) {
+                surface.visibleItems_[index].systemImageIndex = rotated;
+                ++changed;
+            }
+        }
+        if (changed == 0) {
+            return 0;
+        }
+        surface.iconCache_.Clear();
+        for (const DesktopViewItem& item : surface.visibleItems_) {
+            surface.iconCache_.PreloadShellIcon(
+                item.path,
+                item.systemImageIndex,
+                item.overlayIndex,
+                surface.iconSize_,
+                &item.shellChildPidl,
+                surface.snapshot_.viewIconSize);
+        }
+        return changed;
+    }
+
     static RECT NormalizeMarqueeRect(
         POINT anchor,
         POINT current,
@@ -916,7 +1021,7 @@ struct DesktopSurfaceWindowSmokeAccess {
                 surface.visibleItems_[index]);
             const LONG top = (std::max)(cell.top + 1, bounds.top);
             const LONG bottom = (std::min)(
-                cell.top + surface.iconSize_ - 1,
+                cell.bottom - 1,
                 bounds.bottom - 1);
             const LONG left = (std::max)(cell.left + 1, bounds.left);
             const LONG right = (std::min)(cell.right - 1, bounds.right - 1);
@@ -1002,6 +1107,35 @@ struct MainWindowSmokeAccess {
 
     static size_t WidgetCount(const MainWindow& window) {
         return window.widgetWindows_.size();
+    }
+
+    static void LoadDesktopItems(MainWindow& window) {
+        window.LoadDesktopItems();
+    }
+
+    static bool HasDesktopPath(
+        const MainWindow& window,
+        const std::wstring& path) {
+        return std::any_of(
+            window.items_.begin(),
+            window.items_.end(),
+            [&](const DesktopItem& item) {
+                return CompareStringOrdinal(
+                           item.path.c_str(), -1,
+                           path.c_str(), -1,
+                           TRUE) == CSTR_EQUAL;
+            });
+    }
+
+    static bool HasRegisteredItem(
+        const MainWindow& window,
+        const std::wstring& itemId) {
+        return std::any_of(
+            window.organizerConfig_.items.begin(),
+            window.organizerConfig_.items.end(),
+            [&](const RegisteredItem& item) {
+                return item.id == itemId;
+            });
     }
 };
 
@@ -2115,6 +2249,297 @@ int RunSmokeConfig() {
         std::wcerr << L"Layout profile load failed\n";
         return 1;
     }
+
+    const DWORD fixtureRootRequired = GetEnvironmentVariableW(
+        L"DESKTOP_ORGANIZER_SMOKE_ITEMS_DIR", nullptr, 0);
+    if (fixtureRootRequired == 0) {
+        std::wcerr << L"Desktop filesystem consistency fixture root is missing\n";
+        return 1;
+    }
+    std::wstring fixtureRootValue(fixtureRootRequired, L'\0');
+    const DWORD fixtureRootCopied = GetEnvironmentVariableW(
+        L"DESKTOP_ORGANIZER_SMOKE_ITEMS_DIR",
+        fixtureRootValue.data(), fixtureRootRequired);
+    if (fixtureRootCopied == 0 || fixtureRootCopied >= fixtureRootRequired) {
+        std::wcerr << L"Desktop filesystem consistency fixture root is invalid\n";
+        return 1;
+    }
+    fixtureRootValue.resize(fixtureRootCopied);
+    const std::filesystem::path consistencyRoot =
+        std::filesystem::path(fixtureRootValue) /
+        L"desktop-filesystem-consistency";
+    const std::filesystem::path desktopRoot =
+        consistencyRoot / L"Desktop";
+    const std::filesystem::path publicRoot =
+        consistencyRoot / L"PublicDesktop";
+    const std::filesystem::path outsideRoot =
+        consistencyRoot / L"Outside";
+    std::error_code consistencyError;
+    std::filesystem::create_directories(desktopRoot, consistencyError);
+    std::filesystem::create_directories(publicRoot, consistencyError);
+    std::filesystem::create_directories(outsideRoot, consistencyError);
+    if (consistencyError ||
+        !SetEnvironmentVariableW(
+            L"DESKTOP_ORGANIZER_DESKTOP_DIR",
+            desktopRoot.c_str()) ||
+        !SetEnvironmentVariableW(
+            L"DESKTOP_ORGANIZER_PUBLIC_DESKTOP_DIR",
+            publicRoot.c_str())) {
+        std::wcerr << L"Desktop filesystem consistency fixture setup failed\n";
+        return 1;
+    }
+
+    const std::filesystem::path existingPath =
+        desktopRoot / L"delete-while-running.txt";
+    const std::filesystem::path addedBeforeStartPath =
+        desktopRoot / L"added-before-start.txt";
+    const std::filesystem::path addedWhileRunningPath =
+        desktopRoot / L"added-while-running.txt";
+    const std::filesystem::path deletedBeforeStartPath =
+        desktopRoot / L"deleted-before-start.txt";
+    const std::filesystem::path unavailableParentPath =
+        desktopRoot / L"unavailable-parent" / L"keep-reference.txt";
+    const std::filesystem::path outsideMissingPath =
+        outsideRoot / L"keep-reference.txt";
+    wchar_t dataRootBuffer[32768]{};
+    const DWORD dataRootLength = GetEnvironmentVariableW(
+        L"DESKTOP_ORGANIZER_DATA_DIR",
+        dataRootBuffer,
+        ARRAYSIZE(dataRootBuffer));
+    if (dataRootLength == 0 || dataRootLength >= ARRAYSIZE(dataRootBuffer)) {
+        std::wcerr << L"Desktop filesystem consistency data root is invalid\n";
+        return 1;
+    }
+    const std::filesystem::path managedMissingPath =
+        std::filesystem::path(dataRootBuffer) /
+        L"ManagedShortcuts" / L"legacy-missing.txt";
+    {
+        std::ofstream existing(existingPath, std::ios::binary);
+        std::ofstream addedBeforeStart(
+            addedBeforeStartPath, std::ios::binary);
+        existing << "existing";
+        addedBeforeStart << "added-before-start";
+        if (!existing || !addedBeforeStart) {
+            std::wcerr << L"Desktop filesystem consistency fixture files failed\n";
+            return 1;
+        }
+    }
+
+    constexpr wchar_t kDeletedBeforeStartId[] =
+        L"consistency-deleted-before-start";
+    constexpr wchar_t kDeletedWhileRunningId[] =
+        L"consistency-deleted-while-running";
+    constexpr wchar_t kOutsideReferenceId[] =
+        L"consistency-outside-reference";
+    constexpr wchar_t kUnavailableReferenceId[] =
+        L"consistency-unavailable-reference";
+    constexpr wchar_t kManagedReferenceId[] =
+        L"consistency-managed-reference";
+    const auto makeItem = [](
+        const std::wstring& id,
+        const std::filesystem::path& path,
+        const std::wstring& displayName) {
+        ItemConfig item;
+        item.id = id;
+        item.path = path.wstring();
+        item.originalDesktopPath = item.path;
+        item.displayName = displayName;
+        return item;
+    };
+    AppConfig consistencyConfig;
+    consistencyConfig.currentCategoryId = L"consistency-category";
+    consistencyConfig.items = {
+        makeItem(
+            kDeletedBeforeStartId,
+            deletedBeforeStartPath,
+            L"Deleted Before Start"),
+        makeItem(
+            kDeletedWhileRunningId,
+            existingPath,
+            L"Deleted While Running"),
+        makeItem(
+            kOutsideReferenceId,
+            outsideMissingPath,
+            L"Outside Reference"),
+        makeItem(
+            kUnavailableReferenceId,
+            unavailableParentPath,
+            L"Unavailable Reference"),
+        makeItem(
+            kManagedReferenceId,
+            managedMissingPath,
+            L"Managed Reference")};
+    consistencyConfig.uncategorizedItemIds = {
+        kOutsideReferenceId,
+        kUnavailableReferenceId,
+        kManagedReferenceId};
+    CategoryConfig consistencyCategory;
+    consistencyCategory.id = consistencyConfig.currentCategoryId;
+    consistencyCategory.name = L"Consistency";
+    consistencyCategory.itemIds = {
+        kDeletedBeforeStartId,
+        kDeletedWhileRunningId};
+    consistencyConfig.categories.push_back(consistencyCategory);
+    for (const ItemConfig& item : consistencyConfig.items) {
+        consistencyConfig.desktopLayout.push_back(
+            DesktopPlacementConfig{item.path, 100, 200});
+        consistencyConfig.desktopDisplayLayout.push_back(
+            DesktopPlacementConfig{item.path, 300, 400});
+    }
+    if (!store.SaveAppConfig(consistencyConfig)) {
+        std::wcerr << L"Desktop filesystem consistency config setup failed\n";
+        return 1;
+    }
+
+    const auto containsItemId = [](
+        const AppConfig& candidate,
+        const std::wstring& itemId) {
+        return std::any_of(
+            candidate.items.begin(),
+            candidate.items.end(),
+            [&](const ItemConfig& item) {
+                return item.id == itemId;
+            });
+    };
+    const auto containsMembership = [](
+        const AppConfig& candidate,
+        const std::wstring& itemId) {
+        if (std::find(
+                candidate.uncategorizedItemIds.begin(),
+                candidate.uncategorizedItemIds.end(),
+                itemId) != candidate.uncategorizedItemIds.end()) {
+            return true;
+        }
+        return std::any_of(
+            candidate.categories.begin(),
+            candidate.categories.end(),
+            [&](const CategoryConfig& candidateCategory) {
+                return std::find(
+                           candidateCategory.itemIds.begin(),
+                           candidateCategory.itemIds.end(),
+                           itemId) != candidateCategory.itemIds.end();
+            });
+    };
+    const auto containsLayoutIdentity = [](
+        const std::vector<DesktopPlacementConfig>& layout,
+        const std::filesystem::path& path) {
+        return std::any_of(
+            layout.begin(),
+            layout.end(),
+            [&](const DesktopPlacementConfig& position) {
+                return CompareStringOrdinal(
+                           position.path.c_str(), -1,
+                           path.c_str(), -1,
+                           TRUE) == CSTR_EQUAL;
+            });
+    };
+    const auto verifyRemoved = [&](
+        const AppConfig& candidate,
+        const std::wstring& itemId,
+        const std::filesystem::path& path) {
+        return !containsItemId(candidate, itemId) &&
+            !containsMembership(candidate, itemId) &&
+            !containsLayoutIdentity(candidate.desktopLayout, path) &&
+            !containsLayoutIdentity(candidate.desktopDisplayLayout, path);
+    };
+
+    MainWindow consistencyWindow(
+        GetModuleHandleW(nullptr), {}, false);
+    MainWindowSmokeAccess::LoadDesktopItems(consistencyWindow);
+    const AppConfig afterStartupRefresh = store.LoadAppConfig();
+    if (!verifyRemoved(
+            afterStartupRefresh,
+            kDeletedBeforeStartId,
+            deletedBeforeStartPath) ||
+        MainWindowSmokeAccess::HasRegisteredItem(
+            consistencyWindow, kDeletedBeforeStartId) ||
+        MainWindowSmokeAccess::HasDesktopPath(
+            consistencyWindow, deletedBeforeStartPath.wstring()) ||
+        !MainWindowSmokeAccess::HasRegisteredItem(
+            consistencyWindow, kDeletedWhileRunningId) ||
+        !MainWindowSmokeAccess::HasDesktopPath(
+            consistencyWindow, existingPath.wstring()) ||
+        !MainWindowSmokeAccess::HasDesktopPath(
+            consistencyWindow, addedBeforeStartPath.wstring()) ||
+        !containsItemId(afterStartupRefresh, kOutsideReferenceId) ||
+        !containsItemId(afterStartupRefresh, kUnavailableReferenceId) ||
+        !containsItemId(afterStartupRefresh, kManagedReferenceId)) {
+        std::wcerr << L"Desktop startup filesystem reconciliation failed\n";
+        return 1;
+    }
+
+    {
+        std::ofstream addedWhileRunning(
+            addedWhileRunningPath, std::ios::binary);
+        addedWhileRunning << "added-while-running";
+        if (!addedWhileRunning) {
+            std::wcerr << L"Desktop runtime addition fixture failed\n";
+            return 1;
+        }
+    }
+    MainWindowSmokeAccess::LoadDesktopItems(consistencyWindow);
+    if (!MainWindowSmokeAccess::HasDesktopPath(
+            consistencyWindow, addedWhileRunningPath.wstring())) {
+        std::wcerr << L"Desktop runtime addition was not discovered\n";
+        return 1;
+    }
+
+    if (!store.SaveInteractionStateAsync(
+            consistencyCategory.id,
+            consistencyCategory.layout,
+            consistencyCategory.itemIds,
+            true) ||
+        !store.SaveDesktopDisplayPositionsAsync(
+            {DesktopPlacementConfig{
+                existingPath.wstring(), 777, 888}})) {
+        std::wcerr << L"Desktop filesystem consistency pending-state setup failed\n";
+        return 1;
+    }
+    if (!std::filesystem::remove(existingPath, consistencyError) ||
+        consistencyError) {
+        std::wcerr << L"Desktop runtime deletion fixture failed\n";
+        return 1;
+    }
+    MainWindowSmokeAccess::LoadDesktopItems(consistencyWindow);
+    const AppConfig pendingDeleteConfig = store.LoadAppConfig();
+    if (!verifyRemoved(
+            pendingDeleteConfig,
+            kDeletedWhileRunningId,
+            existingPath) ||
+        MainWindowSmokeAccess::HasRegisteredItem(
+            consistencyWindow, kDeletedWhileRunningId) ||
+        MainWindowSmokeAccess::HasDesktopPath(
+            consistencyWindow, existingPath.wstring()) ||
+        !MainWindowSmokeAccess::HasDesktopPath(
+            consistencyWindow, addedBeforeStartPath.wstring()) ||
+        !MainWindowSmokeAccess::HasDesktopPath(
+            consistencyWindow, addedWhileRunningPath.wstring())) {
+        std::wcerr << L"Desktop runtime deletion reconciliation failed\n";
+        return 1;
+    }
+    if (!ConfigStore::DrainPendingWrites(5000)) {
+        std::wcerr << L"Desktop filesystem consistency write drain failed\n";
+        return 1;
+    }
+    const AppConfig persistedConsistencyConfig = store.LoadAppConfig();
+    if (!verifyRemoved(
+            persistedConsistencyConfig,
+            kDeletedBeforeStartId,
+            deletedBeforeStartPath) ||
+        !verifyRemoved(
+            persistedConsistencyConfig,
+            kDeletedWhileRunningId,
+            existingPath) ||
+        !containsItemId(persistedConsistencyConfig, kOutsideReferenceId) ||
+        !containsItemId(
+            persistedConsistencyConfig, kUnavailableReferenceId) ||
+        !containsItemId(persistedConsistencyConfig, kManagedReferenceId) ||
+        !std::filesystem::exists(addedBeforeStartPath) ||
+        !std::filesystem::exists(addedWhileRunningPath)) {
+        std::wcerr << L"Desktop filesystem consistency persistence failed\n";
+        return 1;
+    }
+    std::wcout << L"Desktop filesystem additions and confirmed deletions converged\n";
     return 0;
 }
 
@@ -2775,18 +3200,61 @@ int RunSmokeManagedItems() {
         !std::filesystem::exists(sourceFile)) {
         return fail(L"Different desktop duplicate was not preserved safely");
     }
-    std::filesystem::remove(sourceFile, fileError);
-    if (fileError) {
-        return fail(L"Desktop conflict cleanup failed");
+    std::wstring rollbackDestination;
+    std::wstring rollbackPersistPath;
+    if (store.MoveToOriginalDesktop(
+            L"smoke-conflict",
+            managedConflict,
+            sourceFile.wstring(),
+            [&](const std::wstring& path) {
+                rollbackPersistPath = path;
+                return false;
+            },
+            rollbackDestination,
+            moveError,
+            nullptr,
+            true,
+            true) ||
+        rollbackPersistPath.empty() ||
+        rollbackPersistPath == sourceFile.wstring() ||
+        !std::filesystem::exists(managedConflict) ||
+        !std::filesystem::exists(sourceFile) ||
+        std::filesystem::exists(rollbackPersistPath) ||
+        std::filesystem::exists(
+            dataDirectory / L"ManagedShortcuts" / L"move-journal.bin")) {
+        return fail(
+            L"Explicit unique-name conflict rollback did not preserve both endpoints");
     }
+    bool uniqueConflictPersisted = false;
     if (!store.MoveToOriginalDesktop(
             L"smoke-conflict",
             managedConflict,
             sourceFile.wstring(),
-            [](const std::wstring&) { return true; },
-            restoredFile,
-            moveError)) {
-        return fail(L"Desktop conflict final restore failed: " + moveError);
+            [&](const std::wstring& path) {
+                uniqueConflictPersisted =
+                    path != sourceFile.wstring() &&
+                    std::filesystem::path(path).parent_path() ==
+                        sourceFile.parent_path();
+                return uniqueConflictPersisted;
+            },
+            conflictDestination,
+            moveError,
+            nullptr,
+            true,
+            true) ||
+        !uniqueConflictPersisted ||
+        conflictDestination == sourceFile.wstring() ||
+        std::filesystem::path(conflictDestination).filename().wstring() !=
+            L"说明 (2).txt" ||
+        std::filesystem::exists(managedConflict) ||
+        !std::filesystem::exists(sourceFile) ||
+        !std::filesystem::exists(conflictDestination) ||
+        ReadFileBytes(conflictDestination) != userBytesBefore ||
+        ReadFileBytes(sourceFile.wstring()) == userBytesBefore ||
+        std::filesystem::exists(
+            dataDirectory / L"ManagedShortcuts" / L"move-journal.bin")) {
+        return fail(
+            L"Explicit unique-name conflict release failed: " + moveError);
     }
 
     std::wstring managedPublicShortcut;
@@ -2930,7 +3398,7 @@ int RunSmokeManagedItems() {
         std::wcerr << L"Managed item smoke cleanup failed\n";
         return 1;
     }
-    std::wcout << L"Ordinary and Public Desktop unique-original transactions passed\n";
+    std::wcout << L"Ordinary, Public Desktop, and explicit unique-conflict transactions passed\n";
     return 0;
 }
 
@@ -2981,6 +3449,17 @@ int RunSmokeShortcutOverlay(HINSTANCE instance) {
         std::wcerr << L"Unable to resolve smoke executable path\n";
         return 1;
     }
+    wchar_t systemDirectory[MAX_PATH]{};
+    const UINT systemDirectoryLength = GetSystemDirectoryW(
+        systemDirectory,
+        ARRAYSIZE(systemDirectory));
+    if (systemDirectoryLength == 0 ||
+        systemDirectoryLength >= ARRAYSIZE(systemDirectory)) {
+        std::wcerr << L"Unable to resolve the Shell icon fixture library\n";
+        return 1;
+    }
+    const std::filesystem::path iconLibrary =
+        std::filesystem::path(systemDirectory) / L"SHELL32.dll";
     const std::filesystem::path shortcutPath = testRoot / L"Lattice smoke.lnk";
     Microsoft::WRL::ComPtr<IShellLinkW> shellLink;
     Microsoft::WRL::ComPtr<IPersistFile> persistFile;
@@ -2988,9 +3467,10 @@ int RunSmokeShortcutOverlay(HINSTANCE instance) {
             CLSID_ShellLink,
             nullptr,
             CLSCTX_INPROC_SERVER,
-            IID_PPV_ARGS(shellLink.GetAddressOf()))) ||
+        IID_PPV_ARGS(shellLink.GetAddressOf()))) ||
         shellLink == nullptr ||
         FAILED(shellLink->SetPath(executablePath)) ||
+        FAILED(shellLink->SetIconLocation(iconLibrary.c_str(), 141)) ||
         FAILED(shellLink.As(&persistFile)) ||
         persistFile == nullptr ||
         FAILED(persistFile->Save(shortcutPath.c_str(), TRUE))) {
@@ -3040,23 +3520,50 @@ int RunSmokeShortcutOverlay(HINSTANCE instance) {
         cachedIcon = iconCache.CopyReadyIconForDrag(shortcutPath.wstring());
     }
 
+    IconCache desktopSizedIconCache;
+    desktopSizedIconCache.PreloadShellIcon(
+        shortcutPath.wstring(),
+        -1,
+        overlayIndex,
+        72,
+        nullptr,
+        48);
+    HICON desktopSizedIcon = nullptr;
+    const ULONGLONG desktopSizedDeadline = GetTickCount64() + 3000;
+    while (desktopSizedIcon == nullptr &&
+           GetTickCount64() < desktopSizedDeadline) {
+        Sleep(10);
+        desktopSizedIcon =
+            desktopSizedIconCache.CopyReadyIconForDrag(shortcutPath.wstring());
+    }
+
     std::vector<std::uint32_t> basePixels;
     std::vector<std::uint32_t> expectedPixels;
     std::vector<std::uint32_t> cachedPixels;
+    std::vector<std::uint32_t> desktopSizedPixels;
     const bool captured =
         CaptureIconPixels(baseIcon, basePixels) &&
         CaptureIconPixels(expectedIcon, expectedPixels) &&
-        CaptureIconPixels(cachedIcon, cachedPixels);
+        CaptureIconPixels(cachedIcon, cachedPixels) &&
+        CaptureIconPixels(desktopSizedIcon, desktopSizedPixels);
     DestroyIcon(baseIcon);
     DestroyIcon(expectedIcon);
     if (cachedIcon != nullptr) {
         DestroyIcon(cachedIcon);
+    }
+    if (desktopSizedIcon != nullptr) {
+        DestroyIcon(desktopSizedIcon);
     }
     if (!captured ||
         basePixels == expectedPixels ||
         cachedPixels != expectedPixels) {
         std::wcerr << L"Lattice shortcut icon is not the Shell-composited icon\n";
         return 1;
+    }
+    if (desktopSizedPixels != expectedPixels) {
+        std::wcerr
+            << L"Logical 48px desktop request selected a non-Explorer Shell image list at 150% DPI\n";
+        return 2;
     }
 
     HICON resourceIcon = static_cast<HICON>(LoadImageW(
@@ -3935,7 +4442,7 @@ int RunSmokeWidgetDesktopLayer(HINSTANCE instance) {
         !GetWindowRect(widgetWindow, &widgetRect) ||
         widgetRect.left != targetX + moveX ||
         widgetRect.top != targetY + moveY ||
-        SendMessageW(widgetWindow, WM_MOUSEACTIVATE, 0, 0) != MA_NOACTIVATE) {
+        SendMessageW(widgetWindow, WM_MOUSEACTIVATE, 0, 0) != MA_ACTIVATE) {
         return fail(L"Desktop-hosted widget coordinate or activation behavior failed", 73);
     }
 
@@ -4010,6 +4517,9 @@ int RunSmokeDesktopIconFidelity(HINSTANCE instance) {
         std::filesystem::path(outputRoot) / L"desktop-native.bmp";
     const std::filesystem::path latticeCapture =
         std::filesystem::path(outputRoot) / L"desktop-lattice.bmp";
+    const std::filesystem::path rotatedIndexCapture =
+        std::filesystem::path(outputRoot) /
+            L"desktop-lattice-rotated-view-index.bmp";
     const bool nativeCaptureAvailable =
         SaveWindowClientBmp(before.listViewWindow, nativeCapture);
     DesktopSurfaceWindow surface(instance);
@@ -4073,6 +4583,17 @@ int RunSmokeDesktopIconFidelity(HINSTANCE instance) {
     }
     if (!DesktopSurfaceWindowSmokeAccess::AllVisibleIconsReady(
             surface)) {
+        const auto unready =
+            DesktopSurfaceWindowSmokeAccess::UnreadyVisibleIconPaths(
+                surface);
+        std::ofstream diagnostic(
+            std::filesystem::path(outputRoot) /
+                L"desktop-icon-fidelity-error.txt",
+            std::ios::trunc);
+        diagnostic << "STAGE=WaitInitialIcons\n";
+        for (const std::wstring& path : unready) {
+            diagnostic << "UNREADY=" << Utf8Text(path) << "\n";
+        }
         surface.Close();
         std::wcerr
             << L"Desktop icon fidelity left a Shell item on a placeholder\n";
@@ -4088,6 +4609,51 @@ int RunSmokeDesktopIconFidelity(HINSTANCE instance) {
         surface.Close();
         std::wcerr << L"Could not capture Lattice desktop surface\n";
         return 138;
+    }
+    const std::optional<std::string> initialLatticePixels =
+        ReadFileBytes(latticeCapture.wstring());
+    const size_t rotatedIndexCount =
+        DesktopSurfaceWindowSmokeAccess::
+            ReloadWithRotatedExplorerImageIndices(surface);
+    if (!initialLatticePixels.has_value() || rotatedIndexCount == 0) {
+        surface.Close();
+        std::wcerr
+            << L"Desktop icon fidelity could not perturb Explorer view indices\n";
+        return 139;
+    }
+    const ULONGLONG reloadDeadline = GetTickCount64() + 5000;
+    while (!DesktopSurfaceWindowSmokeAccess::AllVisibleIconsReady(
+               surface) &&
+           GetTickCount64() < reloadDeadline) {
+        MSG message{};
+        while (PeekMessageW(
+                &message, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+        MsgWaitForMultipleObjects(
+            0, nullptr, FALSE, 16, QS_ALLINPUT);
+    }
+    RedrawWindow(
+        surface.Window(),
+        nullptr,
+        nullptr,
+        RDW_INVALIDATE | RDW_UPDATENOW | RDW_ERASE);
+    const bool reloadedIconsReady =
+        DesktopSurfaceWindowSmokeAccess::AllVisibleIconsReady(surface);
+    const bool reloadedCaptureSaved = reloadedIconsReady &&
+        SaveWindowClientBmp(
+            surface.Window(), rotatedIndexCapture);
+    const std::optional<std::string> reloadedLatticePixels =
+        reloadedCaptureSaved
+            ? ReadFileBytes(rotatedIndexCapture.wstring())
+            : std::nullopt;
+    if (!reloadedLatticePixels.has_value() ||
+        *reloadedLatticePixels != *initialLatticePixels) {
+        surface.Close();
+        std::wcerr
+            << L"Desktop icons changed when Explorer view indices were rotated\n";
+        return 139;
     }
     surface.Close();
     DesktopViewSnapshot after;
@@ -4129,6 +4695,8 @@ int RunSmokeDesktopIconFidelity(HINSTANCE instance) {
         << GetDpiForWindow(before.listViewWindow)
         << L", native-capture="
         << (nativeCaptureAvailable ? 1 : 0)
+        << L", rotated-view-indices="
+        << rotatedIndexCount
         << L"\n";
     return 0;
 }
@@ -4374,18 +4942,36 @@ int RunSmokeDesktopDisplayTakeover(HINSTANCE instance) {
             : GetWindowThreadProcessId(foreground, nullptr);
         const bool needsAttachment = foregroundThread != 0 &&
             foregroundThread != currentThread;
+        HANDLE foregroundThreadHandle = needsAttachment
+            ? OpenThread(SYNCHRONIZE, FALSE, foregroundThread)
+            : nullptr;
         if (needsAttachment &&
             AttachThreadInput(
                 currentThread, foregroundThread, TRUE) == FALSE) {
+            if (foregroundThreadHandle != nullptr) {
+                CloseHandle(foregroundThreadHandle);
+            }
             return false;
         }
         action();
         if (needsAttachment &&
             AttachThreadInput(
                 currentThread, foregroundThread, FALSE) == FALSE) {
-            AttachThreadInput(
-                currentThread, foregroundThread, FALSE);
-            return false;
+            const bool foregroundThreadExited =
+                foregroundThreadHandle != nullptr &&
+                WaitForSingleObject(foregroundThreadHandle, 0) ==
+                    WAIT_OBJECT_0;
+            if (!foregroundThreadExited &&
+                AttachThreadInput(
+                    currentThread, foregroundThread, FALSE) == FALSE) {
+                if (foregroundThreadHandle != nullptr) {
+                    CloseHandle(foregroundThreadHandle);
+                }
+                return false;
+            }
+        }
+        if (foregroundThreadHandle != nullptr) {
+            CloseHandle(foregroundThreadHandle);
         }
         return true;
     };
@@ -7261,16 +7847,22 @@ int RunSmokeDesktopCurrentConfigDrag(HINSTANCE instance) {
         focusClickInjected =
             sendMouse(*focusPoint, MOUSEEVENTF_LEFTUP) &&
             focusClickInjected;
-        pumpFor(80);
-        std::vector<std::wstring> explorerSelectionAfterClick;
-        explorerSelectionMatchesClick =
-            capturedExplorerSelectionBeforeClick &&
-            CaptureExplorerSelectionForSmoke(
-                explorerSelectionAfterClick) &&
-            explorerSelectionAfterClick.size() == 1 &&
-            CompareStringOrdinal(
-                explorerSelectionAfterClick.front().c_str(), -1,
-                focusIdentity.c_str(), -1, TRUE) == CSTR_EQUAL;
+        const ULONGLONG selectionDeadline = GetTickCount64() + 250;
+        do {
+            std::vector<std::wstring> explorerSelectionAfterClick;
+            explorerSelectionMatchesClick =
+                capturedExplorerSelectionBeforeClick &&
+                CaptureExplorerSelectionForSmoke(
+                    explorerSelectionAfterClick) &&
+                explorerSelectionAfterClick.size() == 1 &&
+                CompareStringOrdinal(
+                    explorerSelectionAfterClick.front().c_str(), -1,
+                    focusIdentity.c_str(), -1, TRUE) == CSTR_EQUAL;
+            if (explorerSelectionMatchesClick) {
+                break;
+            }
+            pumpFor(20);
+        } while (GetTickCount64() < selectionDeadline);
 
         desktopF2RouteReady =
             DesktopSurfaceWindowSmokeAccess::ShouldRouteDesktopF2(
@@ -7734,23 +8326,117 @@ int RunSmokeWidgetInteraction(HINSTANCE instance) {
     if (!app.InitializeForIsolatedSmoke(SW_SHOWNOACTIVATE)) {
         return fail(L"Widget interaction app initialization failed", 33);
     }
-    HWND mainWindow = FindCurrentProcessMainWindow();
-    HWND uncategorizedWindow = FindLatticeWidgetWindow(L"未分类");
-    HWND categoryWindow = FindLatticeWidgetWindow(L"交互测试");
+    HWND mainWindow = nullptr;
+    HWND uncategorizedWindow = nullptr;
+    HWND categoryWindow = nullptr;
+    const ULONGLONG windowDiscoveryDeadline = GetTickCount64() + 1000;
+    do {
+        mainWindow = FindCurrentProcessMainWindow();
+        uncategorizedWindow = FindLatticeWidgetWindow(L"未分类");
+        categoryWindow = FindLatticeWidgetWindow(L"交互测试");
+        if (mainWindow != nullptr &&
+            uncategorizedWindow != nullptr &&
+            categoryWindow != nullptr) {
+            break;
+        }
+        MSG message{};
+        while (PeekMessageW(
+                &message, nullptr, 0, 0, PM_REMOVE) != FALSE) {
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+        MsgWaitForMultipleObjects(
+            0, nullptr, FALSE, 16, QS_ALLINPUT);
+    } while (GetTickCount64() < windowDiscoveryDeadline);
     if (mainWindow == nullptr || uncategorizedWindow == nullptr || categoryWindow == nullptr) {
+        std::wcerr << L"Widget discovery main=" << mainWindow
+                   << L" uncategorized=" << uncategorizedWindow
+                   << L" category=" << categoryWindow
+                   << L" count=" << CountLatticeWidgetWindows()
+                   << L"\n";
         if (mainWindow != nullptr) {
             DestroyWindow(mainWindow);
             app.Run();
         }
         return fail(L"Widget interaction windows not found", 34);
     }
-    const auto* categoryWidget = reinterpret_cast<const WidgetWindow*>(
+    auto* categoryWidget = reinterpret_cast<WidgetWindow*>(
         GetWindowLongPtrW(categoryWindow, GWLP_USERDATA));
     if (categoryWidget == nullptr || !categoryWidget->HasShellDropTarget()) {
         DestroyWindow(mainWindow);
         app.Run();
         return fail(L"Widget OLE shell drop target was not registered", 44);
     }
+
+    const LONG_PTR categoryExStyle = GetWindowLongPtrW(
+        categoryWindow, GWL_EXSTYLE);
+    if ((categoryExStyle & WS_EX_TOOLWINDOW) == 0 ||
+        (categoryExStyle & WS_EX_NOACTIVATE) != 0 ||
+        (categoryExStyle & WS_EX_TOPMOST) != 0 ||
+        SendMessageW(categoryWindow, WM_MOUSEACTIVATE, 0, 0) !=
+            MA_ACTIVATE ||
+        (SendMessageW(categoryWindow, WM_GETDLGCODE, 0, 0) &
+            (DLGC_WANTARROWS | DLGC_WANTALLKEYS)) !=
+            (DLGC_WANTARROWS | DLGC_WANTALLKEYS)) {
+        DestroyWindow(mainWindow);
+        app.Run();
+        return fail(
+            L"Widget keyboard activation contract was not enabled safely",
+            61);
+    }
+    WidgetWindowSmokeAccess::SelectOnly(*categoryWidget, 0);
+    if (WidgetWindowSmokeAccess::SelectedItemIds(*categoryWidget) !=
+            std::vector<std::wstring>{L"widget-first"}) {
+        DestroyWindow(mainWindow);
+        app.Run();
+        return fail(L"Widget single selection failed", 62);
+    }
+    WidgetWindowSmokeAccess::ToggleSelection(*categoryWidget, 1);
+    if (WidgetWindowSmokeAccess::SelectedItemIds(*categoryWidget) !=
+            std::vector<std::wstring>{L"widget-first", L"widget-second"}) {
+        DestroyWindow(mainWindow);
+        app.Run();
+        return fail(L"Widget Ctrl-style selection toggle failed", 63);
+    }
+    const RECT selectionGrid =
+        WidgetWindowSmokeAccess::GridBounds(*categoryWidget);
+    const RECT firstCell =
+        WidgetWindowSmokeAccess::CellAt(*categoryWidget, 0);
+    WidgetWindowSmokeAccess::MarqueeSelect(
+        *categoryWidget,
+        POINT{selectionGrid.right - 1, selectionGrid.bottom - 1},
+        POINT{firstCell.left, firstCell.top},
+        false);
+    if (WidgetWindowSmokeAccess::SelectedItemIds(*categoryWidget) !=
+            std::vector<std::wstring>{L"widget-first", L"widget-second"}) {
+        DestroyWindow(mainWindow);
+        app.Run();
+        return fail(L"Widget blank-area marquee selection failed", 64);
+    }
+    WidgetWindowSmokeAccess::SelectOnly(*categoryWidget, 0);
+    WidgetWindowSmokeAccess::MarqueeSelect(
+        *categoryWidget,
+        POINT{
+            (firstCell.left + firstCell.right) / 2,
+            firstCell.bottom + 8},
+        POINT{firstCell.left, firstCell.top},
+        true);
+    if (!WidgetWindowSmokeAccess::SelectedItemIds(
+            *categoryWidget).empty()) {
+        DestroyWindow(mainWindow);
+        app.Run();
+        return fail(L"Widget Ctrl marquee reverse selection failed", 65);
+    }
+    WidgetWindowSmokeAccess::SelectAll(*categoryWidget);
+    WidgetWindowSmokeAccess::MoveKeyboardSelection(
+        *categoryWidget, VK_RIGHT);
+    if (WidgetWindowSmokeAccess::SelectedItemIds(*categoryWidget) !=
+            std::vector<std::wstring>{L"widget-second"}) {
+        DestroyWindow(mainWindow);
+        app.Run();
+        return fail(L"Widget keyboard selection navigation failed", 66);
+    }
+    WidgetWindowSmokeAccess::SelectOnly(*categoryWidget, 0);
 
     const int uncategorizedX = monitorInfo.rcWork.left + 170;
     const int uncategorizedY = monitorInfo.rcWork.top + 240;
@@ -7860,7 +8546,7 @@ int RunSmokeWidgetInteraction(HINSTANCE instance) {
     SendMessageW(categoryWindow, WM_LBUTTONDOWN, MK_LBUTTON, lockPoint);
     SendMessageW(categoryWindow, WM_LBUTTONUP, 0, lockPoint);
     if (!WidgetWindowSmokeAccess::FlushInteractionSave(
-            *const_cast<WidgetWindow*>(categoryWidget))) {
+            *categoryWidget)) {
         DestroyWindow(mainWindow);
         app.Run();
         return fail(L"Widget deferred lock persistence failed", 36);
@@ -7908,7 +8594,7 @@ int RunSmokeWidgetInteraction(HINSTANCE instance) {
         std::chrono::steady_clock::now() - reorderStart).count();
     const auto persistStart = std::chrono::steady_clock::now();
     if (!WidgetWindowSmokeAccess::FlushInteractionSave(
-            *const_cast<WidgetWindow*>(categoryWidget))) {
+            *categoryWidget)) {
         DestroyWindow(mainWindow);
         app.Run();
         return fail(L"Widget deferred reorder persistence failed", 38);
@@ -7934,7 +8620,7 @@ int RunSmokeWidgetInteraction(HINSTANCE instance) {
     SendMessageW(categoryWindow, WM_LBUTTONDOWN, MK_LBUTTON, lockPoint);
     SendMessageW(categoryWindow, WM_LBUTTONUP, 0, lockPoint);
     if (!WidgetWindowSmokeAccess::FlushInteractionSave(
-            *const_cast<WidgetWindow*>(categoryWidget))) {
+            *categoryWidget)) {
         DestroyWindow(mainWindow);
         app.Run();
         return fail(L"Widget deferred unlock persistence failed", 45);
@@ -7961,7 +8647,7 @@ int RunSmokeWidgetInteraction(HINSTANCE instance) {
     if (uncategorizedWidget == nullptr ||
         !WidgetWindowSmokeAccess::FlushInteractionSave(*uncategorizedWidget) ||
         !WidgetWindowSmokeAccess::FlushInteractionSave(
-            *const_cast<WidgetWindow*>(categoryWidget))) {
+            *categoryWidget)) {
         DestroyWindow(mainWindow);
         app.Run();
         return fail(L"Widget deferred position persistence failed", 43);
@@ -9620,41 +10306,41 @@ int RunSmokeUpdateAndDialog() {
         return 1;
     }
 
-    const std::string allAssetsForward = R"({"tag_name":"v0.4.49","assets":[{"name":"Lattice-Setup-Latest-Offline.exe","browser_download_url":"https://example.invalid/Lattice-Setup-Latest-Offline.exe"},{"name":"Lattice-Setup-0.4.49-Offline.exe","browser_download_url":"https://example.invalid/Lattice-Setup-0.4.49-Offline.exe"},{"name":"Lattice-Setup-Latest.exe","browser_download_url":"https://example.invalid/Lattice-Setup-Latest.exe"},{"name":"Lattice-Setup-0.4.49.exe","browser_download_url":"https://example.invalid/Lattice-Setup-0.4.49.exe"}]})";
-    const std::string allAssetsReverse = R"({"tag_name":"v0.4.49","assets":[{"name":"Lattice-Setup-0.4.49.exe","browser_download_url":"https://example.invalid/Lattice-Setup-0.4.49.exe"},{"name":"Lattice-Setup-Latest.exe","browser_download_url":"https://example.invalid/Lattice-Setup-Latest.exe"},{"name":"Lattice-Setup-0.4.49-Offline.exe","browser_download_url":"https://example.invalid/Lattice-Setup-0.4.49-Offline.exe"},{"name":"Lattice-Setup-Latest-Offline.exe","browser_download_url":"https://example.invalid/Lattice-Setup-Latest-Offline.exe"}]})";
+    const std::string allAssetsForward = R"({"tag_name":"v0.4.50","assets":[{"name":"Lattice-Setup-Latest-Offline.exe","browser_download_url":"https://example.invalid/Lattice-Setup-Latest-Offline.exe"},{"name":"Lattice-Setup-0.4.50-Offline.exe","browser_download_url":"https://example.invalid/Lattice-Setup-0.4.50-Offline.exe"},{"name":"Lattice-Setup-Latest.exe","browser_download_url":"https://example.invalid/Lattice-Setup-Latest.exe"},{"name":"Lattice-Setup-0.4.50.exe","browser_download_url":"https://example.invalid/Lattice-Setup-0.4.50.exe"}]})";
+    const std::string allAssetsReverse = R"({"tag_name":"v0.4.50","assets":[{"name":"Lattice-Setup-0.4.50.exe","browser_download_url":"https://example.invalid/Lattice-Setup-0.4.50.exe"},{"name":"Lattice-Setup-Latest.exe","browser_download_url":"https://example.invalid/Lattice-Setup-Latest.exe"},{"name":"Lattice-Setup-0.4.50-Offline.exe","browser_download_url":"https://example.invalid/Lattice-Setup-0.4.50-Offline.exe"},{"name":"Lattice-Setup-Latest-Offline.exe","browser_download_url":"https://example.invalid/Lattice-Setup-Latest-Offline.exe"}]})";
     const auto selects = [&version, &url](
         const std::string& metadata,
         UpdatePackageVariant variant,
         const wchar_t* expectedAsset) {
         return UpdateService::SelectReleaseAssetForVariant(
                    metadata, variant, version, url) &&
-            version == L"0.4.49" &&
+            version == L"0.4.50" &&
             url == std::wstring(L"https://example.invalid/") + expectedAsset;
     };
     if (!selects(
             allAssetsForward,
             UpdatePackageVariant::Standard,
-            L"Lattice-Setup-0.4.49.exe") ||
+            L"Lattice-Setup-0.4.50.exe") ||
         !selects(
             allAssetsReverse,
             UpdatePackageVariant::Standard,
-            L"Lattice-Setup-0.4.49.exe") ||
+            L"Lattice-Setup-0.4.50.exe") ||
         !selects(
             allAssetsForward,
             UpdatePackageVariant::Offline,
-            L"Lattice-Setup-0.4.49-Offline.exe") ||
+            L"Lattice-Setup-0.4.50-Offline.exe") ||
         !selects(
             allAssetsReverse,
             UpdatePackageVariant::Offline,
-            L"Lattice-Setup-0.4.49-Offline.exe")) {
+            L"Lattice-Setup-0.4.50-Offline.exe")) {
         std::wcerr << L"Update asset selection depends on release order\n";
         return 2;
     }
 
-    const std::string standardLatestJson = R"({"tag_name":"0.4.49","assets":[{"name":"Lattice-Setup-Latest-Offline.exe","browser_download_url":"https://example.invalid/Lattice-Setup-Latest-Offline.exe"},{"name":"Lattice-Setup-0.4.49-Offline.exe","browser_download_url":"https://example.invalid/Lattice-Setup-0.4.49-Offline.exe"},{"name":"Lattice-Setup-Latest.exe","browser_download_url":"https://example.invalid/Lattice-Setup-Latest.exe"}]})";
-    const std::string offlineOnlyJson = R"({"tag_name":"0.4.49","assets":[{"name":"Lattice-Setup-Latest-Offline.exe","browser_download_url":"https://example.invalid/Lattice-Setup-Latest-Offline.exe"},{"name":"Lattice-Setup-0.4.49-Offline.exe","browser_download_url":"https://example.invalid/Lattice-Setup-0.4.49-Offline.exe"}]})";
-    const std::string latestOfflineJson = R"({"tag_name":"0.4.49","assets":[{"name":"Lattice-Setup-0.4.49.exe","browser_download_url":"https://example.invalid/Lattice-Setup-0.4.49.exe"},{"name":"Lattice-Setup-Latest-Offline.exe","browser_download_url":"https://example.invalid/Lattice-Setup-Latest-Offline.exe"}]})";
-    const std::string latestOfflineOnlyJson = R"({"tag_name":"0.4.49","assets":[{"name":"Lattice-Setup-Latest-Offline.exe","browser_download_url":"https://example.invalid/Lattice-Setup-Latest-Offline.exe"}]})";
+    const std::string standardLatestJson = R"({"tag_name":"0.4.50","assets":[{"name":"Lattice-Setup-Latest-Offline.exe","browser_download_url":"https://example.invalid/Lattice-Setup-Latest-Offline.exe"},{"name":"Lattice-Setup-0.4.50-Offline.exe","browser_download_url":"https://example.invalid/Lattice-Setup-0.4.50-Offline.exe"},{"name":"Lattice-Setup-Latest.exe","browser_download_url":"https://example.invalid/Lattice-Setup-Latest.exe"}]})";
+    const std::string offlineOnlyJson = R"({"tag_name":"0.4.50","assets":[{"name":"Lattice-Setup-Latest-Offline.exe","browser_download_url":"https://example.invalid/Lattice-Setup-Latest-Offline.exe"},{"name":"Lattice-Setup-0.4.50-Offline.exe","browser_download_url":"https://example.invalid/Lattice-Setup-0.4.50-Offline.exe"}]})";
+    const std::string latestOfflineJson = R"({"tag_name":"0.4.50","assets":[{"name":"Lattice-Setup-0.4.50.exe","browser_download_url":"https://example.invalid/Lattice-Setup-0.4.50.exe"},{"name":"Lattice-Setup-Latest-Offline.exe","browser_download_url":"https://example.invalid/Lattice-Setup-Latest-Offline.exe"}]})";
+    const std::string latestOfflineOnlyJson = R"({"tag_name":"0.4.50","assets":[{"name":"Lattice-Setup-Latest-Offline.exe","browser_download_url":"https://example.invalid/Lattice-Setup-Latest-Offline.exe"}]})";
     if (!selects(
             standardLatestJson,
             UpdatePackageVariant::Standard,
@@ -9662,7 +10348,7 @@ int RunSmokeUpdateAndDialog() {
         !selects(
             offlineOnlyJson,
             UpdatePackageVariant::Standard,
-            L"Lattice-Setup-0.4.49-Offline.exe") ||
+            L"Lattice-Setup-0.4.50-Offline.exe") ||
         !selects(
             latestOfflineJson,
             UpdatePackageVariant::Offline,
@@ -9673,12 +10359,12 @@ int RunSmokeUpdateAndDialog() {
             L"Lattice-Setup-Latest-Offline.exe") ||
         !UpdateService::SelectReleaseAsset(
             allAssetsReverse, version, url) ||
-        url != L"https://example.invalid/Lattice-Setup-0.4.49.exe") {
+        url != L"https://example.invalid/Lattice-Setup-0.4.50.exe") {
         std::wcerr << L"Update package priority selection failed\n";
         return 20;
     }
 
-    const std::string standardOnlyJson = R"({"tag_name":"0.4.49","assets":[{"name":"Lattice-Setup-0.4.49.exe","browser_download_url":"https://example.invalid/Lattice-Setup-0.4.49.exe"},{"name":"Lattice-Setup-Latest.exe","browser_download_url":"https://example.invalid/Lattice-Setup-Latest.exe"}]})";
+    const std::string standardOnlyJson = R"({"tag_name":"0.4.50","assets":[{"name":"Lattice-Setup-0.4.50.exe","browser_download_url":"https://example.invalid/Lattice-Setup-0.4.50.exe"},{"name":"Lattice-Setup-Latest.exe","browser_download_url":"https://example.invalid/Lattice-Setup-Latest.exe"}]})";
     version = L"stale";
     url = L"stale";
     if (UpdateService::SelectReleaseAssetForVariant(

@@ -77,6 +77,13 @@ private:
         POINT point{};
     };
 
+    enum class PointerSelectionGesture {
+        None,
+        ItemPressed,
+        MarqueePending,
+        MarqueeActive,
+    };
+
     static LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
     LRESULT HandleMessage(UINT message, WPARAM wParam, LPARAM lParam);
 
@@ -142,6 +149,12 @@ private:
     void DissolveCategory();
     void RenameCategory();
     void ShowIconMenu(POINT screenPoint, int iconIndex);
+    void RenameSelectedItem();
+    bool InvokeSelectedShellVerb(const std::wstring& canonicalVerb);
+    void ScheduleShellMutationCleanup(
+        const std::vector<std::wstring>& itemIds,
+        const std::vector<std::wstring>& paths);
+    void ReconcileShellMutationCleanup();
     void ToggleCollapsed();
     void ToggleLocked();
     RECT GridBounds() const;
@@ -162,8 +175,28 @@ private:
     void FinishIconDrag(POINT pixelPoint);
     void CancelIconDrag();
     void FlushDeferredRefresh();
+    bool IsItemSelected(const std::wstring& itemId) const;
+    void SyncSelectionToGrid();
+    void PruneSelectionToCurrentItems();
+    void ClearSelection();
+    void SelectOnly(int iconIndex);
+    void ToggleSelection(int iconIndex);
+    void SelectAllItems();
+    void MoveKeyboardSelection(UINT virtualKey);
+    std::vector<std::wstring> SelectedItemIdsInVisibleOrder() const;
+    std::vector<std::wstring> SelectedPathsInVisibleOrder() const;
+    std::vector<ShellItemReference> SelectedDesktopShellItems() const;
+    void BeginItemSelection(int iconIndex, bool controlPressed);
+    void BeginMarqueeSelection(POINT point, bool controlPressed);
+    void UpdateMarqueeSelection(POINT point);
+    void CompletePointerSelection(bool dragged);
+    void ResetPointerSelection();
+    void ReorderSelectedItems(size_t targetIndex);
     WidgetWindow* DropTargetWidgetAtScreenPoint(POINT screenPoint) const;
     void MoveItemToCategory(const std::wstring& itemId, const std::wstring& targetCategoryId);
+    void MoveItemsToCategory(
+        const std::vector<std::wstring>& itemIds,
+        const std::wstring& targetCategoryId);
     bool MoveItemOut(
         const std::wstring& itemId,
         bool showError = true,
@@ -197,6 +230,21 @@ private:
     bool dragVisualActive_ = false;
     std::uint64_t dragGhostGeneration_ = 0;
     std::wstring draggingItemId_;
+    std::vector<std::wstring> draggingSelectionIds_;
+    std::vector<std::wstring> selectedItemIds_;
+    std::vector<std::wstring> selectionBaselineItemIds_;
+    PointerSelectionGesture pointerSelectionGesture_ =
+        PointerSelectionGesture::None;
+    POINT selectionStartPoint_{};
+    POINT selectionCurrentPoint_{};
+    RECT selectionMarqueeRect_{};
+    bool selectionControlPressed_ = false;
+    bool pressedItemWasSelected_ = false;
+    std::wstring pressedItemId_;
+    int selectionAnchorIndex_ = -1;
+    std::vector<std::wstring> pendingShellCleanupItemIds_;
+    std::vector<std::wstring> pendingShellCleanupPaths_;
+    unsigned int pendingShellCleanupAttempts_ = 0;
     bool refreshPending_ = false;
     int hoverIconIndex_ = -1;
     int hoverHeaderButton_ = -1;

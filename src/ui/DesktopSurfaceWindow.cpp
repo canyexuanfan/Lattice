@@ -396,7 +396,9 @@ bool DesktopSurfaceWindow::Create(
             item.path,
             item.systemImageIndex,
             item.overlayIndex,
-            iconSize_);
+            iconSize_,
+            &item.shellChildPidl,
+            snapshot_.viewIconSize);
     }
     if (!wallpaper_.Refresh(
             hwnd_, d2d_.Target(), width, height, false)) {
@@ -445,7 +447,9 @@ void DesktopSurfaceWindow::UpdateAssignedIdentities(
             item.path,
             item.systemImageIndex,
             item.overlayIndex,
-            iconSize_);
+            iconSize_,
+            &item.shellChildPidl,
+            snapshot_.viewIconSize);
     }
     if (hwnd_ != nullptr) {
         InvalidateRect(hwnd_, nullptr, FALSE);
@@ -673,7 +677,9 @@ bool DesktopSurfaceWindow::Refresh(
             item.path,
             item.systemImageIndex,
             item.overlayIndex,
-            iconSize_);
+            iconSize_,
+            &item.shellChildPidl,
+            snapshot_.viewIconSize);
     }
     const int width =
         snapshot_.screenRect.right - snapshot_.screenRect.left;
@@ -1188,7 +1194,9 @@ void DesktopSurfaceWindow::Render() {
             nullptr,
             item.systemImageIndex,
             item.overlayIndex,
-            iconSize_);
+            iconSize_,
+            &item.shellChildPidl,
+            snapshot_.viewIconSize);
         if (bitmap != nullptr) {
             const FLOAT bitmapHeight = item.overlayIndex > 0
                 ? static_cast<FLOAT>(
@@ -2558,12 +2566,16 @@ void DesktopSurfaceWindow::ReplaceRenamedIdentity(
         renamedItem.item.path,
         systemImageIndex,
         overlayIndex,
-        iconSize_);
+        iconSize_,
+        &renamedItem.item.desktopChildPidl,
+        snapshot_.viewIconSize);
     iconCache_.PreloadShellIcon(
         renamedItem.item.path,
         systemImageIndex,
         overlayIndex,
-        iconSize_);
+        iconSize_,
+        &renamedItem.item.desktopChildPidl,
+        snapshot_.viewIconSize);
     if (hwnd_ != nullptr) {
         InvalidateRect(hwnd_, nullptr, FALSE);
     }

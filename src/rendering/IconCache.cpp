@@ -8,6 +8,7 @@
 #include <shobjidl.h>
 
 #include <algorithm>
+#include <array>
 #include <condition_variable>
 #include <cstdint>
 #include <mutex>
@@ -59,9 +60,11 @@ struct PendingIconRequest {
     std::uint64_t generation = 0;
     std::wstring loadPath;
     std::wstring resultPath;
+    std::vector<BYTE> shellChildPidl;
     int systemImageIndex = -1;
     int overlayIndex = 0;
     int desiredPixelSize = 0;
+    int shellImageLogicalSize = 0;
 };
 
 struct FailedIconLoad {
@@ -181,25 +184,21 @@ HICON LoadShellIconWithFallback(const std::wstring& path) {
     return fallbackResult != 0 ? fallbackInfo.hIcon : nullptr;
 }
 
-HICON LoadSystemImageIcon(
-    int systemImageIndex,
-    int overlayIndex,
-    int desiredPixelSize) {
-    if (systemImageIndex < 0) {
-        return nullptr;
-    }
-    Microsoft::WRL::ComPtr<IImageList> imageList;
-    const int imageListSize = desiredPixelSize <= 16
+int SystemImageListSizeFor(int desiredPixelSize) {
+    return desiredPixelSize <= 16
         ? SHIL_SMALL
         : (desiredPixelSize <= 32
             ? SHIL_LARGE
             : (desiredPixelSize <= 48
                 ? SHIL_EXTRALARGE
                 : SHIL_JUMBO));
-    if (FAILED(SHGetImageList(
-            imageListSize,
-            IID_PPV_ARGS(imageList.GetAddressOf()))) ||
-        imageList == nullptr) {
+}
+
+HICON LoadSystemImageIcon(
+    IImageList* imageList,
+    int systemImageIndex,
+    int overlayIndex) {
+    if (imageList == nullptr || systemImageIndex < 0) {
         return nullptr;
     }
     const UINT flags = ILD_TRANSPARENT |
@@ -209,6 +208,71 @@ HICON LoadSystemImageIcon(
     HICON icon = nullptr;
     return SUCCEEDED(imageList->GetIcon(
         systemImageIndex, flags, &icon)) ? icon : nullptr;
+}
+
+bool ResolveShellImageIdentity(
+    const std::wstring& path,
+    int& imageIndex,
+    int& overlayIndex) {
+    imageIndex = -1;
+    overlayIndex = 0;
+    if (path.empty()) {
+        return false;
+    }
+
+    SHFILEINFOW fileInfo{};
+    PIDLIST_ABSOLUTE pidl = nullptr;
+    const bool namespaceItem =
+        GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES &&
+        SUCCEEDED(SHParseDisplayName(
+            path.c_str(), nullptr, &pidl, 0, nullptr)) &&
+        pidl != nullptr;
+    constexpr UINT flags = SHGFI_ICON | SHGFI_SYSICONINDEX |
+        SHGFI_ADDOVERLAYS | SHGFI_OVERLAYINDEX;
+    const DWORD_PTR infoResult = SHGetFileInfoW(
+        namespaceItem ? reinterpret_cast<LPCWSTR>(pidl) : path.c_str(),
+        0,
+        &fileInfo,
+        sizeof(fileInfo),
+        flags | (namespaceItem ? SHGFI_PIDL : 0));
+    if (pidl != nullptr) {
+        CoTaskMemFree(pidl);
+    }
+    if (infoResult == 0) {
+        return false;
+    }
+
+    imageIndex = fileInfo.iIcon & 0x00FFFFFF;
+    overlayIndex = (fileInfo.iIcon >> 24) & 0xFF;
+    if (fileInfo.hIcon != nullptr) {
+        DestroyIcon(fileInfo.hIcon);
+    }
+    return imageIndex >= 0;
+}
+
+HICON LoadSystemImageIconForDesktopChild(
+    IImageList* imageList,
+    IShellFolder* desktopFolder,
+    const std::vector<BYTE>& shellChildPidl) {
+    if (imageList == nullptr || desktopFolder == nullptr ||
+        shellChildPidl.size() < sizeof(USHORT) * 2U) {
+        return nullptr;
+    }
+    const auto* child = reinterpret_cast<PCUITEMID_CHILD>(
+        shellChildPidl.data());
+    if (ILIsEmpty(child) ||
+        !ILIsEmpty(ILNext(child)) ||
+        ILGetSize(child) != shellChildPidl.size()) {
+        return nullptr;
+    }
+    const int imageIndex = SHMapPIDLToSystemImageListIndex(
+        desktopFolder,
+        child,
+        nullptr);
+    return LoadSystemImageIcon(
+        imageList,
+        imageIndex,
+        0);
 }
 
 HICON LoadShellItemImage(
@@ -528,6 +592,9 @@ public:
         const std::shared_ptr<IconAsyncState>& state) {
         {
             std::lock_guard<std::mutex> lock(mutex_);
+            if (stop_) {
+                return false;
+            }
             if (requests_.size() >= kRequestCapacity) {
                 std::queue<Request> liveRequests;
                 while (!requests_.empty()) {
@@ -566,8 +633,10 @@ public:
             stop_ = true;
         }
         condition_.notify_all();
-        if (worker_.joinable()) {
-            worker_.join();
+        for (std::thread& worker : workers_) {
+            if (worker.joinable()) {
+                worker.join();
+            }
         }
     }
 
@@ -578,10 +647,15 @@ private:
     };
 
     static constexpr size_t kRequestCapacity = 1024;
+    static constexpr size_t kWorkerCount = 4;
 
-    SharedIconLoader()
-        : worker_(&SharedIconLoader::WorkerLoop, this) {
+    SharedIconLoader() {
         sharedIconLoaderInstance = this;
+        for (std::thread& worker : workers_) {
+            worker = std::thread(
+                &SharedIconLoader::WorkerLoop,
+                this);
+        }
     }
 
     ~SharedIconLoader() {
@@ -597,6 +671,12 @@ private:
             CoInitializeEx(nullptr, COINIT_MULTITHREADED);
         const DPI_AWARENESS_CONTEXT previousDpiContext =
             SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        constexpr size_t kSystemImageListCount = 5;
+        std::array<Microsoft::WRL::ComPtr<IImageList>,
+                   kSystemImageListCount> systemImageLists;
+        std::array<bool, kSystemImageListCount>
+            systemImageListAttempted{};
+        Microsoft::WRL::ComPtr<IShellFolder> desktopFolder;
         for (;;) {
             Request request;
             {
@@ -615,10 +695,12 @@ private:
             }
 
             std::wstring loadPath;
+            std::vector<BYTE> shellChildPidl;
             std::uint64_t generation = 0;
             int systemImageIndex = -1;
             int overlayIndex = 0;
             int desiredPixelSize = 0;
+            int shellImageLogicalSize = 0;
             {
                 std::lock_guard<std::mutex> lock(state->mutex);
                 const auto pending = state->pendingById.find(request.id);
@@ -627,40 +709,115 @@ private:
                     continue;
                 }
                 loadPath = pending->second.loadPath;
+                shellChildPidl = pending->second.shellChildPidl;
                 generation = pending->second.generation;
                 systemImageIndex = pending->second.systemImageIndex;
                 overlayIndex = pending->second.overlayIndex;
                 desiredPixelSize = pending->second.desiredPixelSize;
+                shellImageLogicalSize =
+                    pending->second.shellImageLogicalSize;
             }
 
+            const int imageListSize =
+                SystemImageListSizeFor(
+                    shellImageLogicalSize > 0
+                        ? shellImageLogicalSize
+                        : desiredPixelSize);
+            const size_t imageListSlot =
+                static_cast<size_t>(imageListSize);
+            if (imageListSlot < systemImageLists.size() &&
+                !systemImageListAttempted[imageListSlot]) {
+                systemImageListAttempted[imageListSlot] = true;
+                SHGetImageList(
+                    imageListSize,
+                    IID_PPV_ARGS(
+                        systemImageLists[imageListSlot].GetAddressOf()));
+            }
+            IImageList* systemImageList =
+                imageListSlot < systemImageLists.size()
+                    ? systemImageLists[imageListSlot].Get()
+                    : nullptr;
+            // Explorer's LVITEM.iImage belongs to the current ListView image
+            // list. It is not a stable index into SHGetImageList and may be
+            // populated only after Explorer has painted once. Resolve the
+            // system image identity again from the real Shell item instead.
+            (void)systemImageIndex;
+            (void)overlayIndex;
             const DWORD attributes =
                 GetFileAttributesW(loadPath.c_str());
-            const bool iconOnly =
-                attributes == INVALID_FILE_ATTRIBUTES ||
-                (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0;
-            HICON icon = LoadShellItemImage(
-                loadPath,
-                desiredPixelSize,
-                iconOnly);
-            const bool needsShield =
-                (ReadShellIconFlags(loadPath) & GIL_SHIELD) != 0;
-            if (icon != nullptr &&
-                (overlayIndex > 0 || needsShield)) {
-                HICON decorated = AddShellDecorations(
-                    icon,
-                    overlayIndex,
-                    needsShield,
-                    desiredPixelSize);
-                if (decorated != nullptr) {
-                    DestroyIcon(icon);
-                    icon = decorated;
+            const bool directory =
+                attributes != INVALID_FILE_ATTRIBUTES &&
+                (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+            int shellSystemImageIndex = -1;
+            int shellOverlayIndex = 0;
+            const bool hasShellImageIdentity =
+                desiredPixelSize > 0 &&
+                ResolveShellImageIdentity(
+                    loadPath,
+                    shellSystemImageIndex,
+                    shellOverlayIndex);
+            HICON icon = directory
+                ? LoadShellItemImage(
+                    loadPath,
+                    desiredPixelSize,
+                    false)
+                : nullptr;
+            if (icon != nullptr) {
+                const bool needsShield =
+                    (ReadShellIconFlags(loadPath) & GIL_SHIELD) != 0;
+                if (shellOverlayIndex > 0 || needsShield) {
+                    HICON decorated = AddShellDecorations(
+                        icon,
+                        shellOverlayIndex,
+                        needsShield,
+                        desiredPixelSize);
+                    if (decorated != nullptr) {
+                        DestroyIcon(icon);
+                        icon = decorated;
+                    }
                 }
             }
+            if (icon == nullptr && desiredPixelSize > 0) {
+                if (hasShellImageIdentity) {
+                    icon = LoadSystemImageIcon(
+                        systemImageList,
+                        shellSystemImageIndex,
+                        shellOverlayIndex);
+                }
+            }
+            if (icon == nullptr && desiredPixelSize > 0) {
+                if (!shellChildPidl.empty() &&
+                    desktopFolder == nullptr) {
+                    SHGetDesktopFolder(
+                        desktopFolder.GetAddressOf());
+                }
+                icon = LoadSystemImageIconForDesktopChild(
+                    systemImageList,
+                    desktopFolder.Get(),
+                    shellChildPidl);
+            }
             if (icon == nullptr) {
-                icon = LoadSystemImageIcon(
-                    systemImageIndex,
-                    overlayIndex,
-                    desiredPixelSize);
+                const bool iconOnly =
+                    attributes == INVALID_FILE_ATTRIBUTES ||
+                    (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0;
+                icon = LoadShellItemImage(
+                    loadPath,
+                    desiredPixelSize,
+                    iconOnly);
+                const bool needsShield =
+                    (ReadShellIconFlags(loadPath) & GIL_SHIELD) != 0;
+                if (icon != nullptr &&
+                    (shellOverlayIndex > 0 || needsShield)) {
+                    HICON decorated = AddShellDecorations(
+                        icon,
+                        shellOverlayIndex,
+                        needsShield,
+                        desiredPixelSize);
+                    if (decorated != nullptr) {
+                        DestroyIcon(icon);
+                        icon = decorated;
+                    }
+                }
             }
             if (icon == nullptr) {
                 icon = LoadShellIconWithFallback(loadPath);
@@ -729,7 +886,7 @@ private:
         }
     }
 
-    std::thread worker_;
+    std::array<std::thread, kWorkerCount> workers_;
     std::mutex mutex_;
     std::condition_variable condition_;
     std::queue<Request> requests_;
@@ -774,7 +931,9 @@ ID2D1Bitmap* IconCache::GetIcon(
     bool* usedPlaceholder,
     int systemImageIndex,
     int overlayIndex,
-    int desiredPixelSize) {
+    int desiredPixelSize,
+    const std::vector<BYTE>* shellChildPidl,
+    int shellImageLogicalSize) {
     (void)displayName;
     if (usedPlaceholder != nullptr) {
         *usedPlaceholder = false;
@@ -796,7 +955,9 @@ ID2D1Bitmap* IconCache::GetIcon(
         path,
         systemImageIndex,
         overlayIndex,
-        desiredPixelSize);
+        desiredPixelSize,
+        shellChildPidl,
+        shellImageLogicalSize);
     ID2D1Bitmap* placeholder = GetPlaceholder(target, placeholderKind);
     if (placeholder != nullptr && usedPlaceholder != nullptr) {
         *usedPlaceholder = true;
@@ -857,7 +1018,9 @@ void IconCache::PreloadShellIcon(
     const std::wstring& path,
     int systemImageIndex,
     int overlayIndex,
-    int desiredPixelSize) {
+    int desiredPixelSize,
+    const std::vector<BYTE>* shellChildPidl,
+    int shellImageLogicalSize) {
     if (path.empty()) {
         return;
     }
@@ -871,7 +1034,9 @@ void IconCache::PreloadShellIcon(
         path,
         systemImageIndex,
         overlayIndex,
-        desiredPixelSize);
+        desiredPixelSize,
+        shellChildPidl,
+        shellImageLogicalSize);
 }
 
 void IconCache::Alias(
@@ -879,7 +1044,9 @@ void IconCache::Alias(
     const std::wstring& destinationPath,
     int systemImageIndex,
     int overlayIndex,
-    int desiredPixelSize) {
+    int desiredPixelSize,
+    const std::vector<BYTE>* shellChildPidl,
+    int shellImageLogicalSize) {
     if (sourcePath.empty() || destinationPath.empty() || sourcePath == destinationPath) {
         return;
     }
@@ -936,6 +1103,12 @@ void IconCache::Alias(
             if (request != asyncState_->pendingById.end()) {
                 request->second.loadPath = destinationPath;
                 request->second.resultPath = destinationPath;
+                request->second.shellChildPidl =
+                    shellChildPidl != nullptr
+                        ? *shellChildPidl
+                        : std::vector<BYTE>{};
+                request->second.shellImageLogicalSize =
+                    shellImageLogicalSize;
                 asyncState_->pendingIdByPath[destinationPath] = requestId;
                 return;
             }
@@ -947,7 +1120,9 @@ void IconCache::Alias(
             destinationPath,
             systemImageIndex,
             overlayIndex,
-            desiredPixelSize);
+            desiredPixelSize,
+            shellChildPidl,
+            shellImageLogicalSize);
     }
 }
 
@@ -1020,7 +1195,9 @@ void IconCache::Enqueue(
     const std::wstring& path,
     int systemImageIndex,
     int overlayIndex,
-    int desiredPixelSize) {
+    int desiredPixelSize,
+    const std::vector<BYTE>* shellChildPidl,
+    int shellImageLogicalSize) {
     if (path.empty()) {
         return;
     }
@@ -1045,9 +1222,13 @@ void IconCache::Enqueue(
             request.generation = asyncState_->generation;
             request.loadPath = path;
             request.resultPath = path;
+            if (shellChildPidl != nullptr) {
+                request.shellChildPidl = *shellChildPidl;
+            }
             request.systemImageIndex = systemImageIndex;
             request.overlayIndex = overlayIndex;
             request.desiredPixelSize = desiredPixelSize;
+            request.shellImageLogicalSize = shellImageLogicalSize;
             asyncState_->pendingById.emplace(requestId, std::move(request));
             asyncState_->pendingIdByPath[path] = requestId;
         }

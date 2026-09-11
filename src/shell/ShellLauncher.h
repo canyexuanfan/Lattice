@@ -2,6 +2,7 @@
 
 #include <Windows.h>
 
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -12,7 +13,10 @@ enum class ShellContextMenuResult {
     Cancelled,
     Invoked,
     RenameRequested,
+    CustomCommand,
 };
+
+using ShellMenuAppender = std::function<void(HMENU)>;
 
 class ShellLauncher {
 public:
@@ -32,6 +36,30 @@ public:
         const std::vector<ShellItemReference>& items,
         POINT screenPoint,
         bool allowRename) const;
+    ShellContextMenuResult ShowContextMenuWithExtensions(
+        HWND ownerWindow,
+        const std::wstring& path,
+        POINT screenPoint,
+        bool allowRename,
+        const ShellMenuAppender& appendCommands,
+        UINT& customCommand,
+        std::wstring& invokedVerb) const;
+    ShellContextMenuResult ShowDesktopContextMenuWithExtensions(
+        HWND ownerWindow,
+        const std::vector<ShellItemReference>& items,
+        POINT screenPoint,
+        bool allowRename,
+        const ShellMenuAppender& appendCommands,
+        UINT& customCommand,
+        std::wstring& invokedVerb) const;
+    bool InvokeContextMenuVerb(
+        HWND ownerWindow,
+        const std::wstring& path,
+        const std::wstring& canonicalVerb) const;
+    bool InvokeDesktopContextMenuVerb(
+        HWND ownerWindow,
+        const std::vector<ShellItemReference>& items,
+        const std::wstring& canonicalVerb) const;
     bool ForwardContextMenuMessage(
         UINT message,
         WPARAM wParam,

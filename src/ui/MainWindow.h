@@ -42,7 +42,7 @@ public:
     void ShowNonBlockingNotice(
         const std::wstring& title,
         const std::wstring& message);
-    void Show(int showCommand);
+    void Show(int showCommand, bool enableDesktopTakeover = true);
     bool ShouldStartHidden() const noexcept {
         return organizerConfig_.settings.startHidden ||
                (organizerConfig_.settings.restoreHiddenState && !organizerConfig_.settings.lastVisible);
@@ -70,6 +70,7 @@ private:
     LRESULT HandleMessage(UINT message, WPARAM wParam, LPARAM lParam);
 
     void LoadDesktopItems();
+    void ReconcileDeletedDesktopItems();
     std::vector<std::wstring> AssignedDesktopIdentities() const;
     void RefreshDesktopSurfaceAssignments();
     void ScheduleDesktopRefresh();

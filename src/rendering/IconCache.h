@@ -10,6 +10,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 struct IconAsyncState;
 
@@ -31,7 +32,9 @@ public:
         bool* usedPlaceholder = nullptr,
         int systemImageIndex = -1,
         int overlayIndex = 0,
-        int desiredPixelSize = 0);
+        int desiredPixelSize = 0,
+        const std::vector<BYTE>* shellChildPidl = nullptr,
+        int shellImageLogicalSize = 0);
     bool IsIconReady(ID2D1RenderTarget* target, const std::wstring& path);
     HICON CopyReadyIconForDrag(const std::wstring& path);
     void Preload(const std::wstring& path);
@@ -39,13 +42,17 @@ public:
         const std::wstring& path,
         int systemImageIndex,
         int overlayIndex,
-        int desiredPixelSize);
+        int desiredPixelSize,
+        const std::vector<BYTE>* shellChildPidl = nullptr,
+        int shellImageLogicalSize = 0);
     void Alias(
         const std::wstring& sourcePath,
         const std::wstring& destinationPath,
         int systemImageIndex = -1,
         int overlayIndex = 0,
-        int desiredPixelSize = 0);
+        int desiredPixelSize = 0,
+        const std::vector<BYTE>* shellChildPidl = nullptr,
+        int shellImageLogicalSize = 0);
     void Clear();
     size_t Size() const noexcept;
     void SetCapacity(size_t capacity);
@@ -58,7 +65,9 @@ private:
         const std::wstring& path,
         int systemImageIndex = -1,
         int overlayIndex = 0,
-        int desiredPixelSize = 0);
+        int desiredPixelSize = 0,
+        const std::vector<BYTE>* shellChildPidl = nullptr,
+        int shellImageLogicalSize = 0);
     ID2D1Bitmap* GetPlaceholder(
         ID2D1RenderTarget* target,
         IconPlaceholderKind placeholderKind);

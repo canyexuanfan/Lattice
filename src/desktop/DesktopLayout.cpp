@@ -197,52 +197,138 @@ std::wstring ItemDisplayName(
     return buffer.data();
 }
 
-void ReadShellImageIdentity(
-    IShellFolder* folder,
-    PCUITEMID_CHILD child,
-    int& systemImageIndex,
-    int& overlayIndex) {
-    systemImageIndex = -1;
-    overlayIndex = 0;
-    if (folder == nullptr || child == nullptr) {
-        return;
+class ExplorerListViewImageReader {
+public:
+    ExplorerListViewImageReader() = default;
+    ExplorerListViewImageReader(const ExplorerListViewImageReader&) = delete;
+    ExplorerListViewImageReader& operator=(const ExplorerListViewImageReader&) = delete;
+
+    ~ExplorerListViewImageReader() {
+        Reset();
     }
-    ComPtr<IShellItem> shellItem;
-    if (FAILED(SHCreateItemWithParent(
+
+    bool Initialize(HWND listViewWindow) {
+        Reset();
+        DWORD processId = 0;
+        if (listViewWindow == nullptr ||
+            GetWindowThreadProcessId(listViewWindow, &processId) == 0 ||
+            processId == 0) {
+            return false;
+        }
+        process_ = OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION |
+                PROCESS_VM_OPERATION | PROCESS_VM_READ | PROCESS_VM_WRITE,
+            FALSE,
+            processId);
+        if (process_ == nullptr) {
+            return false;
+        }
+        remoteBuffer_ = VirtualAllocEx(
+            process_,
             nullptr,
-            folder,
-            child,
-            IID_PPV_ARGS(shellItem.GetAddressOf()))) ||
-        shellItem == nullptr) {
-        return;
+            sizeof(LVITEMW),
+            MEM_COMMIT | MEM_RESERVE,
+            PAGE_READWRITE);
+        if (remoteBuffer_ == nullptr) {
+            Reset();
+            return false;
+        }
+        listViewWindow_ = listViewWindow;
+        processId_ = processId;
+        available_ = true;
+        return true;
     }
-    PIDLIST_ABSOLUTE absolutePidl = nullptr;
-    if (FAILED(SHGetIDListFromObject(
-            shellItem.Get(), &absolutePidl)) ||
-        absolutePidl == nullptr) {
-        return;
+
+    bool Read(
+        int viewIndex,
+        int& systemImageIndex,
+        int& overlayIndex) {
+        systemImageIndex = -1;
+        overlayIndex = 0;
+        if (!available_ || viewIndex < 0 ||
+            listViewWindow_ == nullptr ||
+            IsWindow(listViewWindow_) == FALSE) {
+            return false;
+        }
+        DWORD currentProcessId = 0;
+        GetWindowThreadProcessId(listViewWindow_, &currentProcessId);
+        if (currentProcessId != processId_) {
+            Reset();
+            return false;
+        }
+
+        LVITEMW item{};
+        item.mask = LVIF_IMAGE | LVIF_STATE;
+        item.iItem = viewIndex;
+        item.iSubItem = 0;
+        item.stateMask = LVIS_OVERLAYMASK;
+        SIZE_T written = 0;
+        if (WriteProcessMemory(
+                process_,
+                remoteBuffer_,
+                &item,
+                sizeof(item),
+                &written) == FALSE ||
+            written != sizeof(item)) {
+            Reset();
+            return false;
+        }
+
+        DWORD_PTR messageResult = 0;
+        if (SendMessageTimeoutW(
+                listViewWindow_,
+                LVM_GETITEMW,
+                0,
+                reinterpret_cast<LPARAM>(remoteBuffer_),
+                SMTO_ABORTIFHUNG | SMTO_BLOCK | SMTO_ERRORONEXIT,
+                100,
+                &messageResult) == 0 ||
+            messageResult == FALSE) {
+            Reset();
+            return false;
+        }
+
+        SIZE_T read = 0;
+        if (ReadProcessMemory(
+                process_,
+                remoteBuffer_,
+                &item,
+                sizeof(item),
+                &read) == FALSE ||
+            read != sizeof(item)) {
+            Reset();
+            return false;
+        }
+        if (item.iImage < 0) {
+            return false;
+        }
+        systemImageIndex = item.iImage;
+        overlayIndex = static_cast<int>(
+            (item.state & LVIS_OVERLAYMASK) >> 8U);
+        return true;
     }
-    SHFILEINFOW fileInfo{};
-    constexpr UINT flags = SHGFI_PIDL | SHGFI_ICON | SHGFI_SYSICONINDEX |
-        SHGFI_ADDOVERLAYS | SHGFI_OVERLAYINDEX;
-    const DWORD_PTR result = SHGetFileInfoW(
-        reinterpret_cast<LPCWSTR>(absolutePidl),
-        0,
-        &fileInfo,
-        sizeof(fileInfo),
-        flags);
-    CoTaskMemFree(absolutePidl);
-    if (result == 0) {
-        return;
+
+private:
+    void Reset() {
+        available_ = false;
+        if (remoteBuffer_ != nullptr && process_ != nullptr) {
+            VirtualFreeEx(process_, remoteBuffer_, 0, MEM_RELEASE);
+        }
+        remoteBuffer_ = nullptr;
+        if (process_ != nullptr) {
+            CloseHandle(process_);
+        }
+        process_ = nullptr;
+        listViewWindow_ = nullptr;
+        processId_ = 0;
     }
-    const unsigned int packed =
-        static_cast<unsigned int>(fileInfo.iIcon);
-    systemImageIndex = static_cast<int>(packed & 0x00FFFFFFU);
-    overlayIndex = static_cast<int>((packed >> 24U) & 0xFFU);
-    if (fileInfo.hIcon != nullptr) {
-        DestroyIcon(fileInfo.hIcon);
-    }
-}
+
+    HWND listViewWindow_ = nullptr;
+    DWORD processId_ = 0;
+    HANDLE process_ = nullptr;
+    void* remoteBuffer_ = nullptr;
+    bool available_ = false;
+};
 
 struct ShellDesktopItem {
     PIDLIST_RELATIVE pidl = nullptr;
@@ -469,6 +555,8 @@ bool CaptureViewSnapshotCore(
             snapshot.viewIconSize = viewIconSize;
         }
     }
+    ExplorerListViewImageReader imageReader;
+    imageReader.Initialize(listViewWindow);
     snapshot.items.reserve(shellItems.size());
     for (const ShellDesktopItem& shellItem : shellItems) {
         POINT viewPoint{};
@@ -481,9 +569,8 @@ bool CaptureViewSnapshotCore(
         }
         int systemImageIndex = -1;
         int overlayIndex = 0;
-        ReadShellImageIdentity(
-            folder.Get(),
-            shellItem.pidl,
+        imageReader.Read(
+            shellItem.viewIndex,
             systemImageIndex,
             overlayIndex);
         const UINT shellChildPidlSize =

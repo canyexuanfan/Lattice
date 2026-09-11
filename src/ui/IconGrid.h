@@ -25,9 +25,11 @@ public:
     void SetLightTheme(bool lightTheme);
     bool SetHoverIndex(int index);
     void SetSelectedIndex(int index);
+    void SetSelectedIndices(const std::vector<int>& indices);
     void SetDraggingIndex(int index);
     bool ScrollBy(int deltaPixels);
     void SetScrollOffset(int scrollOffset);
+    bool EnsureItemVisible(size_t index);
     int HitTest(POINT point) const;
     int SlotIndexForPoint(POINT point) const;
     int InsertionIndexForPoint(POINT point) const;
@@ -63,7 +65,7 @@ private:
     int cellHeight_ = 92;
     int scrollOffset_ = 0;
     int hoverIndex_ = -1;
-    int selectedIndex_ = -1;
+    std::vector<int> selectedIndices_;
     int draggingIndex_ = -1;
     std::uint64_t itemsGeneration_ = 0;
     size_t lastFallbackDrawCount_ = 0;

@@ -760,7 +760,8 @@ bool ManagedShortcutStore::MoveToOriginalDesktop(
     std::wstring& destinationPath,
     std::wstring& errorMessage,
     HWND ownerWindow,
-    bool notifyShell) {
+    bool notifyShell,
+    bool allowUniqueConflictDestination) {
     if (!IsManagedPath(sourcePath)) {
         errorMessage = L"该项目不在格子的托管目录中，未移动任何文件。";
         return false;
@@ -773,6 +774,25 @@ bool ManagedShortcutStore::MoveToOriginalDesktop(
     }
     if (GetFileAttributesW(target.c_str()) != INVALID_FILE_ATTRIBUTES && !PathsEqual(sourcePath, target)) {
         if (!FilesHaveSameContents(sourcePath, target)) {
+            if (allowUniqueConflictDestination) {
+                const std::wstring uniqueTarget = AvailableDestination(
+                    targetDirectory, FileNameFromPath(target));
+                if (uniqueTarget.empty()) {
+                    errorMessage = L"原桌面目录中同名项目过多，无法生成安全文件名。";
+                    return false;
+                }
+                return ExecuteMove(
+                    itemId,
+                    sourcePath,
+                    targetDirectory,
+                    true,
+                    persistDestination,
+                    destinationPath,
+                    errorMessage,
+                    uniqueTarget,
+                    ownerWindow,
+                    notifyShell);
+            }
             errorMessage = L"原桌面位置已经存在内容不同的同名项目，已保留两份且未覆盖：" + target;
             return false;
         }

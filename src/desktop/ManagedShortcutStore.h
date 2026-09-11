@@ -74,7 +74,8 @@ public:
         std::wstring& destinationPath,
         std::wstring& errorMessage,
         HWND ownerWindow = nullptr,
-        bool notifyShell = true);
+        bool notifyShell = true,
+        bool allowUniqueConflictDestination = false);
 
     bool MoveToOriginalDesktopBatch(
         const std::vector<OriginalDesktopMoveRequest>& requests,

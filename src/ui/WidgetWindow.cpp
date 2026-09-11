@@ -45,8 +45,11 @@ constexpr UINT_PTR kIconDragTimerId = 5;
 constexpr UINT kIconDragPollMilliseconds = 16;
 constexpr UINT_PTR kInteractionSaveTimerId = 6;
 constexpr UINT kInteractionSaveDelayMilliseconds = 240;
+constexpr UINT_PTR kShellMutationCleanupTimerId = 7;
+constexpr UINT kShellMutationCleanupDelayMilliseconds = 500;
+constexpr unsigned int kMaximumShellMutationCleanupAttempts = 20;
 constexpr wchar_t kAlignmentGuideClassName[] = L"Lattice.AlignmentGuide";
-constexpr wchar_t kCurrentVersion[] = L"0.4.48";
+constexpr wchar_t kCurrentVersion[] = L"0.4.50";
 constexpr UINT kShellNewCommandFirst = 0x5000;
 constexpr UINT kShellNewCommandLast = 0x5FFF;
 
@@ -396,7 +399,7 @@ bool WidgetWindow::Create() {
     const auto createWindow = [&](HWND host) {
         ScopedPerMonitorV2Awareness dpiAwareness(host);
         return CreateWindowExW(
-            WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+            WS_EX_TOOLWINDOW,
             kWindowClassName,
             categoryName_.c_str(),
             WS_POPUP,
@@ -584,6 +587,11 @@ LRESULT WidgetWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) 
         } else if (gActiveShellMenu2 != nullptr && SUCCEEDED(gActiveShellMenu2->HandleMenuMsg(message, wParam, lParam))) {
             return 0;
         }
+        LRESULT shellMenuResult = 0;
+        if (launcher_.ForwardContextMenuMessage(
+                message, wParam, lParam, shellMenuResult)) {
+            return shellMenuResult;
+        }
     }
     switch (message) {
         case WM_CREATE:
@@ -701,7 +709,86 @@ LRESULT WidgetWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) 
         }
 
         case WM_MOUSEACTIVATE:
-            return MA_NOACTIVATE;
+            return MA_ACTIVATE;
+
+        case WM_GETDLGCODE:
+            return DLGC_WANTARROWS | DLGC_WANTCHARS | DLGC_WANTALLKEYS;
+
+        case WM_KEYDOWN: {
+            if (IsShellDropBusy() || windowConfig_.collapsed) {
+                return 0;
+            }
+            const bool controlPressed = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+            const bool shiftPressed = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+            if (controlPressed && wParam == 'A') {
+                SelectAllItems();
+                return 0;
+            }
+            if (controlPressed && wParam == 'C') {
+                InvokeSelectedShellVerb(L"copy");
+                return 0;
+            }
+            if (controlPressed && wParam == 'X') {
+                InvokeSelectedShellVerb(L"cut");
+                return 0;
+            }
+            if (controlPressed && wParam == 'V') {
+                PasteClipboardShortcuts();
+                return 0;
+            }
+            if (wParam == VK_ESCAPE) {
+                if (draggingIconIndex_ >= 0 || dragVisualActive_) {
+                    CancelIconDrag();
+                } else {
+                    ResetPointerSelection();
+                    ClearSelection();
+                }
+                return 0;
+            }
+            if (wParam == VK_LEFT || wParam == VK_RIGHT ||
+                wParam == VK_UP || wParam == VK_DOWN) {
+                MoveKeyboardSelection(static_cast<UINT>(wParam));
+                return 0;
+            }
+            if (wParam == VK_RETURN) {
+                for (const std::wstring& path : SelectedPathsInVisibleOrder()) {
+                    launcher_.OpenPath(path);
+                }
+                return 0;
+            }
+            if (wParam == VK_F2) {
+                RenameSelectedItem();
+                return 0;
+            }
+            if (wParam == VK_DELETE) {
+                InvokeSelectedShellVerb(L"delete");
+                return 0;
+            }
+            if (wParam == VK_APPS || (shiftPressed && wParam == VK_F10)) {
+                const std::vector<std::wstring> selected =
+                    SelectedItemIdsInVisibleOrder();
+                if (!selected.empty()) {
+                    const auto current = std::find_if(
+                        currentItems_.begin(), currentItems_.end(),
+                        [&](const DesktopItem& item) {
+                            return item.id == selected.front();
+                        });
+                    if (current != currentItems_.end()) {
+                        const int index = static_cast<int>(
+                            std::distance(currentItems_.begin(), current));
+                        const RECT cell = iconGrid_.CellAt(
+                            static_cast<size_t>(index));
+                        POINT screenPoint{
+                            DipToPixels((cell.left + cell.right) / 2),
+                            DipToPixels((cell.top + cell.bottom) / 2)};
+                        ClientToScreen(hwnd_, &screenPoint);
+                        ShowIconMenu(screenPoint, index);
+                    }
+                }
+                return 0;
+            }
+            break;
+        }
 
         case WM_NCHITTEST: {
             POINT pixelPoint{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
@@ -756,13 +843,15 @@ LRESULT WidgetWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) 
             }
             const int clickedIconIndex = iconGrid_.HitTest(point);
             if (clickedIconIndex >= 0) {
-                iconGrid_.SetSelectedIndex(clickedIconIndex);
-                InvalidateRect(hwnd_, nullptr, FALSE);
-                if (singleClickOpen_) {
+                const bool controlPressed =
+                    (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+                BeginItemSelection(clickedIconIndex, controlPressed);
+                if (singleClickOpen_ && !controlPressed) {
                     const DesktopItem* item = iconGrid_.ItemAt(static_cast<size_t>(clickedIconIndex));
                     if (item != nullptr) {
                         launcher_.OpenPath(item->path);
                     }
+                    CompletePointerSelection(false);
                     return 0;
                 }
             }
@@ -775,6 +864,8 @@ LRESULT WidgetWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) 
                 if (dragItem != nullptr) {
                     draggingIconIndex_ = iconIndex;
                     draggingItemId_ = dragItem->id;
+                    draggingSelectionIds_ =
+                        SelectedItemIdsInVisibleOrder();
                     dragTargetIndex_ = iconIndex;
                     dragStartPoint_ = point;
                     const bool shortcut =
@@ -794,7 +885,18 @@ LRESULT WidgetWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) 
                     return 0;
                 }
             }
-            break;
+            const RECT gridBounds = GridBounds();
+            if (!windowConfig_.collapsed &&
+                PtInRect(&gridBounds, point) != FALSE) {
+                BeginMarqueeSelection(
+                    point,
+                    (GetKeyState(VK_CONTROL) & 0x8000) != 0);
+                SetCapture(hwnd_);
+                InvalidateRect(hwnd_, nullptr, FALSE);
+                return 0;
+            }
+            ClearSelection();
+            return 0;
         }
 
         case WM_LBUTTONUP:
@@ -817,6 +919,16 @@ LRESULT WidgetWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) 
                 FinishIconDrag(pixelPoint);
                 return 0;
             }
+            if (pointerSelectionGesture_ ==
+                    PointerSelectionGesture::MarqueePending ||
+                pointerSelectionGesture_ ==
+                    PointerSelectionGesture::MarqueeActive) {
+                CompletePointerSelection(false);
+                if (GetCapture() == hwnd_) {
+                    ReleaseCapture();
+                }
+                return 0;
+            }
             break;
 
         case WM_RBUTTONUP: {
@@ -829,6 +941,12 @@ LRESULT WidgetWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) 
             const POINT point = ClientPixelsToDips(pixelPoint);
             const int iconIndex = iconGrid_.HitTest(point);
             if (iconIndex >= 0) {
+                SetFocus(hwnd_);
+                const DesktopItem* clicked = iconGrid_.ItemAt(
+                    static_cast<size_t>(iconIndex));
+                if (clicked != nullptr && !IsItemSelected(clicked->id)) {
+                    SelectOnly(iconIndex);
+                }
                 ShowIconMenu(screenPoint, iconIndex);
                 return 0;
             }
@@ -871,6 +989,13 @@ LRESULT WidgetWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) 
             const POINT pixelPoint{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
             const POINT point = ClientPixelsToDips(pixelPoint);
             UpdateHover(point);
+            if (pointerSelectionGesture_ ==
+                    PointerSelectionGesture::MarqueePending ||
+                pointerSelectionGesture_ ==
+                    PointerSelectionGesture::MarqueeActive) {
+                UpdateMarqueeSelection(point);
+                return 0;
+            }
             if (draggingIconIndex_ >= 0 && UpdateIconDrag(pixelPoint)) {
                 return 0;
             }
@@ -917,6 +1042,10 @@ LRESULT WidgetWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) 
                 FinishIconDrag(pixelPoint);
                 return 0;
             }
+            if (pointerSelectionGesture_ !=
+                PointerSelectionGesture::None) {
+                ResetPointerSelection();
+            }
             pressedHeaderButton_ = -1;
             InvalidateRect(hwnd_, nullptr, FALSE);
             return 0;
@@ -951,6 +1080,11 @@ LRESULT WidgetWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) 
             if (wParam == kInteractionSaveTimerId) {
                 KillTimer(hwnd_, kInteractionSaveTimerId);
                 FlushPendingInteractionSave();
+                return 0;
+            }
+            if (wParam == kShellMutationCleanupTimerId) {
+                KillTimer(hwnd_, kShellMutationCleanupTimerId);
+                ReconcileShellMutationCleanup();
                 return 0;
             }
             break;
@@ -1034,6 +1168,7 @@ LRESULT WidgetWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) 
             KillTimer(hwnd_, kIconDragTimerId);
             KillTimer(hwnd_, kBackdropRefreshTimerId);
             KillTimer(hwnd_, kInteractionSaveTimerId);
+            KillTimer(hwnd_, kShellMutationCleanupTimerId);
             if (shellDropTargetRegistered_) {
                 UnregisterShellDropTarget(hwnd_);
                 shellDropTargetRegistered_ = false;
@@ -1153,6 +1288,7 @@ void WidgetWindow::RefreshCurrentItems() {
         if (changed) {
             iconGrid_.SetItems(currentItems_);
         }
+        PruneSelectionToCurrentItems();
     };
     if (categoryId_ == kUncategorizedCategoryId) {
         for (const std::wstring& itemId : appConfig.uncategorizedItemIds) {
@@ -1307,7 +1443,7 @@ bool WidgetWindow::QueueDroppedPaths(
         ? iconGrid_.HitTest(clientDipPoint)
         : -1;
     iconGrid_.SetHoverIndex(hoverIconIndex_);
-    iconGrid_.SetSelectedIndex(-1);
+    ClearSelection();
     if (!finalProjectionAlreadyPainted) {
         RedrawWindow(
             hwnd_,
@@ -1426,7 +1562,7 @@ void WidgetWindow::ApplyShellDropProjection(
     }
     hoverIconIndex_ = -1;
     iconGrid_.SetHoverIndex(-1);
-    iconGrid_.SetSelectedIndex(-1);
+    ClearSelection();
     shellDropPreviewActive_ = true;
     shellDropProjectionActive_ = true;
     shellDropProjectionPainted_ = false;
@@ -1622,6 +1758,7 @@ void WidgetWindow::FinishDesktopCollectionBatch(
     } else {
         iconGrid_.SetItems(currentItems_);
     }
+    PruneSelectionToCurrentItems();
     shellDropProjectedItems_.clear();
     shellDropCommittedItems_.clear();
     shellDropProjectionActive_ = false;
@@ -2101,6 +2238,7 @@ bool WidgetWindow::AddDroppedPaths(
             }
         }
         iconGrid_.SetItems(currentItems_);
+        PruneSelectionToCurrentItems();
         if (owner_ != nullptr && IsWindow(owner_) != FALSE) {
             PostMessageW(owner_, kOrganizerConfigSyncMessage, 0, 0);
         }
@@ -2187,6 +2325,7 @@ void WidgetWindow::ReorderItem(size_t fromIndex, size_t toIndex) {
         currentItems_.begin() + static_cast<std::ptrdiff_t>(std::min(toIndex, currentItems_.size())),
         std::move(moving));
     iconGrid_.SetItems(currentItems_);
+    SyncSelectionToGrid();
     pendingLayout_ = windowConfig_;
     pendingOrderIds_.clear();
     pendingOrderIds_.reserve(currentItems_.size());
@@ -3191,6 +3330,10 @@ void WidgetWindow::FinishIconDrag(POINT pixelPoint) {
     const std::wstring movingId = !draggingItemId_.empty()
         ? draggingItemId_
         : (movingItem == nullptr ? L"" : movingItem->id);
+    std::vector<std::wstring> movingIds = draggingSelectionIds_;
+    if (movingIds.empty() && !movingId.empty()) {
+        movingIds.push_back(movingId);
+    }
     const RECT gridBounds = GridBounds();
     const bool droppedInside = PtInRect(&gridBounds, point) != FALSE;
     POINT cursorScreenPoint = pixelPoint;
@@ -3218,26 +3361,63 @@ void WidgetWindow::FinishIconDrag(POINT pixelPoint) {
     dragVisualActive_ = false;
     dragGhostGeneration_ = 0;
     draggingItemId_.clear();
+    draggingSelectionIds_.clear();
+    if (completedDrag) {
+        ResetPointerSelection();
+    } else {
+        CompletePointerSelection(false);
+    }
     if (GetCapture() == hwnd_) {
         ReleaseCapture();
     }
     if (completedDrag) {
         if (targetWidget != nullptr &&
             targetWidget->categoryId_ != categoryId_ &&
-            !movingId.empty()) {
+            !movingIds.empty()) {
             DragGhostWindow::Instance().EndIfGeneration(dragGhostGeneration);
-            MoveItemToCategory(movingId, targetWidget->categoryId_);
-        } else if (!droppedInside && !movingId.empty()) {
-            if (!MoveItemOut(
-                    movingId,
-                    true,
-                    &dropScreenPoint,
-                    dragGhostGeneration)) {
-                DragGhostWindow::Instance().EndIfGeneration(dragGhostGeneration);
+            MoveItemsToCategory(movingIds, targetWidget->categoryId_);
+        } else if (!droppedInside && !movingIds.empty()) {
+            if (movingIds.size() > 1) {
+                DragGhostWindow::Instance().EndIfGeneration(
+                    dragGhostGeneration);
+            }
+            const RECT primaryCell = originIndex >= 0
+                ? iconGrid_.CellAt(static_cast<size_t>(originIndex))
+                : RECT{};
+            for (size_t index = 0; index < movingIds.size(); ++index) {
+                POINT itemDropPoint = dropScreenPoint;
+                const auto movingEntry = std::find_if(
+                    currentItems_.begin(),
+                    currentItems_.end(),
+                    [&](const DesktopItem& item) {
+                        return item.id == movingIds[index];
+                    });
+                if (originIndex >= 0 && movingEntry != currentItems_.end()) {
+                    const RECT itemCell = iconGrid_.CellAt(
+                        static_cast<size_t>(std::distance(
+                            currentItems_.begin(), movingEntry)));
+                    itemDropPoint.x += DipToPixels(
+                        itemCell.left - primaryCell.left);
+                    itemDropPoint.y += DipToPixels(
+                        itemCell.top - primaryCell.top);
+                }
+                const std::uint64_t itemGhostGeneration =
+                    index == 0 && movingIds.size() == 1
+                        ? dragGhostGeneration
+                        : 0;
+                if (!MoveItemOut(
+                        movingIds[index],
+                        true,
+                        &itemDropPoint,
+                        itemGhostGeneration) &&
+                    itemGhostGeneration != 0) {
+                    DragGhostWindow::Instance().EndIfGeneration(
+                        itemGhostGeneration);
+                }
             }
         } else if (originIndex >= 0 && targetIndex >= 0) {
             DragGhostWindow::Instance().EndIfGeneration(dragGhostGeneration);
-            ReorderItem(static_cast<size_t>(originIndex), static_cast<size_t>(targetIndex));
+            ReorderSelectedItems(static_cast<size_t>(targetIndex));
         } else {
             DragGhostWindow::Instance().EndIfGeneration(dragGhostGeneration);
         }
@@ -3254,6 +3434,8 @@ void WidgetWindow::CancelIconDrag() {
     dragGhostGeneration_ = 0;
     dragVisualActive_ = false;
     draggingItemId_.clear();
+    draggingSelectionIds_.clear();
+    ResetPointerSelection();
     iconGrid_.SetDraggingIndex(-1);
     draggingIconIndex_ = -1;
     dragTargetIndex_ = -1;
@@ -3275,6 +3457,381 @@ void WidgetWindow::FlushDeferredRefresh() {
     }
 }
 
+bool WidgetWindow::IsItemSelected(const std::wstring& itemId) const {
+    return std::find(
+               selectedItemIds_.begin(),
+               selectedItemIds_.end(),
+               itemId) != selectedItemIds_.end();
+}
+
+void WidgetWindow::SyncSelectionToGrid() {
+    std::vector<int> indices;
+    indices.reserve(selectedItemIds_.size());
+    for (size_t index = 0; index < currentItems_.size(); ++index) {
+        if (IsItemSelected(currentItems_[index].id)) {
+            indices.push_back(static_cast<int>(index));
+        }
+    }
+    iconGrid_.SetSelectedIndices(indices);
+}
+
+void WidgetWindow::PruneSelectionToCurrentItems() {
+    std::erase_if(
+        selectedItemIds_,
+        [&](const std::wstring& itemId) {
+            return std::none_of(
+                currentItems_.begin(),
+                currentItems_.end(),
+                [&](const DesktopItem& item) {
+                    return item.id == itemId;
+                });
+        });
+    if (selectionAnchorIndex_ < 0 ||
+        selectionAnchorIndex_ >= static_cast<int>(currentItems_.size()) ||
+        (selectionAnchorIndex_ >= 0 &&
+         !IsItemSelected(
+             currentItems_[static_cast<size_t>(selectionAnchorIndex_)].id))) {
+        selectionAnchorIndex_ = -1;
+        for (size_t index = 0; index < currentItems_.size(); ++index) {
+            if (IsItemSelected(currentItems_[index].id)) {
+                selectionAnchorIndex_ = static_cast<int>(index);
+                break;
+            }
+        }
+    }
+    SyncSelectionToGrid();
+}
+
+void WidgetWindow::ClearSelection() {
+    selectedItemIds_.clear();
+    selectionAnchorIndex_ = -1;
+    SyncSelectionToGrid();
+    if (hwnd_ != nullptr) {
+        InvalidateRect(hwnd_, nullptr, FALSE);
+    }
+}
+
+void WidgetWindow::SelectOnly(int iconIndex) {
+    if (iconIndex < 0 ||
+        iconIndex >= static_cast<int>(currentItems_.size())) {
+        ClearSelection();
+        return;
+    }
+    selectedItemIds_.assign(
+        1, currentItems_[static_cast<size_t>(iconIndex)].id);
+    selectionAnchorIndex_ = iconIndex;
+    SyncSelectionToGrid();
+    if (hwnd_ != nullptr) {
+        InvalidateRect(hwnd_, nullptr, FALSE);
+    }
+}
+
+void WidgetWindow::ToggleSelection(int iconIndex) {
+    if (iconIndex < 0 ||
+        iconIndex >= static_cast<int>(currentItems_.size())) {
+        return;
+    }
+    const std::wstring& itemId =
+        currentItems_[static_cast<size_t>(iconIndex)].id;
+    const auto selected = std::find(
+        selectedItemIds_.begin(), selectedItemIds_.end(), itemId);
+    if (selected == selectedItemIds_.end()) {
+        selectedItemIds_.push_back(itemId);
+        selectionAnchorIndex_ = iconIndex;
+    } else {
+        selectedItemIds_.erase(selected);
+        if (selectionAnchorIndex_ == iconIndex) {
+            selectionAnchorIndex_ = -1;
+        }
+    }
+    PruneSelectionToCurrentItems();
+    if (hwnd_ != nullptr) {
+        InvalidateRect(hwnd_, nullptr, FALSE);
+    }
+}
+
+void WidgetWindow::SelectAllItems() {
+    selectedItemIds_.clear();
+    selectedItemIds_.reserve(currentItems_.size());
+    for (const DesktopItem& item : currentItems_) {
+        selectedItemIds_.push_back(item.id);
+    }
+    selectionAnchorIndex_ = currentItems_.empty() ? -1 : 0;
+    SyncSelectionToGrid();
+    InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+void WidgetWindow::MoveKeyboardSelection(UINT virtualKey) {
+    if (currentItems_.empty()) {
+        return;
+    }
+    int index = selectionAnchorIndex_;
+    if (index < 0 || index >= static_cast<int>(currentItems_.size())) {
+        index = 0;
+    }
+    const RECT bounds = GridBounds();
+    const SIZE slot = iconGrid_.SlotSize();
+    const int columns = windowConfig_.contentViewMode == 1
+        ? 1
+        : (std::max)(
+            1,
+            static_cast<int>(bounds.right - bounds.left) /
+                (std::max)(1, static_cast<int>(slot.cx)));
+    if (virtualKey == VK_LEFT) {
+        --index;
+    } else if (virtualKey == VK_RIGHT) {
+        ++index;
+    } else if (virtualKey == VK_UP) {
+        index -= columns;
+    } else if (virtualKey == VK_DOWN) {
+        index += columns;
+    }
+    index = std::clamp(
+        index, 0, static_cast<int>(currentItems_.size()) - 1);
+    SelectOnly(index);
+    if (iconGrid_.EnsureItemVisible(static_cast<size_t>(index))) {
+        InvalidateRect(hwnd_, nullptr, FALSE);
+    }
+}
+
+std::vector<std::wstring>
+WidgetWindow::SelectedItemIdsInVisibleOrder() const {
+    std::vector<std::wstring> result;
+    result.reserve(selectedItemIds_.size());
+    for (const DesktopItem& item : currentItems_) {
+        if (IsItemSelected(item.id)) {
+            result.push_back(item.id);
+        }
+    }
+    return result;
+}
+
+std::vector<std::wstring>
+WidgetWindow::SelectedPathsInVisibleOrder() const {
+    std::vector<std::wstring> result;
+    result.reserve(selectedItemIds_.size());
+    for (const DesktopItem& item : currentItems_) {
+        if (IsItemSelected(item.id)) {
+            result.push_back(item.path);
+        }
+    }
+    return result;
+}
+
+std::vector<ShellItemReference>
+WidgetWindow::SelectedDesktopShellItems() const {
+    std::vector<ShellItemReference> result;
+    result.reserve(selectedItemIds_.size());
+    for (const DesktopItem& item : currentItems_) {
+        if (!IsItemSelected(item.id)) {
+            continue;
+        }
+        ShellItemReference reference;
+        if (FAILED(CreateDesktopShellItemReference(
+                item.path, reference))) {
+            return {};
+        }
+        result.push_back(std::move(reference));
+    }
+    return result;
+}
+
+void WidgetWindow::BeginItemSelection(
+    int iconIndex,
+    bool controlPressed) {
+    ResetPointerSelection();
+    if (iconIndex < 0 ||
+        iconIndex >= static_cast<int>(currentItems_.size())) {
+        return;
+    }
+    pointerSelectionGesture_ = PointerSelectionGesture::ItemPressed;
+    selectionControlPressed_ = controlPressed;
+    selectionBaselineItemIds_ = selectedItemIds_;
+    pressedItemId_ = currentItems_[static_cast<size_t>(iconIndex)].id;
+    pressedItemWasSelected_ = IsItemSelected(pressedItemId_);
+    if (controlPressed) {
+        if (!pressedItemWasSelected_) {
+            selectedItemIds_.push_back(pressedItemId_);
+        }
+    } else if (!pressedItemWasSelected_) {
+        selectedItemIds_.assign(1, pressedItemId_);
+    }
+    selectionAnchorIndex_ = iconIndex;
+    SyncSelectionToGrid();
+    InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+void WidgetWindow::BeginMarqueeSelection(
+    POINT point,
+    bool controlPressed) {
+    ResetPointerSelection();
+    pointerSelectionGesture_ = PointerSelectionGesture::MarqueePending;
+    selectionControlPressed_ = controlPressed;
+    selectionBaselineItemIds_ = selectedItemIds_;
+    selectionStartPoint_ = point;
+    selectionCurrentPoint_ = point;
+    if (!controlPressed) {
+        selectedItemIds_.clear();
+        SyncSelectionToGrid();
+    }
+}
+
+void WidgetWindow::UpdateMarqueeSelection(POINT point) {
+    if (pointerSelectionGesture_ !=
+            PointerSelectionGesture::MarqueePending &&
+        pointerSelectionGesture_ !=
+            PointerSelectionGesture::MarqueeActive) {
+        return;
+    }
+    selectionCurrentPoint_ = point;
+    if (pointerSelectionGesture_ ==
+            PointerSelectionGesture::MarqueePending &&
+        std::abs(point.x - selectionStartPoint_.x) <= 4 &&
+        std::abs(point.y - selectionStartPoint_.y) <= 4) {
+        return;
+    }
+    pointerSelectionGesture_ = PointerSelectionGesture::MarqueeActive;
+    const RECT bounds = GridBounds();
+    selectionMarqueeRect_ = RECT{
+        std::clamp(
+            (std::min)(selectionStartPoint_.x, point.x),
+            bounds.left, bounds.right),
+        std::clamp(
+            (std::min)(selectionStartPoint_.y, point.y),
+            bounds.top, bounds.bottom),
+        std::clamp(
+            (std::max)(selectionStartPoint_.x, point.x),
+            bounds.left, bounds.right),
+        std::clamp(
+            (std::max)(selectionStartPoint_.y, point.y),
+            bounds.top, bounds.bottom)};
+    selectedItemIds_ = selectionControlPressed_
+        ? selectionBaselineItemIds_
+        : std::vector<std::wstring>{};
+    for (size_t index = 0; index < currentItems_.size(); ++index) {
+        const RECT cell = iconGrid_.CellAt(index);
+        RECT intersection{};
+        if (!IntersectRect(
+                &intersection, &cell, &selectionMarqueeRect_)) {
+            continue;
+        }
+        const std::wstring& itemId = currentItems_[index].id;
+        const bool selectedAtStart = std::find(
+            selectionBaselineItemIds_.begin(),
+            selectionBaselineItemIds_.end(),
+            itemId) != selectionBaselineItemIds_.end();
+        const auto selected = std::find(
+            selectedItemIds_.begin(), selectedItemIds_.end(), itemId);
+        if (selectionControlPressed_ && selectedAtStart) {
+            if (selected != selectedItemIds_.end()) {
+                selectedItemIds_.erase(selected);
+            }
+        } else if (selected == selectedItemIds_.end()) {
+            selectedItemIds_.push_back(itemId);
+        }
+    }
+    PruneSelectionToCurrentItems();
+    InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+void WidgetWindow::CompletePointerSelection(bool dragged) {
+    if (!dragged && pointerSelectionGesture_ ==
+            PointerSelectionGesture::ItemPressed &&
+        !pressedItemId_.empty()) {
+        selectedItemIds_ = selectionBaselineItemIds_;
+        if (selectionControlPressed_) {
+            const auto selected = std::find(
+                selectedItemIds_.begin(),
+                selectedItemIds_.end(),
+                pressedItemId_);
+            if (pressedItemWasSelected_) {
+                if (selected != selectedItemIds_.end()) {
+                    selectedItemIds_.erase(selected);
+                }
+            } else if (selected == selectedItemIds_.end()) {
+                selectedItemIds_.push_back(pressedItemId_);
+            }
+        } else {
+            selectedItemIds_.assign(1, pressedItemId_);
+        }
+    }
+    ResetPointerSelection();
+    PruneSelectionToCurrentItems();
+    InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+void WidgetWindow::ResetPointerSelection() {
+    pointerSelectionGesture_ = PointerSelectionGesture::None;
+    selectionBaselineItemIds_.clear();
+    selectionStartPoint_ = {};
+    selectionCurrentPoint_ = {};
+    selectionMarqueeRect_ = {};
+    selectionControlPressed_ = false;
+    pressedItemWasSelected_ = false;
+    pressedItemId_.clear();
+}
+
+void WidgetWindow::ReorderSelectedItems(size_t targetIndex) {
+    const std::vector<std::wstring> selected =
+        SelectedItemIdsInVisibleOrder();
+    if (selected.empty() || targetIndex >= currentItems_.size()) {
+        return;
+    }
+    if (selected.size() == 1) {
+        const auto source = std::find_if(
+            currentItems_.begin(), currentItems_.end(),
+            [&](const DesktopItem& item) {
+                return item.id == selected.front();
+            });
+        if (source != currentItems_.end()) {
+            ReorderItem(
+                static_cast<size_t>(
+                    std::distance(currentItems_.begin(), source)),
+                targetIndex);
+        }
+        return;
+    }
+    const std::wstring targetId = currentItems_[targetIndex].id;
+    if (IsItemSelected(targetId)) {
+        return;
+    }
+    std::vector<DesktopItem> moving;
+    std::vector<DesktopItem> remaining;
+    moving.reserve(selected.size());
+    remaining.reserve(currentItems_.size() - selected.size());
+    for (DesktopItem& item : currentItems_) {
+        if (IsItemSelected(item.id)) {
+            moving.push_back(std::move(item));
+        } else {
+            remaining.push_back(std::move(item));
+        }
+    }
+    const auto target = std::find_if(
+        remaining.begin(), remaining.end(),
+        [&](const DesktopItem& item) { return item.id == targetId; });
+    const size_t insertionIndex = target == remaining.end()
+        ? remaining.size()
+        : static_cast<size_t>(std::distance(remaining.begin(), target));
+    remaining.insert(
+        remaining.begin() + static_cast<std::ptrdiff_t>(insertionIndex),
+        std::make_move_iterator(moving.begin()),
+        std::make_move_iterator(moving.end()));
+    currentItems_ = std::move(remaining);
+    windowConfig_.autoArrange = false;
+    windowConfig_.sortMode = 0;
+    iconGrid_.SetItems(currentItems_);
+    SyncSelectionToGrid();
+    pendingLayout_ = windowConfig_;
+    pendingOrderIds_.clear();
+    for (const DesktopItem& item : currentItems_) {
+        pendingOrderIds_.push_back(item.id);
+    }
+    pendingOrderValid_ = true;
+    interactionSavePending_ = true;
+    ScheduleInteractionSave();
+    InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
 DesktopItem* WidgetWindow::FindItem(const std::wstring& itemId) {
     for (DesktopItem& item : items_) {
         if (item.id == itemId) {
@@ -3289,81 +3846,312 @@ void WidgetWindow::ShowIconMenu(POINT screenPoint, int iconIndex) {
     if (item == nullptr) {
         return;
     }
+    if (!IsItemSelected(item->id)) {
+        SelectOnly(iconIndex);
+        item = iconGrid_.ItemAt(static_cast<size_t>(iconIndex));
+        if (item == nullptr) {
+            return;
+        }
+    }
 
-    constexpr int kOpenCommand = 11;
-    constexpr int kShowCommand = 12;
-    constexpr int kAdminCommand = 13;
-    constexpr int kRenameCommand = 14;
-    constexpr int kRefreshCommand = 15;
-    constexpr int kMoveOutCommand = 16;
-    constexpr int kMoveToUncategorizedCommand = 17;
-    constexpr int kMoveCategoryBaseCommand = 1000;
+    constexpr UINT kMoveOutCommand = 0x7000;
+    constexpr UINT kMoveToUncategorizedCommand = 0x7001;
+    constexpr UINT kRefreshCommand = 0x7002;
+    constexpr UINT kMoveCategoryBaseCommand = 0x7100;
     const AppConfig appConfig = configStore_.LoadAppConfig();
-    HMENU menu = CreatePopupMenu();
-    AppendMenuW(menu, MF_STRING, kOpenCommand, L"\u6253\u5f00");
-    AppendMenuW(menu, MF_STRING, kShowCommand, L"\u6253\u5f00\u6240\u5728\u4f4d\u7f6e");
-    AppendMenuW(menu, MF_STRING, kAdminCommand, L"\u4ee5\u7ba1\u7406\u5458\u8fd0\u884c");
-    AppendMenuW(menu, MF_STRING, kRenameCommand, L"\u91cd\u547d\u540d\u663e\u793a\u540d");
-    AppendMenuW(menu, MF_STRING, kRefreshCommand, L"\u5237\u65b0\u56fe\u6807");
-    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    HMENU moveMenu = CreatePopupMenu();
-    if (categoryId_ != kUncategorizedCategoryId) {
-        AppendMenuW(moveMenu, MF_STRING, kMoveToUncategorizedCommand, L"\u672a\u5206\u7c7b");
-    }
-    for (size_t index = 0; index < appConfig.categories.size(); ++index) {
-        if (appConfig.categories[index].id != categoryId_) {
-            AppendMenuW(
-                moveMenu,
-                MF_STRING,
-                kMoveCategoryBaseCommand + static_cast<UINT>(index),
-                appConfig.categories[index].name.c_str());
+    std::vector<std::wstring> selectedIds =
+        SelectedItemIdsInVisibleOrder();
+    std::vector<std::wstring> selectedPaths =
+        SelectedPathsInVisibleOrder();
+    std::vector<ShellItemReference> desktopItems =
+        SelectedDesktopShellItems();
+    bool useDesktopSelection =
+        !selectedIds.empty() && desktopItems.size() == selectedIds.size();
+    if (selectedIds.size() > 1 && !useDesktopSelection) {
+        // IContextMenu extensions require a common Shell parent. Do not fake a
+        // mixed-parent menu: safely collapse to the item actually right-clicked.
+        SelectOnly(iconIndex);
+        selectedIds = SelectedItemIdsInVisibleOrder();
+        selectedPaths = SelectedPathsInVisibleOrder();
+        desktopItems = SelectedDesktopShellItems();
+        useDesktopSelection = desktopItems.size() == 1;
+        item = iconGrid_.ItemAt(static_cast<size_t>(iconIndex));
+        if (item == nullptr) {
+            return;
         }
     }
-    if (GetMenuItemCount(moveMenu) == 0) {
-        AppendMenuW(moveMenu, MF_GRAYED, 0, L"\u6682\u65e0\u5176\u4ed6\u5206\u7c7b");
+    bool canRename = false;
+    if (selectedIds.size() == 1) {
+        CanRenameShellPath(item->path, canRename);
     }
-    AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(moveMenu), L"\u79fb\u52a8\u5230\u5206\u7c7b");
-    AppendMenuW(menu, MF_STRING, kMoveOutCommand, L"移出格子");
-    const int command = TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_RETURNCMD, screenPoint.x, screenPoint.y, 0, hwnd_, nullptr);
-    DestroyMenu(menu);
-
-    if (command == kOpenCommand) {
-        launcher_.OpenPath(item->path);
-    } else if (command == kShowCommand) {
-        launcher_.ShowInExplorer(item->path);
-    } else if (command == kAdminCommand) {
-        if (MessageDialog::Show(instance_,
-                hwnd_,
-                L"\u5c06\u4ee5\u7ba1\u7406\u5458\u6743\u9650\u8fd0\u884c\u8be5\u9879\u76ee\uff1f",
-                L"\u9700\u8981\u786e\u8ba4",
-                MB_YESNO | MB_ICONWARNING) == IDYES) {
-            launcher_.RunAsAdministrator(item->path);
-        }
-    } else if (command == kRenameCommand) {
-        const auto name = InputDialog::Prompt(instance_, hwnd_, L"\u91cd\u547d\u540d\u663e\u793a\u540d", L"\u663e\u793a\u540d", item->displayName);
-        if (name.has_value() && !name->empty()) {
-            AppConfig updatedConfig = configStore_.LoadAppConfig();
-            for (ItemConfig& registered : updatedConfig.items) {
-                if (registered.id == item->id) {
-                    registered.displayName = *name;
-                    break;
-                }
+    const ShellMenuAppender appendCommands =
+        [&](HMENU menu) {
+            AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+            HMENU moveMenu = CreatePopupMenu();
+            if (categoryId_ != kUncategorizedCategoryId) {
+                AppendMenuW(
+                    moveMenu,
+                    MF_STRING,
+                    kMoveToUncategorizedCommand,
+                    L"未分类");
             }
-            configStore_.SaveAppConfig(updatedConfig);
-            LoadItems();
-            InvalidateRect(hwnd_, nullptr, FALSE);
+            for (size_t index = 0;
+                 index < appConfig.categories.size(); ++index) {
+                if (appConfig.categories[index].id == categoryId_) {
+                    continue;
+                }
+                AppendMenuW(
+                    moveMenu,
+                    MF_STRING,
+                    kMoveCategoryBaseCommand +
+                        static_cast<UINT>(index),
+                    appConfig.categories[index].name.c_str());
+            }
+            if (GetMenuItemCount(moveMenu) == 0) {
+                AppendMenuW(
+                    moveMenu,
+                    MF_GRAYED,
+                    0,
+                    L"暂无其他分类");
+            }
+            AppendMenuW(
+                menu,
+                MF_POPUP,
+                reinterpret_cast<UINT_PTR>(moveMenu),
+                L"移动到分类");
+            AppendMenuW(
+                menu, MF_STRING, kMoveOutCommand, L"移出格子");
+            AppendMenuW(
+                menu, MF_STRING, kRefreshCommand, L"刷新图标");
+        };
+    UINT customCommand = 0;
+    std::wstring invokedVerb;
+    const ShellContextMenuResult menuResult = useDesktopSelection
+        ? launcher_.ShowDesktopContextMenuWithExtensions(
+            hwnd_,
+            desktopItems,
+            screenPoint,
+            canRename,
+            appendCommands,
+            customCommand,
+            invokedVerb)
+        : launcher_.ShowContextMenuWithExtensions(
+            hwnd_,
+            item->path,
+            screenPoint,
+            canRename,
+            appendCommands,
+            customCommand,
+            invokedVerb);
+    if (menuResult == ShellContextMenuResult::RenameRequested) {
+        RenameSelectedItem();
+    } else if (menuResult == ShellContextMenuResult::Invoked &&
+               (CompareStringOrdinal(
+                    invokedVerb.c_str(), -1, L"delete", -1, TRUE) ==
+                    CSTR_EQUAL ||
+                CompareStringOrdinal(
+                    invokedVerb.c_str(), -1, L"cut", -1, TRUE) ==
+                    CSTR_EQUAL)) {
+        ScheduleShellMutationCleanup(selectedIds, selectedPaths);
+    } else if (menuResult != ShellContextMenuResult::CustomCommand) {
+        return;
+    }
+
+    if (customCommand == kRefreshCommand) {
+        RefreshIconCache();
+    } else if (customCommand == kMoveOutCommand) {
+        for (const std::wstring& itemId : selectedIds) {
+            MoveItemOut(itemId);
+        }
+    } else if (customCommand == kMoveToUncategorizedCommand) {
+        MoveItemsToCategory(selectedIds, kUncategorizedCategoryId);
+    } else if (customCommand >= kMoveCategoryBaseCommand &&
+               customCommand < kMoveCategoryBaseCommand +
+                   static_cast<UINT>(appConfig.categories.size())) {
+        const size_t categoryIndex = static_cast<size_t>(
+            customCommand - kMoveCategoryBaseCommand);
+        MoveItemsToCategory(
+            selectedIds, appConfig.categories[categoryIndex].id);
+    }
+}
+
+void WidgetWindow::RenameSelectedItem() {
+    const std::vector<std::wstring> selectedIds =
+        SelectedItemIdsInVisibleOrder();
+    if (selectedIds.size() != 1) {
+        return;
+    }
+    DesktopItem* item = FindItem(selectedIds.front());
+    if (item == nullptr) {
+        return;
+    }
+    const std::wstring previousIdentity = item->path;
+    const std::wstring previousDisplayName = item->displayName;
+    bool canRename = false;
+    if (FAILED(CanRenameShellPath(previousIdentity, canRename)) ||
+        !canRename) {
+        MessageDialog::Show(
+            instance_, hwnd_,
+            L"Windows 不允许重命名这个项目。",
+            L"Lattice 重命名",
+            MB_OK | MB_ICONWARNING);
+        return;
+    }
+    const auto name = InputDialog::Prompt(
+        instance_, hwnd_, L"重命名", L"名称", previousDisplayName);
+    if (!name.has_value() || *name == previousDisplayName) {
+        return;
+    }
+    if (name->empty()) {
+        MessageDialog::Show(
+            instance_, hwnd_, L"名称不能为空。", L"Lattice 重命名",
+            MB_OK | MB_ICONWARNING);
+        return;
+    }
+    ShellPathRenameResult renamedItem;
+    const HRESULT result = RenameShellPath(
+        hwnd_, previousIdentity, *name, renamedItem);
+    if (FAILED(result) &&
+        renamedItem.disposition == ShellRenameDisposition::Unchanged) {
+        MessageDialog::Show(
+            instance_, hwnd_,
+            (L"Windows 无法完成这个重命名。请检查名称冲突、无效字符或项目权限。\n\n错误代码：" +
+             std::to_wstring(static_cast<unsigned long>(result))).c_str(),
+            L"Lattice 重命名",
+            MB_OK | MB_ICONERROR);
+        return;
+    }
+    if (renamedItem.parsingName.empty()) {
+        LoadItems();
+        MessageDialog::Show(
+            instance_, hwnd_,
+            L"Windows 已完成重命名，但 Lattice 暂时无法确认新的 Shell 身份。请刷新或重新启动 Lattice 完成协调。",
+            L"Lattice 重命名",
+            MB_OK | MB_ICONWARNING);
+        return;
+    }
+    const std::wstring displayName = renamedItem.displayName.empty()
+        ? *name
+        : renamedItem.displayName;
+    const bool accepted = configStore_.SaveShellRenameAsync(
+        previousIdentity, renamedItem.parsingName, displayName);
+    iconCache_.Alias(previousIdentity, renamedItem.parsingName);
+    LoadItems();
+    InvalidateRect(hwnd_, nullptr, FALSE);
+    if (owner_ != nullptr && IsWindow(owner_) != FALSE) {
+        PostMessageW(owner_, kOrganizerConfigChangedMessage, 0, 0);
+    }
+    if (!accepted || FAILED(result)) {
+        MessageDialog::Show(
+            instance_, hwnd_,
+            L"Windows 已完成重命名，但配置更新仍在等待后台写入。请稍后再退出 Lattice。",
+            L"Lattice 重命名",
+            MB_OK | MB_ICONWARNING);
+    }
+}
+
+bool WidgetWindow::InvokeSelectedShellVerb(
+    const std::wstring& canonicalVerb) {
+    const std::vector<std::wstring> itemIds =
+        SelectedItemIdsInVisibleOrder();
+    const std::vector<std::wstring> paths =
+        SelectedPathsInVisibleOrder();
+    if (itemIds.empty() || paths.size() != itemIds.size()) {
+        return false;
+    }
+    const std::vector<ShellItemReference> desktopItems =
+        SelectedDesktopShellItems();
+    bool invoked = desktopItems.size() == itemIds.size()
+        ? launcher_.InvokeDesktopContextMenuVerb(
+            hwnd_, desktopItems, canonicalVerb)
+        : false;
+    if (!invoked && paths.size() == 1) {
+        invoked = launcher_.InvokeContextMenuVerb(
+            hwnd_, paths.front(), canonicalVerb);
+    } else if (!invoked && canonicalVerb == L"delete") {
+        // Mixed Shell parents cannot form one IContextMenu selection. Delete
+        // each real Shell item and reconcile only the entries that disappear.
+        for (const std::wstring& path : paths) {
+            invoked = launcher_.InvokeContextMenuVerb(
+                hwnd_, path, canonicalVerb) || invoked;
+        }
+    }
+    if (invoked &&
+        (canonicalVerb == L"delete" || canonicalVerb == L"cut")) {
+        ScheduleShellMutationCleanup(itemIds, paths);
+    }
+    return invoked;
+}
+
+void WidgetWindow::ScheduleShellMutationCleanup(
+    const std::vector<std::wstring>& itemIds,
+    const std::vector<std::wstring>& paths) {
+    pendingShellCleanupItemIds_.clear();
+    pendingShellCleanupPaths_.clear();
+    for (size_t index = 0;
+         index < itemIds.size() && index < paths.size(); ++index) {
+        if (!shortcutStore_.IsManagedPath(paths[index])) {
+            continue;
+        }
+        pendingShellCleanupItemIds_.push_back(itemIds[index]);
+        pendingShellCleanupPaths_.push_back(paths[index]);
+    }
+    pendingShellCleanupAttempts_ = 0;
+    if (!pendingShellCleanupItemIds_.empty() && hwnd_ != nullptr) {
+        SetTimer(
+            hwnd_,
+            kShellMutationCleanupTimerId,
+            kShellMutationCleanupDelayMilliseconds,
+            nullptr);
+    }
+}
+
+void WidgetWindow::ReconcileShellMutationCleanup() {
+    std::vector<std::wstring> removedItemIds;
+    std::vector<std::wstring> remainingItemIds;
+    std::vector<std::wstring> remainingPaths;
+    for (size_t index = 0;
+         index < pendingShellCleanupItemIds_.size() &&
+         index < pendingShellCleanupPaths_.size(); ++index) {
+        SetLastError(ERROR_SUCCESS);
+        const DWORD attributes = GetFileAttributesW(
+            pendingShellCleanupPaths_[index].c_str());
+        const DWORD error = GetLastError();
+        if (attributes == INVALID_FILE_ATTRIBUTES &&
+            (error == ERROR_FILE_NOT_FOUND ||
+             error == ERROR_PATH_NOT_FOUND)) {
+            removedItemIds.push_back(
+                pendingShellCleanupItemIds_[index]);
+        } else {
+            remainingItemIds.push_back(
+                pendingShellCleanupItemIds_[index]);
+            remainingPaths.push_back(
+                pendingShellCleanupPaths_[index]);
+        }
+    }
+    pendingShellCleanupItemIds_ = std::move(remainingItemIds);
+    pendingShellCleanupPaths_ = std::move(remainingPaths);
+    if (!removedItemIds.empty()) {
+        configStore_.RemoveItemsAsync(removedItemIds);
+        LoadItems();
+        InvalidateRect(hwnd_, nullptr, FALSE);
+        if (owner_ != nullptr && IsWindow(owner_) != FALSE) {
             PostMessageW(owner_, kOrganizerConfigChangedMessage, 0, 0);
         }
-    } else if (command == kRefreshCommand) {
-        RefreshIconCache();
-    } else if (command == kMoveOutCommand) {
-        MoveItemOut(item->id);
-    } else if (command == kMoveToUncategorizedCommand) {
-        MoveItemToCategory(item->id, kUncategorizedCategoryId);
-    } else if (command >= kMoveCategoryBaseCommand &&
-               command < kMoveCategoryBaseCommand + static_cast<int>(appConfig.categories.size())) {
-        const size_t categoryIndex = static_cast<size_t>(command - kMoveCategoryBaseCommand);
-        MoveItemToCategory(item->id, appConfig.categories[categoryIndex].id);
+    }
+    ++pendingShellCleanupAttempts_;
+    if (!pendingShellCleanupItemIds_.empty() &&
+        pendingShellCleanupAttempts_ <
+            kMaximumShellMutationCleanupAttempts &&
+        hwnd_ != nullptr) {
+        SetTimer(
+            hwnd_,
+            kShellMutationCleanupTimerId,
+            kShellMutationCleanupDelayMilliseconds,
+            nullptr);
+    } else {
+        pendingShellCleanupItemIds_.clear();
+        pendingShellCleanupPaths_.clear();
     }
 }
 
@@ -3434,6 +4222,15 @@ void WidgetWindow::MoveItemToCategory(const std::wstring& itemId, const std::wst
     }
 }
 
+void WidgetWindow::MoveItemsToCategory(
+    const std::vector<std::wstring>& itemIds,
+    const std::wstring& targetCategoryId) {
+    const std::vector<std::wstring> stableItemIds = itemIds;
+    for (const std::wstring& itemId : stableItemIds) {
+        MoveItemToCategory(itemId, targetCategoryId);
+    }
+}
+
 WidgetWindow* WidgetWindow::DropTargetWidgetAtScreenPoint(POINT screenPoint) const {
     DWORD processId = 0;
     GetWindowThreadProcessId(hwnd_, &processId);
@@ -3487,9 +4284,24 @@ bool WidgetWindow::MoveItemOut(
     });
     bool placementCached = registeredBeforeRemoval != registeredItems_.end();
     ItemConfig placement = placementCached ? *registeredBeforeRemoval : ItemConfig{};
+    if (!placementCached) {
+        const AppConfig beforeRemoval = configStore_.LoadAppConfig();
+        const auto loadedPlacement = std::find_if(
+            beforeRemoval.items.begin(),
+            beforeRemoval.items.end(),
+            [&](const ItemConfig& value) { return value.id == itemId; });
+        if (loadedPlacement != beforeRemoval.items.end()) {
+            placement = *loadedPlacement;
+            placementCached = true;
+        }
+    }
     if (dropScreenPoint != nullptr) {
-        const std::wstring targetPath = sourcePath;
-        if (shortcutStore_.IsDesktopPath(targetPath) &&
+        const bool managedSource = shortcutStore_.IsManagedPath(sourcePath);
+        const std::wstring targetPath = managedSource
+            ? placement.originalDesktopPath
+            : sourcePath;
+        if (!targetPath.empty() &&
+            (shortcutStore_.IsDesktopPath(targetPath) || managedSource) &&
             owner_ != nullptr && IsWindow(owner_) != FALSE) {
             DesktopPlacementRequest request;
             request.path = targetPath;
@@ -3517,22 +4329,13 @@ bool WidgetWindow::MoveItemOut(
                     }),
                     currentItems_.end());
                 iconGrid_.SetItems(currentItems_);
+                PruneSelectionToCurrentItems();
                 InvalidateRect(hwnd_, nullptr, FALSE);
                 return true;
             }
         }
     }
-    if (!placementCached) {
-        const AppConfig beforeRemoval = configStore_.LoadAppConfig();
-        const auto loadedPlacement = std::find_if(
-            beforeRemoval.items.begin(),
-            beforeRemoval.items.end(),
-            [&](const ItemConfig& value) { return value.id == itemId; });
-        if (loadedPlacement != beforeRemoval.items.end()) {
-            placement = *loadedPlacement;
-        }
-    }
-    const auto removeFromConfig = [&]() {
+    const auto removeFromConfig = [&](const std::wstring&) {
         AppConfig config = configStore_.LoadAppConfig();
         config.uncategorizedItemIds.erase(
             std::remove(config.uncategorizedItemIds.begin(), config.uncategorizedItemIds.end(), itemId),
@@ -3554,10 +4357,18 @@ bool WidgetWindow::MoveItemOut(
     std::wstring desktopPath = sourcePath;
     std::wstring errorMessage;
     if (shortcutStore_.IsManagedPath(sourcePath)) {
-        errorMessage =
-            L"该项目仍处于旧版受管目录，请先完成一次性历史迁移。";
+        moved = shortcutStore_.MoveToOriginalDesktop(
+            itemId,
+            sourcePath,
+            placement.originalDesktopPath,
+            removeFromConfig,
+            desktopPath,
+            errorMessage,
+            hwnd_,
+            true,
+            true);
     } else {
-        moved = removeFromConfig();
+        moved = removeFromConfig({});
         if (!moved) {
             errorMessage =
                 L"项目原件未发生改变，但无法保存移出格子的显示归属。";
@@ -3847,6 +4658,33 @@ void WidgetWindow::Render() {
 
         if (!windowConfig_.collapsed) {
             iconGrid_.Draw(d2d_, iconCache_);
+            if (pointerSelectionGesture_ ==
+                    PointerSelectionGesture::MarqueeActive &&
+                !IsRectEmpty(&selectionMarqueeRect_)) {
+                Microsoft::WRL::ComPtr<ID2D1SolidColorBrush>
+                    marqueeFillBrush;
+                Microsoft::WRL::ComPtr<ID2D1SolidColorBrush>
+                    marqueeBorderBrush;
+                target->CreateSolidColorBrush(
+                    D2D1::ColorF(0x2D8CFF, 0.18f),
+                    marqueeFillBrush.GetAddressOf());
+                target->CreateSolidColorBrush(
+                    D2D1::ColorF(0x5AA8FF, 0.92f),
+                    marqueeBorderBrush.GetAddressOf());
+                const D2D1_RECT_F marquee = D2D1::RectF(
+                    static_cast<FLOAT>(selectionMarqueeRect_.left),
+                    static_cast<FLOAT>(selectionMarqueeRect_.top),
+                    static_cast<FLOAT>(selectionMarqueeRect_.right),
+                    static_cast<FLOAT>(selectionMarqueeRect_.bottom));
+                if (marqueeFillBrush != nullptr) {
+                    target->FillRectangle(
+                        marquee, marqueeFillBrush.Get());
+                }
+                if (marqueeBorderBrush != nullptr) {
+                    target->DrawRectangle(
+                        marquee, marqueeBorderBrush.Get(), 1.0f);
+                }
+            }
             if (shellDropPreviewActive_ &&
                 shellDropInsertionIndex_ >= 0) {
                 Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> insertionBrush;

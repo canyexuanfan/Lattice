@@ -7,6 +7,7 @@
 #include <wrl/client.h>
 
 #include <algorithm>
+#include <filesystem>
 #include <iterator>
 #include <unordered_set>
 #include <utility>
@@ -185,6 +186,26 @@ std::vector<DesktopPosition> ToDesktopPositions(
             POINT{placement.x, placement.y}});
     }
     return positions;
+}
+
+bool IsConfirmedDeletedDesktopPath(const std::wstring& path) {
+    SetLastError(ERROR_SUCCESS);
+    if (GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        return false;
+    }
+    const DWORD error = GetLastError();
+    if (error != ERROR_FILE_NOT_FOUND &&
+        error != ERROR_PATH_NOT_FOUND) {
+        return false;
+    }
+    const std::filesystem::path parent =
+        std::filesystem::path(path).parent_path();
+    if (parent.empty()) {
+        return false;
+    }
+    const DWORD parentAttributes = GetFileAttributesW(parent.c_str());
+    return parentAttributes != INVALID_FILE_ATTRIBUTES &&
+        (parentAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
 }
 
 }  // namespace
@@ -588,7 +609,7 @@ bool MainWindow::Create() {
     return hwnd_ != nullptr;
 }
 
-void MainWindow::Show(int showCommand) {
+void MainWindow::Show(int showCommand, bool enableDesktopTakeover) {
     windowConfig_.viewMode = 1;
     organizerConfig_.window.viewMode = 1;
     ShowWindow(hwnd_, SW_HIDE);
@@ -605,8 +626,9 @@ void MainWindow::Show(int showCommand) {
         }
         return;
     }
-    if (desktopSurface_ == nullptr ||
-        desktopSurface_->Window() == nullptr) {
+    if (enableDesktopTakeover &&
+        (desktopSurface_ == nullptr ||
+         desktopSurface_->Window() == nullptr)) {
         std::wstring errorMessage;
         if (!EnableDesktopDisplayTakeover(errorMessage)) {
             ShowNonBlockingNotice(
@@ -616,7 +638,9 @@ void MainWindow::Show(int showCommand) {
             return;
         }
     }
-    desktopSurface_->Show();
+    if (desktopSurface_ != nullptr) {
+        desktopSurface_->Show();
+    }
     OpenAllCategoryWidgets();
 }
 
@@ -1763,6 +1787,7 @@ LRESULT MainWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
 void MainWindow::LoadDesktopItems() {
     DesktopScanner scanner;
     items_ = scanner.Scan(organizerConfig_.settings.showPublicDesktopItems);
+    ReconcileDeletedDesktopItems();
     for (const RegisteredItem& registeredItem : organizerConfig_.items) {
         scanner.MergeRegisteredItem(
             items_,
@@ -1783,6 +1808,51 @@ void MainWindow::LoadDesktopItems() {
         }
     }
     RefreshDesktopSurfaceAssignments();
+}
+
+void MainWindow::ReconcileDeletedDesktopItems() {
+    std::vector<std::wstring> removedItemIds;
+    for (const RegisteredItem& item : organizerConfig_.items) {
+        if (item.id.empty() || item.path.empty() ||
+            !shortcutStore_.IsDesktopPath(item.path) ||
+            !IsConfirmedDeletedDesktopPath(item.path)) {
+            continue;
+        }
+        removedItemIds.push_back(item.id);
+    }
+    if (removedItemIds.empty() ||
+        !configStore_.RemoveItemsAsync(removedItemIds)) {
+        return;
+    }
+
+    const auto isRemoved = [&](const std::wstring& itemId) {
+        return std::find(
+                   removedItemIds.begin(),
+                   removedItemIds.end(),
+                   itemId) != removedItemIds.end();
+    };
+    organizerConfig_.items.erase(
+        std::remove_if(
+            organizerConfig_.items.begin(),
+            organizerConfig_.items.end(),
+            [&](const RegisteredItem& item) {
+                return isRemoved(item.id);
+            }),
+        organizerConfig_.items.end());
+    organizerConfig_.uncategorizedItemIds.erase(
+        std::remove_if(
+            organizerConfig_.uncategorizedItemIds.begin(),
+            organizerConfig_.uncategorizedItemIds.end(),
+            isRemoved),
+        organizerConfig_.uncategorizedItemIds.end());
+    for (Category& category : organizerConfig_.categories) {
+        category.itemIds.erase(
+            std::remove_if(
+                category.itemIds.begin(),
+                category.itemIds.end(),
+                isRemoved),
+            category.itemIds.end());
+    }
 }
 
 std::vector<std::wstring> MainWindow::AssignedDesktopIdentities() const {
