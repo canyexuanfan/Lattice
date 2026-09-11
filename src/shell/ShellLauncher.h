@@ -7,6 +7,13 @@
 
 #include "shell/ShellItemReference.h"
 
+enum class ShellContextMenuResult {
+    Failed,
+    Cancelled,
+    Invoked,
+    RenameRequested,
+};
+
 class ShellLauncher {
 public:
     bool OpenPath(const std::wstring& path) const;
@@ -20,6 +27,11 @@ public:
         HWND ownerWindow,
         const std::vector<ShellItemReference>& items,
         POINT screenPoint) const;
+    ShellContextMenuResult ShowDesktopContextMenu(
+        HWND ownerWindow,
+        const std::vector<ShellItemReference>& items,
+        POINT screenPoint,
+        bool allowRename) const;
     bool ForwardContextMenuMessage(
         UINT message,
         WPARAM wParam,

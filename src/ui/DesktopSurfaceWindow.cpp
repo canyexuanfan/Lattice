@@ -3,6 +3,7 @@
 #include <CommCtrl.h>
 #include <d2d1helper.h>
 #include <ShlObj.h>
+#include <Shlwapi.h>
 #include <windowsx.h>
 #include <wrl/client.h>
 
@@ -14,12 +15,18 @@
 #include <set>
 
 #include "shell/ShellDragDrop.h"
+#include "ui/MessageDialog.h"
 
 namespace {
 
 constexpr wchar_t kDesktopSurfaceClassName[] =
     L"Lattice.DesktopSurfaceWindow";
 constexpr UINT kIconReadyMessage = WM_APP + 41;
+constexpr UINT kFinishRenameMessage = WM_APP + 42;
+constexpr UINT kCancelRenameMessage = WM_APP + 43;
+constexpr UINT kBeginRenameMessage = WM_APP + 44;
+constexpr UINT_PTR kRenameTimerId = 0x52454E41;
+constexpr UINT_PTR kRenameSubclassId = 1;
 constexpr DWORD kListViewQueryTimeoutMilliseconds = 50;
 
 bool IdentitiesEqual(const std::wstring& left, const std::wstring& right) {
@@ -59,6 +66,8 @@ DesktopLabelStyle ReadDesktopLabelStyle() {
 }
 
 }  // namespace
+
+DesktopSurfaceWindow* DesktopSurfaceWindow::keyboardHookOwner_ = nullptr;
 
 class DesktopSurfaceDropTarget final : public IDropTarget {
 public:
@@ -109,6 +118,12 @@ public:
             return E_POINTER;
         }
         internalDrag_ = owner_ != nullptr && owner_->internalDragActive_;
+#ifndef NDEBUG
+        if (internalDrag_) {
+            owner_->internalDropStage_ =
+                DesktopSurfaceWindow::InternalDropStage::DragEntered;
+        }
+#endif
         HRESULT routedResult = S_OK;
         if (internalDrag_) {
             *effect = (*effect & DROPEFFECT_MOVE) != 0
@@ -194,6 +209,12 @@ public:
                 : E_FAIL;
         }
         internalDrag_ = false;
+#ifndef NDEBUG
+        if (owner_ != nullptr) {
+            owner_->internalDropStage_ =
+                DesktopSurfaceWindow::InternalDropStage::DropReceived;
+        }
+#endif
         const bool positioned = owner_ != nullptr &&
             owner_->CommitInternalDesktopDrop(screenPoint);
         *effect = positioned ? DROPEFFECT_MOVE : DROPEFFECT_NONE;
@@ -238,6 +259,35 @@ bool DesktopSurfaceWindow::Create(
     assignedIdentities_ = assignedIdentities;
     DesktopLayout layout;
     if (!layout.CaptureViewSnapshot(snapshot_, errorMessage)) {
+        return false;
+    }
+    HWND selectionViewWindow = nullptr;
+    if (!layout.AcquireFolderViewOnce(
+            explorerFolderView_.ReleaseAndGetAddressOf(),
+            explorerShellView_.ReleaseAndGetAddressOf(),
+            selectionViewWindow,
+            errorMessage) ||
+        selectionViewWindow != snapshot_.shellViewWindow) {
+        explorerFolderView_.Reset();
+        if (errorMessage.empty()) {
+            errorMessage =
+                L"Explorer桌面视图在建立显示接管时已重建。";
+        }
+        explorerShellView_.Reset();
+        return false;
+    }
+    const HRESULT selectionFolderResult =
+        explorerFolderView_->GetFolder(
+            IID_PPV_ARGS(
+                explorerDesktopFolder_.ReleaseAndGetAddressOf()));
+    if (FAILED(selectionFolderResult) ||
+        explorerDesktopFolder_ == nullptr) {
+        errorMessage =
+            L"无法连接Explorer桌面选择父文件夹，HRESULT=" +
+            std::to_wstring(
+                static_cast<long long>(selectionFolderResult)) + L"。";
+        explorerFolderView_.Reset();
+        explorerShellView_.Reset();
         return false;
     }
     InitializeListViewQueryAccess();
@@ -355,6 +405,12 @@ bool DesktopSurfaceWindow::Create(
         Close();
         return false;
     }
+    if (!InstallKeyboardHook()) {
+        errorMessage =
+            L"无法建立桌面F2键盘路由。";
+        Close();
+        return false;
+    }
     MaintainDesktopLayer();
     return true;
 }
@@ -372,6 +428,9 @@ void DesktopSurfaceWindow::Show() {
 
 void DesktopSurfaceWindow::Hide() {
     if (hwnd_ != nullptr) {
+        desktopKeyboardSelectionArmed_ = false;
+        CancelPendingRename();
+        FinishRename(false);
         CancelPointerCapture();
         ShowWindow(hwnd_, SW_HIDE);
     }
@@ -433,6 +492,11 @@ void DesktopSurfaceWindow::UpdateDisplayPositions(
 void DesktopSurfaceWindow::SetDisplayPositionCommitHandler(
     DisplayPositionCommitHandler handler) {
     displayPositionCommitHandler_ = std::move(handler);
+}
+
+void DesktopSurfaceWindow::SetRenameCommitHandler(
+    RenameCommitHandler handler) {
+    renameCommitHandler_ = std::move(handler);
 }
 
 void DesktopSurfaceWindow::PresentUnassignedItemAt(
@@ -497,6 +561,9 @@ void DesktopSurfaceWindow::ConfirmUnassignedItemAt(
 }
 
 void DesktopSurfaceWindow::Close() {
+    RemoveKeyboardHook();
+    CancelPendingRename();
+    FinishRename(false);
     CancelPointerCapture();
     iconCache_.SetInvalidateCallback(nullptr);
     if (dropTargetRegistered_ && hwnd_ != nullptr) {
@@ -508,6 +575,11 @@ void DesktopSurfaceWindow::Close() {
         DestroyWindow(hwnd_);
     }
     ReleaseListViewQueryAccess();
+    explorerDesktopFolder_.Reset();
+    explorerShellView_.Reset();
+    explorerFolderView_.Reset();
+    lastExplorerSelectionSyncResult_ = E_PENDING;
+    lastExplorerSelectionSyncStage_ = 0;
     hwnd_ = nullptr;
     visibleItems_.clear();
     visibleInteractionRects_.clear();
@@ -515,23 +587,63 @@ void DesktopSurfaceWindow::Close() {
     snapshot_ = {};
     hoverIndex_ = -1;
     selectedIdentities_.clear();
+    desktopKeyboardSelectionArmed_ = false;
     EndInternalDragSession();
     ResetPointerGesture();
 }
 
-bool DesktopSurfaceWindow::Refresh(std::wstring& errorMessage) {
+bool DesktopSurfaceWindow::Refresh(
+    std::wstring& errorMessage,
+    bool refreshWallpaper) {
     if (hwnd_ == nullptr) {
         errorMessage = L"Lattice 桌面显示接管尚未创建。";
         return false;
     }
+    if (renameEdit_ != nullptr) {
+        FinishRename(true);
+        if (renameEdit_ != nullptr) {
+            errorMessage =
+                L"当前重命名仍需用户修正，已暂缓刷新桌面项目。";
+            return false;
+        }
+    }
+    CancelPendingRename();
     CancelPointerCapture();
     DesktopViewSnapshot next;
     DesktopLayout layout;
     if (!layout.CaptureViewSnapshot(next, errorMessage)) {
         return false;
     }
+    Microsoft::WRL::ComPtr<IFolderView> nextFolderView;
+    Microsoft::WRL::ComPtr<IShellView> nextShellView;
+    HWND nextSelectionViewWindow = nullptr;
+    if (!layout.AcquireFolderViewOnce(
+            nextFolderView.GetAddressOf(),
+            nextShellView.GetAddressOf(),
+            nextSelectionViewWindow,
+            errorMessage) ||
+        nextSelectionViewWindow != next.shellViewWindow) {
+        if (errorMessage.empty()) {
+            errorMessage =
+                L"Explorer桌面视图在刷新显示接管时已重建。";
+        }
+        return false;
+    }
+    Microsoft::WRL::ComPtr<IShellFolder> nextDesktopFolder;
+    const HRESULT nextFolderResult = nextFolderView->GetFolder(
+        IID_PPV_ARGS(nextDesktopFolder.GetAddressOf()));
+    if (FAILED(nextFolderResult) || nextDesktopFolder == nullptr) {
+        errorMessage =
+            L"无法刷新Explorer桌面选择父文件夹，HRESULT=" +
+            std::to_wstring(
+                static_cast<long long>(nextFolderResult)) + L"。";
+        return false;
+    }
     ReleaseListViewQueryAccess();
     snapshot_ = std::move(next);
+    explorerFolderView_ = std::move(nextFolderView);
+    explorerShellView_ = std::move(nextShellView);
+    explorerDesktopFolder_ = std::move(nextDesktopFolder);
     InitializeListViewQueryAccess();
     UpdateViewMetrics();
     for (PositionOverride& value : positionOverrides_) {
@@ -582,7 +694,7 @@ bool DesktopSurfaceWindow::Refresh(std::wstring& errorMessage) {
         parentOrigin.y, width, height,
         SWP_NOZORDER | SWP_NOACTIVATE);
     d2d_.Resize(static_cast<UINT>(width), static_cast<UINT>(height));
-    if (!wallpaper_.Refresh(
+    if (refreshWallpaper && !wallpaper_.Refresh(
             hwnd_, d2d_.Target(), width, height, false)) {
         errorMessage =
             L"无法刷新与当前桌面一致的无模糊壁纸快照。";
@@ -625,6 +737,37 @@ LRESULT CALLBACK DesktopSurfaceWindow::WindowProc(
         : window->HandleMessage(message, wParam, lParam);
 }
 
+LRESULT CALLBACK DesktopSurfaceWindow::RenameEditProc(
+    HWND hwnd,
+    UINT message,
+    WPARAM wParam,
+    LPARAM lParam,
+    UINT_PTR subclassId,
+    DWORD_PTR referenceData) {
+    auto* window = reinterpret_cast<DesktopSurfaceWindow*>(referenceData);
+    if (message == WM_GETDLGCODE) {
+        return DLGC_WANTALLKEYS;
+    }
+    if (message == WM_KEYDOWN && window != nullptr) {
+        if (wParam == VK_RETURN) {
+            PostMessageW(window->Window(), kFinishRenameMessage, 0, 0);
+            return 0;
+        }
+        if (wParam == VK_ESCAPE) {
+            PostMessageW(window->Window(), kCancelRenameMessage, 0, 0);
+            return 0;
+        }
+    }
+    if (message == WM_KILLFOCUS && window != nullptr &&
+        !window->renameFinalizing_) {
+        PostMessageW(window->Window(), kFinishRenameMessage, 0, 0);
+    }
+    if (message == WM_NCDESTROY) {
+        RemoveWindowSubclass(hwnd, RenameEditProc, subclassId);
+    }
+    return DefSubclassProc(hwnd, message, wParam, lParam);
+}
+
 LRESULT DesktopSurfaceWindow::HandleMessage(
     UINT message,
     WPARAM wParam,
@@ -648,6 +791,42 @@ LRESULT DesktopSurfaceWindow::HandleMessage(
         case kIconReadyMessage:
             InvalidateRect(hwnd_, nullptr, FALSE);
             return 0;
+        case kFinishRenameMessage:
+            FinishRename(true);
+            return 0;
+        case kCancelRenameMessage:
+            FinishRename(false);
+            return 0;
+        case kBeginRenameMessage:
+            if (renameEdit_ == nullptr &&
+                desktopKeyboardSelectionArmed_ &&
+                selectedIdentities_.size() == 1) {
+                BeginRename(*selectedIdentities_.begin());
+            }
+            return 0;
+        case WM_TIMER:
+            if (wParam == kRenameTimerId) {
+                KillTimer(hwnd_, kRenameTimerId);
+                const std::wstring identity =
+                    pendingRenameIdentity_;
+                renameClickCandidate_ = false;
+                pendingRenameIdentity_.clear();
+                if (!identity.empty() &&
+                    selectedIdentities_.size() == 1 &&
+                    IsSelected(identity)) {
+                    BeginRename(identity);
+                }
+                return 0;
+            }
+            break;
+        case WM_KEYDOWN:
+            if (wParam == VK_F2 &&
+                renameEdit_ == nullptr &&
+                selectedIdentities_.size() == 1) {
+                BeginRename(*selectedIdentities_.begin());
+                return 0;
+            }
+            break;
         case WM_MOUSEMOVE: {
             const POINT current{
                 GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
@@ -663,6 +842,7 @@ LRESULT DesktopSurfaceWindow::HandleMessage(
                 hoverIndex_ = -1;
                 InvalidateRect(hwnd_, nullptr, FALSE);
                 if (!dragPaths.empty()) {
+                    CancelPendingRename();
                     const std::vector<ShellItemReference>
                         dragItems =
                             SelectedShellItemsInVisibleOrder();
@@ -707,12 +887,35 @@ LRESULT DesktopSurfaceWindow::HandleMessage(
             InvalidateRect(hwnd_, nullptr, FALSE);
             return 0;
         case WM_LBUTTONDOWN: {
+            if (renameEdit_ != nullptr) {
+                FinishRename(true);
+                if (renameEdit_ != nullptr) {
+                    return 0;
+                }
+            }
+            CancelPendingRename();
             const POINT clientPoint{
                 GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
             const bool controlPressed =
                 (wParam & MK_CONTROL) != 0 ||
                 (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+            const int index = HitTest(clientPoint);
+            if (index >= 0 && !controlPressed) {
+                const DesktopViewItem& item =
+                    visibleItems_[static_cast<size_t>(index)];
+                const RECT label = LabelRect(item);
+                renameClickCandidate_ =
+                    selectedIdentities_.size() == 1 &&
+                    IsSelected(item.path) &&
+                    PtInRect(&label, clientPoint) != FALSE;
+                if (renameClickCandidate_) {
+                    pendingRenameIdentity_ = item.path;
+                }
+            }
             BeginPointerGesture(clientPoint, controlPressed);
+            SynchronizeExplorerSelection();
+            desktopKeyboardSelectionArmed_ =
+                !selectedIdentities_.empty();
             hoverIndex_ = -1;
             if (pointerGesture_ != PointerGesture::None) {
                 SetCapture(hwnd_);
@@ -723,27 +926,52 @@ LRESULT DesktopSurfaceWindow::HandleMessage(
             InvalidateRect(hwnd_, nullptr, FALSE);
             return 0;
         }
-        case WM_LBUTTONUP:
+        case WM_LBUTTONUP: {
+            const bool scheduleRename =
+                renameClickCandidate_ &&
+                pointerGesture_ == PointerGesture::ItemPressed &&
+                !pendingRenameIdentity_.empty();
             CompletePointerGesture();
+            SynchronizeExplorerSelection();
             if (GetCapture() == hwnd_) {
                 ReleaseCapture();
             }
+            if (scheduleRename &&
+                selectedIdentities_.size() == 1 &&
+                IsSelected(pendingRenameIdentity_)) {
+                if (SetTimer(
+                        hwnd_,
+                        kRenameTimerId,
+                        GetDoubleClickTime(),
+                        nullptr) == 0) {
+                    CancelPendingRename();
+                }
+            } else {
+                CancelPendingRename();
+            }
             InvalidateRect(hwnd_, nullptr, FALSE);
             return 0;
+        }
         case WM_CAPTURECHANGED:
             ResetPointerGesture();
+            SynchronizeExplorerSelection();
             InvalidateRect(hwnd_, nullptr, FALSE);
             return 0;
         case WM_CANCELMODE:
+            CancelPendingRename();
             CancelPointerCapture();
+            SynchronizeExplorerSelection();
             InvalidateRect(hwnd_, nullptr, FALSE);
             return 0;
         case WM_LBUTTONDBLCLK: {
+            CancelPendingRename();
+            desktopKeyboardSelectionArmed_ = false;
             const int index = HitTest(
                 POINT{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)});
             if (index >= 0) {
                 SelectOnly(
                     visibleItems_[static_cast<size_t>(index)].path);
+                SynchronizeExplorerSelection();
                 CancelPointerCapture();
                 InvalidateRect(hwnd_, nullptr, FALSE);
                 launcher_.OpenPath(
@@ -752,6 +980,13 @@ LRESULT DesktopSurfaceWindow::HandleMessage(
             return 0;
         }
         case WM_CONTEXTMENU: {
+            CancelPendingRename();
+            if (renameEdit_ != nullptr) {
+                FinishRename(true);
+                if (renameEdit_ != nullptr) {
+                    return 0;
+                }
+            }
             CancelPointerCapture();
             POINT screenPoint{
                 GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
@@ -767,16 +1002,32 @@ LRESULT DesktopSurfaceWindow::HandleMessage(
                 if (!IsSelected(identity)) {
                     SelectOnly(identity);
                 }
+                SynchronizeExplorerSelection();
+                desktopKeyboardSelectionArmed_ = true;
                 const std::vector<ShellItemReference>
                     selectedItems =
                         SelectedShellItemsInVisibleOrder();
+                bool canRename = false;
+                if (selectedItems.size() == 1) {
+                    CanRenameDesktopShellItem(
+                        selectedItems.front(), canRename);
+                }
                 InvalidateRect(hwnd_, nullptr, FALSE);
-                launcher_.ShowContextMenu(
+                const ShellContextMenuResult menuResult =
+                    launcher_.ShowDesktopContextMenu(
                     hwnd_,
                     selectedItems,
-                    screenPoint);
+                    screenPoint,
+                    canRename);
+                if (menuResult ==
+                        ShellContextMenuResult::RenameRequested &&
+                    selectedItems.size() == 1) {
+                    BeginRename(selectedItems.front().path);
+                }
             } else {
+                desktopKeyboardSelectionArmed_ = false;
                 selectedIdentities_.clear();
+                SynchronizeExplorerSelection();
                 InvalidateRect(hwnd_, nullptr, FALSE);
                 if (snapshot_.listViewWindow != nullptr &&
                     IsWindow(snapshot_.listViewWindow) != FALSE) {
@@ -797,6 +1048,20 @@ LRESULT DesktopSurfaceWindow::HandleMessage(
             return 0;
         }
         case WM_DESTROY:
+            RemoveKeyboardHook();
+            CancelPendingRename();
+            if (renameEdit_ != nullptr) {
+                RemoveWindowSubclass(
+                    renameEdit_, RenameEditProc,
+                    kRenameSubclassId);
+                renameEdit_ = nullptr;
+            }
+            if (renameFont_ != nullptr) {
+                DeleteObject(renameFont_);
+                renameFont_ = nullptr;
+            }
+            renameIdentity_.clear();
+            renameOriginalDisplayName_.clear();
             iconCache_.SetInvalidateCallback(nullptr);
             if (dropTargetRegistered_) {
                 RevokeDragDrop(hwnd_);
@@ -944,6 +1209,10 @@ void DesktopSurfaceWindow::Render() {
             shadowBrush == nullptr) {
             continue;
         }
+        if (renameEdit_ != nullptr &&
+            IdentitiesEqual(item.path, renameIdentity_)) {
+            continue;
+        }
         const D2D1_RECT_F labelRect = D2D1::RectF(
             static_cast<FLOAT>(cell.left + 4),
             iconRect.bottom + 9.0f,
@@ -1045,6 +1314,16 @@ RECT DesktopSurfaceWindow::CellRect(
         left, top, left + cellWidth_, top + cellHeight_};
 }
 
+RECT DesktopSurfaceWindow::LabelRect(
+    const DesktopViewItem& item) const {
+    const RECT cell = CellRect(item);
+    return RECT{
+        cell.left + 4,
+        cell.top + iconSize_ + 9,
+        cell.right - 4,
+        cell.bottom};
+}
+
 RECT DesktopSurfaceWindow::FallbackInteractionRect(
     const DesktopViewItem& item) const {
     const RECT cell = CellRect(item);
@@ -1055,11 +1334,7 @@ RECT DesktopSurfaceWindow::FallbackInteractionRect(
         cell.top,
         iconLeft + iconSize_,
         cell.top + iconSize_};
-    const RECT label{
-        cell.left + 4,
-        cell.top + iconSize_ + 9,
-        cell.right - 4,
-        cell.bottom};
+    const RECT label = LabelRect(item);
     if (!IsRectEmpty(&label)) {
         UnionRect(&result, &result, &label);
     }
@@ -1454,6 +1729,152 @@ void DesktopSurfaceWindow::SelectOnly(
     AddSelected(identity);
 }
 
+bool DesktopSurfaceWindow::ResolveExplorerViewItem(
+    const DesktopViewItem& item,
+    PIDLIST_RELATIVE& currentPidl) const {
+    currentPidl = nullptr;
+    if (explorerFolderView_ == nullptr ||
+        explorerDesktopFolder_ == nullptr || item.viewIndex < 0) {
+        return false;
+    }
+    const HRESULT result = explorerFolderView_->Item(
+        item.viewIndex, &currentPidl);
+    STRRET parsingName{};
+    HRESULT identityResult = result;
+    if (SUCCEEDED(identityResult) && currentPidl != nullptr) {
+        identityResult = explorerDesktopFolder_->GetDisplayNameOf(
+            currentPidl, SHGDN_FORPARSING, &parsingName);
+    }
+    wchar_t buffer[32768]{};
+    if (SUCCEEDED(identityResult)) {
+        identityResult = StrRetToBufW(
+            &parsingName, currentPidl, buffer, ARRAYSIZE(buffer));
+    }
+    const bool matches = SUCCEEDED(identityResult) &&
+        CompareStringOrdinal(
+            buffer, -1, item.path.c_str(), -1, TRUE) == CSTR_EQUAL;
+    if (!matches) {
+        CoTaskMemFree(currentPidl);
+        currentPidl = nullptr;
+    }
+    return matches;
+}
+
+bool DesktopSurfaceWindow::ActivateExplorerDesktopView() const noexcept {
+    const HWND listView = snapshot_.listViewWindow;
+    if (listView == nullptr || IsWindow(listView) == FALSE) {
+        return false;
+    }
+
+    DWORD explorerProcessId = 0;
+    const DWORD explorerThreadId = GetWindowThreadProcessId(
+        listView, &explorerProcessId);
+    const DWORD currentThreadId = GetCurrentThreadId();
+    if (explorerThreadId == 0 || explorerProcessId == 0 ||
+        currentThreadId == 0) {
+        return false;
+    }
+
+    const bool needsAttachment = explorerThreadId != currentThreadId;
+    if (needsAttachment &&
+        AttachThreadInput(currentThreadId, explorerThreadId, TRUE) == FALSE) {
+        return false;
+    }
+
+    HWND desktopRoot = GetAncestor(listView, GA_ROOT);
+    if (desktopRoot == nullptr || IsWindow(desktopRoot) == FALSE) {
+        desktopRoot = snapshot_.desktopHost;
+    }
+    if (desktopRoot != nullptr && IsWindow(desktopRoot) != FALSE) {
+        SetForegroundWindow(desktopRoot);
+        SetActiveWindow(desktopRoot);
+    }
+    SetFocus(listView);
+
+    GUITHREADINFO information{};
+    information.cbSize = sizeof(information);
+    const bool focused =
+        GetGUIThreadInfo(explorerThreadId, &information) != FALSE &&
+        information.hwndFocus == listView;
+
+    if (needsAttachment) {
+        AttachThreadInput(currentThreadId, explorerThreadId, FALSE);
+    }
+    return focused;
+}
+
+bool DesktopSurfaceWindow::SynchronizeExplorerSelection() {
+    lastExplorerSelectionSyncStage_ = 1;
+    lastExplorerSelectionSyncResult_ = E_NOINTERFACE;
+    if (explorerFolderView_ == nullptr || explorerShellView_ == nullptr ||
+        explorerDesktopFolder_ == nullptr) {
+        return false;
+    }
+    std::vector<const DesktopViewItem*> selectedItems;
+    std::vector<PIDLIST_RELATIVE> currentPidls;
+    selectedItems.reserve(selectedIdentities_.size());
+    currentPidls.reserve(selectedIdentities_.size());
+    const auto releaseCurrentPidls = [&]() {
+        for (PIDLIST_RELATIVE pidl : currentPidls) {
+            CoTaskMemFree(pidl);
+        }
+        currentPidls.clear();
+    };
+    for (const DesktopViewItem& item : visibleItems_) {
+        if (!IsSelected(item.path)) {
+            continue;
+        }
+        PIDLIST_RELATIVE currentPidl = nullptr;
+        if (!ResolveExplorerViewItem(item, currentPidl)) {
+            lastExplorerSelectionSyncStage_ = 2;
+            lastExplorerSelectionSyncResult_ =
+                HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
+            releaseCurrentPidls();
+            return false;
+        }
+        selectedItems.push_back(&item);
+        currentPidls.push_back(currentPidl);
+    }
+    if (selectedItems.size() != selectedIdentities_.size()) {
+        lastExplorerSelectionSyncStage_ = 2;
+        lastExplorerSelectionSyncResult_ =
+            HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
+        releaseCurrentPidls();
+        return false;
+    }
+
+    lastExplorerSelectionSyncStage_ = 3;
+    if (!ActivateExplorerDesktopView()) {
+        lastExplorerSelectionSyncResult_ =
+            HRESULT_FROM_WIN32(ERROR_INVALID_STATE);
+        releaseCurrentPidls();
+        return false;
+    }
+
+    lastExplorerSelectionSyncStage_ = 4;
+    HRESULT result = explorerShellView_->SelectItem(
+        nullptr,
+        SVSI_DESELECTOTHERS);
+    lastExplorerSelectionSyncResult_ = result;
+    for (size_t index = 0;
+         SUCCEEDED(result) && index < selectedItems.size(); ++index) {
+        lastExplorerSelectionSyncStage_ = 5;
+        DWORD flags = SVSI_SELECT;
+        if (index == 0) {
+            flags |= SVSI_FOCUSED | SVSI_SELECTIONMARK;
+        }
+        result = explorerShellView_->SelectItem(
+            currentPidls[index], flags);
+        lastExplorerSelectionSyncResult_ = result;
+    }
+    if (SUCCEEDED(result)) {
+        lastExplorerSelectionSyncStage_ = 6;
+        lastExplorerSelectionSyncResult_ = S_OK;
+    }
+    releaseCurrentPidls();
+    return SUCCEEDED(result);
+}
+
 void DesktopSurfaceWindow::PruneSelectionToVisibleItems() {
     const auto isVisible = [&](const std::wstring& identity) {
         return std::any_of(
@@ -1602,6 +2023,552 @@ void DesktopSurfaceWindow::CancelPointerCapture() noexcept {
     }
 }
 
+void DesktopSurfaceWindow::CancelPendingRename() noexcept {
+    if (hwnd_ != nullptr) {
+        KillTimer(hwnd_, kRenameTimerId);
+    }
+    renameClickCandidate_ = false;
+    pendingRenameIdentity_.clear();
+}
+
+LRESULT CALLBACK DesktopSurfaceWindow::KeyboardHookProc(
+    int code,
+    WPARAM wParam,
+    LPARAM lParam) {
+    DesktopSurfaceWindow* owner = keyboardHookOwner_;
+    if (code == HC_ACTION && owner != nullptr && lParam != 0) {
+        const auto* key = reinterpret_cast<const KBDLLHOOKSTRUCT*>(lParam);
+        if (key->vkCode == VK_F2) {
+            const bool keyDown =
+                wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN;
+            const bool keyUp =
+                wParam == WM_KEYUP || wParam == WM_SYSKEYUP;
+            if (keyDown &&
+                (owner->swallowF2Key_ || owner->ShouldRouteDesktopF2())) {
+                if (!owner->swallowF2Key_) {
+                    owner->swallowF2Key_ = PostMessageW(
+                        owner->hwnd_, kBeginRenameMessage, 0, 0) != FALSE;
+                }
+                if (owner->swallowF2Key_) {
+                    return 1;
+                }
+            }
+            if (keyUp && owner->swallowF2Key_) {
+                owner->swallowF2Key_ = false;
+                return 1;
+            }
+        }
+    }
+    return CallNextHookEx(
+        owner != nullptr ? owner->keyboardHook_ : nullptr,
+        code,
+        wParam,
+        lParam);
+}
+
+bool DesktopSurfaceWindow::InstallKeyboardHook() noexcept {
+    if (keyboardHook_ != nullptr) {
+        return true;
+    }
+    if (keyboardHookOwner_ != nullptr && keyboardHookOwner_ != this) {
+        return false;
+    }
+    keyboardHookOwner_ = this;
+    keyboardHook_ = SetWindowsHookExW(
+        WH_KEYBOARD_LL,
+        KeyboardHookProc,
+        instance_,
+        0);
+    if (keyboardHook_ == nullptr) {
+        keyboardHookOwner_ = nullptr;
+        return false;
+    }
+    return true;
+}
+
+void DesktopSurfaceWindow::RemoveKeyboardHook() noexcept {
+    swallowF2Key_ = false;
+    if (keyboardHook_ != nullptr) {
+        UnhookWindowsHookEx(keyboardHook_);
+        keyboardHook_ = nullptr;
+    }
+    if (keyboardHookOwner_ == this) {
+        keyboardHookOwner_ = nullptr;
+    }
+}
+
+bool DesktopSurfaceWindow::ShouldRouteDesktopF2() const noexcept {
+    if (hwnd_ == nullptr || IsWindowVisible(hwnd_) == FALSE ||
+        renameEdit_ != nullptr || !desktopKeyboardSelectionArmed_ ||
+        selectedIdentities_.size() != 1 ||
+        snapshot_.listViewWindow == nullptr ||
+        IsWindow(snapshot_.listViewWindow) == FALSE) {
+        return false;
+    }
+    const auto isDesktopContextWindow = [&](HWND window) {
+        if (window == nullptr) {
+            return false;
+        }
+        if (window == hwnd_ || window == snapshot_.desktopHost ||
+            window == snapshot_.shellViewWindow ||
+            window == snapshot_.listViewWindow) {
+            return true;
+        }
+        DWORD desktopProcessId = 0;
+        GetWindowThreadProcessId(
+            snapshot_.listViewWindow, &desktopProcessId);
+        const HWND root = GetAncestor(window, GA_ROOT);
+        DWORD rootProcessId = 0;
+        if (root == nullptr || desktopProcessId == 0 ||
+            GetWindowThreadProcessId(root, &rootProcessId) == 0 ||
+            rootProcessId != desktopProcessId) {
+            return false;
+        }
+        wchar_t className[64]{};
+        return GetClassNameW(
+                   root, className, ARRAYSIZE(className)) != 0 &&
+            (wcscmp(className, L"Progman") == 0 ||
+             wcscmp(className, L"WorkerW") == 0 ||
+             wcscmp(className, L"Shell_TrayWnd") == 0);
+    };
+    if (!isDesktopContextWindow(GetForegroundWindow())) {
+        return false;
+    }
+    GUITHREADINFO information{};
+    information.cbSize = sizeof(information);
+    return GetGUIThreadInfo(0, &information) != FALSE &&
+        (information.hwndActive == nullptr ||
+         isDesktopContextWindow(information.hwndActive)) &&
+        (information.hwndFocus == nullptr ||
+         isDesktopContextWindow(information.hwndFocus));
+}
+
+bool DesktopSurfaceWindow::BeginRename(
+    const std::wstring& identity) {
+    CancelPendingRename();
+    if (hwnd_ == nullptr || identity.empty()) {
+        return false;
+    }
+    if (renameEdit_ != nullptr) {
+        if (IdentitiesEqual(renameIdentity_, identity)) {
+            return FocusKeyboardWindow(renameEdit_);
+        }
+        FinishRename(false);
+    }
+    const auto item = std::find_if(
+        visibleItems_.begin(), visibleItems_.end(),
+        [&](const DesktopViewItem& value) {
+            return IdentitiesEqual(value.path, identity);
+        });
+    if (item == visibleItems_.end()) {
+        return false;
+    }
+    const ShellItemReference reference{
+        item->path, item->shellChildPidl};
+    bool canRename = false;
+    if (FAILED(CanRenameDesktopShellItem(
+            reference, canRename)) || !canRename) {
+        return false;
+    }
+
+    RECT label = LabelRect(*item);
+    const int center = (label.left + label.right) / 2;
+    const LONG width = (std::max<LONG>)(
+        96, label.right - label.left + 24);
+    label.left = center - width / 2;
+    label.right = label.left + width;
+    const RECT bounds = ClientBounds();
+    if (label.left < bounds.left) {
+        OffsetRect(&label, bounds.left - label.left, 0);
+    }
+    if (label.right > bounds.right) {
+        OffsetRect(&label, bounds.right - label.right, 0);
+    }
+    label.bottom = (std::min<LONG>)(
+        bounds.bottom,
+        label.top + (std::max<LONG>)(
+            24, label.bottom - label.top));
+    if (label.right <= label.left || label.bottom <= label.top) {
+        return false;
+    }
+
+    POINT editOrigin{label.left, label.top};
+    if (ClientToScreen(hwnd_, &editOrigin) == FALSE) {
+        return false;
+    }
+
+    renameEdit_ = CreateWindowExW(
+        WS_EX_TOOLWINDOW | WS_EX_CLIENTEDGE,
+        L"EDIT",
+        item->displayName.c_str(),
+        WS_POPUP | WS_VISIBLE | WS_TABSTOP |
+            ES_CENTER | ES_AUTOHSCROLL,
+        editOrigin.x,
+        editOrigin.y,
+        label.right - label.left,
+        label.bottom - label.top,
+        hwnd_,
+        nullptr,
+        instance_,
+        nullptr);
+    if (renameEdit_ == nullptr) {
+        return false;
+    }
+    if (!SetWindowSubclass(
+            renameEdit_,
+            RenameEditProc,
+            kRenameSubclassId,
+            reinterpret_cast<DWORD_PTR>(this))) {
+        DestroyWindow(renameEdit_);
+        renameEdit_ = nullptr;
+        return false;
+    }
+    LOGFONTW iconFont{};
+    if (SystemParametersInfoW(
+            SPI_GETICONTITLELOGFONT,
+            sizeof(iconFont),
+            &iconFont,
+            0) != FALSE) {
+        renameFont_ = CreateFontIndirectW(&iconFont);
+    }
+    SendMessageW(
+        renameEdit_,
+        WM_SETFONT,
+        reinterpret_cast<WPARAM>(
+            renameFont_ != nullptr
+                ? renameFont_
+                : GetStockObject(DEFAULT_GUI_FONT)),
+        TRUE);
+    SendMessageW(renameEdit_, EM_SETLIMITTEXT, 255, 0);
+    renameIdentity_ = item->path;
+    renameOriginalDisplayName_ = item->displayName;
+    SelectOnly(item->path);
+
+    int selectionEnd = static_cast<int>(item->displayName.size());
+    const DWORD attributes = GetFileAttributesW(item->path.c_str());
+    if (attributes != INVALID_FILE_ATTRIBUTES &&
+        (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0) {
+        const size_t separator = item->path.find_last_of(L"\\/");
+        const size_t extensionStart = item->path.find_last_of(L'.');
+        if (extensionStart != std::wstring::npos &&
+            (separator == std::wstring::npos ||
+             extensionStart > separator)) {
+            const std::wstring extension =
+                item->path.substr(extensionStart);
+            if (item->displayName.size() > extension.size() &&
+                CompareStringOrdinal(
+                    item->displayName.c_str() +
+                        item->displayName.size() - extension.size(),
+                    static_cast<int>(extension.size()),
+                    extension.c_str(),
+                    static_cast<int>(extension.size()),
+                    TRUE) == CSTR_EQUAL) {
+                selectionEnd = static_cast<int>(
+                    item->displayName.size() - extension.size());
+            }
+        }
+    }
+    SendMessageW(renameEdit_, EM_SETSEL, 0, selectionEnd);
+    if (!FocusKeyboardWindow(renameEdit_)) {
+        RemoveWindowSubclass(
+            renameEdit_, RenameEditProc, kRenameSubclassId);
+        DestroyWindow(renameEdit_);
+        renameEdit_ = nullptr;
+        if (renameFont_ != nullptr) {
+            DeleteObject(renameFont_);
+            renameFont_ = nullptr;
+        }
+        renameIdentity_.clear();
+        renameOriginalDisplayName_.clear();
+        InvalidateRect(hwnd_, nullptr, FALSE);
+        return false;
+    }
+    InvalidateRect(hwnd_, nullptr, FALSE);
+    return true;
+}
+
+void DesktopSurfaceWindow::FinishRename(bool commit) {
+    if (renameEdit_ == nullptr || renameFinalizing_) {
+        return;
+    }
+    renameFinalizing_ = true;
+    const int length = GetWindowTextLengthW(renameEdit_);
+    std::wstring newDisplayName(
+        static_cast<size_t>((std::max)(0, length)) + 1,
+        L'\0');
+    if (length > 0) {
+        GetWindowTextW(
+            renameEdit_, newDisplayName.data(), length + 1);
+        newDisplayName.resize(static_cast<size_t>(length));
+    } else {
+        newDisplayName.clear();
+    }
+    const std::wstring previousIdentity = renameIdentity_;
+    const std::wstring previousDisplayName =
+        renameOriginalDisplayName_;
+    HWND edit = renameEdit_;
+    renameEdit_ = nullptr;
+    RemoveWindowSubclass(
+        edit, RenameEditProc, kRenameSubclassId);
+    DestroyWindow(edit);
+    if (renameFont_ != nullptr) {
+        DeleteObject(renameFont_);
+        renameFont_ = nullptr;
+    }
+    renameIdentity_.clear();
+    renameOriginalDisplayName_.clear();
+    renameFinalizing_ = false;
+    InvalidateRect(hwnd_, nullptr, FALSE);
+    if (!commit ||
+        newDisplayName == previousDisplayName) {
+        return;
+    }
+    if (newDisplayName.empty()) {
+        MessageDialog::Show(
+            instance_, hwnd_,
+            L"名称不能为空。",
+            L"Lattice 重命名",
+            MB_OK | MB_ICONWARNING);
+        BeginRename(previousIdentity);
+        return;
+    }
+
+    const auto item = std::find_if(
+        snapshot_.items.begin(), snapshot_.items.end(),
+        [&](const DesktopViewItem& value) {
+            return IdentitiesEqual(
+                value.path, previousIdentity);
+        });
+    if (item == snapshot_.items.end()) {
+        return;
+    }
+    const ShellItemReference reference{
+        item->path, item->shellChildPidl};
+    std::vector<std::wstring> otherIdentities;
+    otherIdentities.reserve(snapshot_.items.size());
+    for (const DesktopViewItem& candidate : snapshot_.items) {
+        if (!IdentitiesEqual(
+                candidate.path, previousIdentity)) {
+            otherIdentities.push_back(candidate.path);
+        }
+    }
+    DesktopShellRenameResult renamedItem;
+    const HRESULT result = RenameDesktopShellItem(
+        hwnd_, reference, newDisplayName, renamedItem);
+    if (FAILED(result) &&
+        renamedItem.disposition ==
+            ShellRenameDisposition::Unchanged) {
+        MessageDialog::Show(
+            instance_, hwnd_,
+            L"Windows 无法完成这个重命名。请检查名称是否冲突、是否包含无效字符，或该项目是否允许重命名。\n\n错误代码：" +
+                std::to_wstring(static_cast<unsigned long>(result)),
+            L"Lattice 重命名",
+            MB_OK | MB_ICONERROR);
+        if (BeginRename(previousIdentity) &&
+            renameEdit_ != nullptr) {
+            SetWindowTextW(renameEdit_, newDisplayName.c_str());
+            SendMessageW(renameEdit_, EM_SETSEL, 0, -1);
+        }
+        return;
+    }
+
+    if (renamedItem.item.path.empty() ||
+        renamedItem.item.desktopChildPidl.empty()) {
+        std::wstring refreshError;
+        if (Refresh(refreshError)) {
+            const auto isPreviousItem =
+                [&](const DesktopViewItem& candidate) {
+                    return std::none_of(
+                        otherIdentities.begin(),
+                        otherIdentities.end(),
+                        [&](const std::wstring& identity) {
+                            return IdentitiesEqual(
+                                candidate.path, identity);
+                        });
+                };
+            const DesktopViewItem* exactMatch = nullptr;
+            size_t exactMatchCount = 0;
+            size_t newIdentityCount = 0;
+            for (const DesktopViewItem& candidate : snapshot_.items) {
+                if (!isPreviousItem(candidate)) {
+                    continue;
+                }
+                ++newIdentityCount;
+                if (CompareStringOrdinal(
+                        candidate.displayName.c_str(), -1,
+                        newDisplayName.c_str(), -1,
+                        TRUE) == CSTR_EQUAL) {
+                    exactMatch = &candidate;
+                    ++exactMatchCount;
+                }
+            }
+            const DesktopViewItem* reconciled =
+                exactMatchCount == 1 && newIdentityCount == 1
+                    ? exactMatch
+                    : nullptr;
+            if (reconciled != nullptr) {
+                renamedItem.item.path = reconciled->path;
+                renamedItem.item.desktopChildPidl =
+                    reconciled->shellChildPidl;
+                renamedItem.displayName =
+                    reconciled->displayName;
+            }
+        }
+    }
+    if (renamedItem.item.path.empty() ||
+        renamedItem.item.desktopChildPidl.empty()) {
+        MessageDialog::Show(
+            instance_, hwnd_,
+            L"Windows 已完成重命名，但 Lattice 无法确认新的 Shell 身份。桌面已刷新；请保留当前名称并重新启动 Lattice 以完成协调。\n\n错误代码：" +
+                std::to_wstring(
+                    static_cast<unsigned long>(result)),
+            L"Lattice 重命名",
+            MB_OK | MB_ICONERROR);
+        return;
+    }
+    if (renamedItem.displayName.empty()) {
+        renamedItem.displayName = newDisplayName;
+    }
+    const bool stateAccepted = !renameCommitHandler_ ||
+        renameCommitHandler_(
+            previousIdentity,
+            renamedItem.item.path,
+            renamedItem.displayName);
+    ReplaceRenamedIdentity(previousIdentity, renamedItem);
+    if (!stateAccepted) {
+        MessageDialog::Show(
+            instance_, hwnd_,
+            L"Windows 已完成重命名，但 Lattice 暂时无法接受配置更新。当前 Shell 名称保持不变；请不要退出并稍后重试。",
+            L"Lattice 重命名",
+            MB_OK | MB_ICONERROR);
+    }
+}
+
+void DesktopSurfaceWindow::UpdateRenameEditGeometry() {
+    if (renameEdit_ == nullptr) {
+        return;
+    }
+    const auto item = std::find_if(
+        visibleItems_.begin(), visibleItems_.end(),
+        [&](const DesktopViewItem& value) {
+            return IdentitiesEqual(value.path, renameIdentity_);
+        });
+    if (item == visibleItems_.end()) {
+        FinishRename(false);
+        return;
+    }
+    RECT label = LabelRect(*item);
+    const int center = (label.left + label.right) / 2;
+    const LONG width = (std::max<LONG>)(
+        96, label.right - label.left + 24);
+    label.left = center - width / 2;
+    label.right = label.left + width;
+    const RECT bounds = ClientBounds();
+    if (label.left < bounds.left) {
+        OffsetRect(&label, bounds.left - label.left, 0);
+    }
+    if (label.right > bounds.right) {
+        OffsetRect(&label, bounds.right - label.right, 0);
+    }
+    label.bottom = (std::min<LONG>)(
+        bounds.bottom,
+        label.top + (std::max<LONG>)(
+            24, label.bottom - label.top));
+    POINT editOrigin{label.left, label.top};
+    if (ClientToScreen(hwnd_, &editOrigin) == FALSE) {
+        FinishRename(false);
+        return;
+    }
+    SetWindowPos(
+        renameEdit_, HWND_TOP,
+        editOrigin.x, editOrigin.y,
+        label.right - label.left,
+        label.bottom - label.top,
+        SWP_NOACTIVATE | SWP_SHOWWINDOW);
+}
+
+bool DesktopSurfaceWindow::FocusKeyboardWindow(
+    HWND target) const noexcept {
+    if (target == nullptr || IsWindow(target) == FALSE) {
+        return false;
+    }
+    ShowWindow(target, SW_SHOWNORMAL);
+    SetForegroundWindow(target);
+    SetActiveWindow(target);
+    SetFocus(target);
+    GUITHREADINFO information{};
+    information.cbSize = sizeof(information);
+    return GetForegroundWindow() == target &&
+        GetGUIThreadInfo(0, &information) != FALSE &&
+        information.hwndFocus == target;
+}
+
+void DesktopSurfaceWindow::ReplaceRenamedIdentity(
+    const std::wstring& previousIdentity,
+    const DesktopShellRenameResult& renamedItem) {
+    int systemImageIndex = -1;
+    int overlayIndex = 0;
+    bool foundShellImageIdentity = false;
+    const auto replaceIdentity = [&](std::wstring& value) {
+        if (IdentitiesEqual(value, previousIdentity)) {
+            value = renamedItem.item.path;
+        }
+    };
+    for (std::wstring& identity : assignedIdentities_) {
+        replaceIdentity(identity);
+    }
+    for (PositionOverride& position : positionOverrides_) {
+        replaceIdentity(position.identity);
+    }
+    const bool wasSelected = IsSelected(previousIdentity);
+    selectedIdentities_.erase(previousIdentity);
+    selectionBaseline_.erase(previousIdentity);
+    replaceIdentity(pressedIdentity_);
+    replaceIdentity(pendingRenameIdentity_);
+    for (DesktopViewItem& item : snapshot_.items) {
+        if (!IdentitiesEqual(item.path, previousIdentity)) {
+            continue;
+        }
+        systemImageIndex = item.systemImageIndex;
+        overlayIndex = item.overlayIndex;
+        foundShellImageIdentity = true;
+        item.path = renamedItem.item.path;
+        item.displayName = renamedItem.displayName;
+        item.shellChildPidl = renamedItem.item.desktopChildPidl;
+    }
+    if (!foundShellImageIdentity) {
+        const auto currentItem = std::find_if(
+            snapshot_.items.begin(), snapshot_.items.end(),
+            [&](const DesktopViewItem& item) {
+                return IdentitiesEqual(
+                    item.path, renamedItem.item.path);
+            });
+        if (currentItem != snapshot_.items.end()) {
+            systemImageIndex = currentItem->systemImageIndex;
+            overlayIndex = currentItem->overlayIndex;
+        }
+    }
+    if (wasSelected) {
+        AddSelected(renamedItem.item.path);
+    }
+    RebuildVisibleItems();
+    SynchronizeExplorerSelection();
+    iconCache_.Alias(
+        previousIdentity,
+        renamedItem.item.path,
+        systemImageIndex,
+        overlayIndex,
+        iconSize_);
+    iconCache_.PreloadShellIcon(
+        renamedItem.item.path,
+        systemImageIndex,
+        overlayIndex,
+        iconSize_);
+    if (hwnd_ != nullptr) {
+        InvalidateRect(hwnd_, nullptr, FALSE);
+    }
+}
+
 void DesktopSurfaceWindow::ApplyMarqueeSelection(
     const RECT& marqueeRect) {
     selectedIdentities_ = controlAtPointerDown_
@@ -1649,6 +2616,7 @@ void DesktopSurfaceWindow::RebuildVisibleItems() {
     hoverIndex_ = -1;
     PruneSelectionToVisibleItems();
     RebuildInteractionRects();
+    UpdateRenameEditGeometry();
 }
 
 void DesktopSurfaceWindow::SetItemScreenPoint(
@@ -1848,6 +2816,9 @@ bool DesktopSurfaceWindow::BuildShellDragImage(
 bool DesktopSurfaceWindow::BeginInternalDragSession(
     POINT sourceClientPoint) {
     EndInternalDragSession();
+#ifndef NDEBUG
+    internalDropStage_ = InternalDropStage::None;
+#endif
     if (hwnd_ == nullptr || IsWindow(hwnd_) == FALSE) {
         return false;
     }
@@ -1866,6 +2837,9 @@ bool DesktopSurfaceWindow::BeginInternalDragSession(
     }
     internalDragSourceScreenPoint_ = sourceScreenPoint;
     internalDragActive_ = true;
+#ifndef NDEBUG
+    internalDropStage_ = InternalDropStage::SessionBegan;
+#endif
     return true;
 }
 
@@ -1956,6 +2930,7 @@ bool DesktopSurfaceWindow::PlanVisibleGridDrop(
     }
 
     IdentitySet selectedIdentities;
+    std::map<std::wstring, POINT, IdentityLess> selectedOriginalPoints;
     std::vector<std::pair<std::wstring, Cell>> selectedCells;
     selectedCells.reserve(selectedPositions.size());
     for (const DesktopPosition& selected : selectedPositions) {
@@ -1968,6 +2943,7 @@ bool DesktopSurfaceWindow::PlanVisibleGridDrop(
             !selectedIdentities.insert(selected.path).second) {
             return false;
         }
+        selectedOriginalPoints.emplace(selected.path, selected.point);
         selectedCells.emplace_back(
             selected.path, cellForPoint(selected.point));
     }
@@ -1984,19 +2960,27 @@ bool DesktopSurfaceWindow::PlanVisibleGridDrop(
     int maximumDeltaColumn = std::numeric_limits<int>::max();
     int minimumDeltaRow = std::numeric_limits<int>::min();
     int maximumDeltaRow = std::numeric_limits<int>::max();
-    for (const auto& selected : selectedCells) {
+    for (const DesktopPosition& selected : selectedPositions) {
         minimumDeltaColumn = (std::max)(
             minimumDeltaColumn,
-            minimumColumn - selected.second.first);
+            static_cast<int>(std::ceil(
+                static_cast<double>(minimumAnchorX - selected.point.x) /
+                static_cast<double>(cellWidth))));
         maximumDeltaColumn = (std::min)(
             maximumDeltaColumn,
-            maximumColumn - selected.second.first);
+            static_cast<int>(std::floor(
+                static_cast<double>(maximumAnchorX - selected.point.x) /
+                static_cast<double>(cellWidth))));
         minimumDeltaRow = (std::max)(
             minimumDeltaRow,
-            minimumRow - selected.second.second);
+            static_cast<int>(std::ceil(
+                static_cast<double>(minimumAnchorY - selected.point.y) /
+                static_cast<double>(cellHeight))));
         maximumDeltaRow = (std::min)(
             maximumDeltaRow,
-            maximumRow - selected.second.second);
+            static_cast<int>(std::floor(
+                static_cast<double>(maximumAnchorY - selected.point.y) /
+                static_cast<double>(cellHeight))));
     }
     if (minimumDeltaColumn > maximumDeltaColumn ||
         minimumDeltaRow > maximumDeltaRow) {
@@ -2007,20 +2991,24 @@ bool DesktopSurfaceWindow::PlanVisibleGridDrop(
     deltaRow = std::clamp(
         deltaRow, minimumDeltaRow, maximumDeltaRow);
 
-    std::map<Cell, std::wstring> occupants;
+    std::map<std::wstring, Cell, IdentityLess> initialCells;
+    std::map<Cell, std::vector<std::wstring>> occupants;
     for (const DesktopPosition& visible : visiblePositions) {
+        const Cell cell = cellForPoint(visible.point);
+        if (!initialCells.emplace(visible.path, cell).second) {
+            return false;
+        }
         if (selectedIdentities.find(visible.path) !=
             selectedIdentities.end()) {
             continue;
         }
-        const Cell cell = cellForPoint(visible.point);
         if (cell.first < minimumColumn ||
             cell.first > maximumColumn ||
             cell.second < minimumRow ||
-            cell.second > maximumRow ||
-            !occupants.emplace(cell, visible.path).second) {
+            cell.second > maximumRow) {
             return false;
         }
+        occupants[cell].push_back(visible.path);
     }
 
     std::map<std::wstring, Cell, IdentityLess> selectedTargets;
@@ -2029,9 +3017,7 @@ bool DesktopSurfaceWindow::PlanVisibleGridDrop(
         const Cell target{
             selected.second.first + deltaColumn,
             selected.second.second + deltaRow};
-        if (!reservedCells.insert(target).second) {
-            return false;
-        }
+        reservedCells.insert(target);
         selectedTargets.emplace(selected.first, target);
     }
 
@@ -2066,32 +3052,41 @@ bool DesktopSurfaceWindow::PlanVisibleGridDrop(
         if (occupied == occupants.end()) {
             continue;
         }
-        std::wstring carried = std::move(occupied->second);
+        std::vector<std::wstring> displaced =
+            std::move(occupied->second);
         occupants.erase(occupied);
-        Cell candidate = nextCell(target);
-        bool placed = false;
-        for (long long attempt = 0; attempt < cellCount; ++attempt) {
-            if (reservedCells.find(candidate) != reservedCells.end()) {
+        for (std::wstring& displacedIdentity : displaced) {
+            std::wstring carried = std::move(displacedIdentity);
+            Cell candidate = nextCell(target);
+            bool placed = false;
+            for (long long attempt = 0; attempt < cellCount; ++attempt) {
+                if (reservedCells.find(candidate) != reservedCells.end()) {
+                    candidate = nextCell(candidate);
+                    continue;
+                }
+                auto nextOccupied = occupants.find(candidate);
+                if (nextOccupied == occupants.end()) {
+                    occupants[candidate].push_back(std::move(carried));
+                    placed = true;
+                    break;
+                }
+                if (nextOccupied->second.empty()) {
+                    return false;
+                }
+                std::swap(carried, nextOccupied->second.front());
                 candidate = nextCell(candidate);
-                continue;
             }
-            auto nextOccupied = occupants.find(candidate);
-            if (nextOccupied == occupants.end()) {
-                occupants.emplace(candidate, std::move(carried));
-                placed = true;
-                break;
+            if (!placed) {
+                return false;
             }
-            std::swap(carried, nextOccupied->second);
-            candidate = nextCell(candidate);
-        }
-        if (!placed) {
-            return false;
         }
     }
 
     std::map<std::wstring, Cell, IdentityLess> finalCells;
     for (const auto& occupant : occupants) {
-        finalCells.emplace(occupant.second, occupant.first);
+        for (const std::wstring& identity : occupant.second) {
+            finalCells.emplace(identity, occupant.first);
+        }
     }
     finalCells.insert(selectedTargets.begin(), selectedTargets.end());
     if (finalCells.size() != visiblePositions.size()) {
@@ -2102,12 +3097,23 @@ bool DesktopSurfaceWindow::PlanVisibleGridDrop(
         if (final == finalCells.end()) {
             return false;
         }
-        const POINT point = pointForCell(final->second);
-        if (point.x != visible.point.x ||
-            point.y != visible.point.y) {
-            plannedPositions.push_back(
-                DesktopPosition{visible.path, point});
+        const auto initial = initialCells.find(visible.path);
+        if (initial == initialCells.end()) {
+            return false;
         }
+        if (final->second == initial->second) {
+            continue;
+        }
+        POINT point = pointForCell(final->second);
+        const auto selectedOriginal =
+            selectedOriginalPoints.find(visible.path);
+        if (selectedOriginal != selectedOriginalPoints.end()) {
+            point = POINT{
+                selectedOriginal->second.x + deltaColumn * cellWidth,
+                selectedOriginal->second.y + deltaRow * cellHeight};
+        }
+        plannedPositions.push_back(
+            DesktopPosition{visible.path, point});
     }
     return true;
 }
@@ -2134,9 +3140,15 @@ bool DesktopSurfaceWindow::CommitInternalDesktopDrop(
             cellHeight_,
             iconSize_,
             planned)) {
+#ifndef NDEBUG
+        internalDropStage_ = InternalDropStage::PlanRejected;
+#endif
         return false;
     }
     if (planned.empty()) {
+#ifndef NDEBUG
+        internalDropStage_ = InternalDropStage::PlannedNoChange;
+#endif
         return true;
     }
 
@@ -2147,11 +3159,18 @@ bool DesktopSurfaceWindow::CommitInternalDesktopDrop(
             ScreenToClient(
                 snapshot_.listViewWindow,
                 &position.point) == FALSE) {
+#ifndef NDEBUG
+            internalDropStage_ =
+                InternalDropStage::CoordinateRejected;
+#endif
             return false;
         }
     }
     if (!displayPositionCommitHandler_ ||
         !displayPositionCommitHandler_(viewPositions)) {
+#ifndef NDEBUG
+        internalDropStage_ = InternalDropStage::CommitRejected;
+#endif
         return false;
     }
 
@@ -2188,6 +3207,9 @@ bool DesktopSurfaceWindow::CommitInternalDesktopDrop(
     if (hwnd_ != nullptr) {
         InvalidateRect(hwnd_, nullptr, FALSE);
     }
+#ifndef NDEBUG
+    internalDropStage_ = InternalDropStage::Applied;
+#endif
     return true;
 }
 

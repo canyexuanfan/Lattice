@@ -1,6 +1,7 @@
 #pragma once
 
 #include <Windows.h>
+#include <ShObjIdl.h>
 
 #include <functional>
 #include <string>
@@ -34,6 +35,11 @@ struct DesktopViewSnapshot {
 
 class DesktopLayout {
 public:
+    bool AcquireFolderViewOnce(
+        IFolderView** folderView,
+        IShellView** shellView,
+        HWND& shellViewWindow,
+        std::wstring& errorMessage) const;
     bool CaptureViewSnapshot(
         DesktopViewSnapshot& snapshot,
         std::wstring& errorMessage) const;

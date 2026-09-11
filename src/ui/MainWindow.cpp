@@ -314,6 +314,35 @@ bool MainWindow::EnableDesktopDisplayTakeover(
             return configStore_.SaveDesktopDisplayPositionsAsync(
                 placements);
         });
+    surface->SetRenameCommitHandler(
+        [this](
+            const std::wstring& previousIdentity,
+            const std::wstring& newIdentity,
+            const std::wstring& newDisplayName) {
+            if (!configStore_.SaveShellRenameAsync(
+                    previousIdentity,
+                    newIdentity,
+                    newDisplayName)) {
+                return false;
+            }
+            for (RegisteredItem& item : organizerConfig_.items) {
+                if (CompareStringOrdinal(
+                        item.path.c_str(), -1,
+                        previousIdentity.c_str(), -1,
+                        TRUE) == CSTR_EQUAL) {
+                    item.path = newIdentity;
+                    item.displayName = newDisplayName;
+                }
+                if (!item.originalDesktopPath.empty() &&
+                    CompareStringOrdinal(
+                        item.originalDesktopPath.c_str(), -1,
+                        previousIdentity.c_str(), -1,
+                        TRUE) == CSTR_EQUAL) {
+                    item.originalDesktopPath = newIdentity;
+                }
+            }
+            return true;
+        });
     const AppConfig appConfig = configStore_.LoadAppConfig();
     surface->UpdateDisplayPositions(
         ToDesktopPositions(appConfig.desktopDisplayLayout));

@@ -5,6 +5,7 @@ param(
         "--smoke-config",
         "--smoke-layout",
         "--smoke-shell-new",
+        "--smoke-shell-rename",
         "--smoke-managed-items",
         "--smoke-legacy-storage-migration",
         "--smoke-category-storage",
@@ -91,12 +92,22 @@ function Invoke-SmokeMode {
     }
     $psi.WorkingDirectory = Split-Path -Parent $exe
     $psi.UseShellExecute = $false
+    $psi.RedirectStandardError = $true
     $processEnvironment = $psi.EnvironmentVariables
     $processEnvironment["DESKTOP_ORGANIZER_CONFIG_DIR"] = $smokeConfigDir
     $processEnvironment["DESKTOP_ORGANIZER_DATA_DIR"] = $smokeDataDir
     $processEnvironment["DESKTOP_ORGANIZER_INSTANCE_SUFFIX"] = "smoke-$runId"
     $processEnvironment["DESKTOP_ORGANIZER_SMOKE_ITEMS_DIR"] = $managedItemsSmokeDir
     $processEnvironment["DESKTOP_ORGANIZER_DISABLE_AUTO_UPDATE"] = "1"
+    if ($Mode -eq '--smoke-shell-rename') {
+        $renameRoot = Join-Path $managedItemsSmokeDir 'shell-rename'
+        New-Item -ItemType Directory -Force -Path $renameRoot | Out-Null
+        $renameSource = Join-Path $renameRoot 'before.txt'
+        $renameTarget = Join-Path $renameRoot 'after.txt'
+        Set-Content -LiteralPath $renameSource -Value 'rename-smoke' -Encoding UTF8
+        $processEnvironment['LATTICE_SMOKE_SHELL_RENAME_PATH'] = $renameSource
+        $processEnvironment['LATTICE_SMOKE_SHELL_RENAME_TARGET'] = 'after.txt'
+    }
     if ($VisibleFixture) {
         if ($Mode -ne '--smoke-resource-idle') {
             throw 'VisibleFixture requires the bounded resource-idle fixture.'
@@ -164,6 +175,11 @@ function Invoke-SmokeMode {
         }
         throw "Smoke mode exceeded 30 seconds: $Mode. Hang dump: $dumpPath. Thread stacks: $stackPath"
     }
+    $standardError = $process.StandardError.ReadToEnd()
+    if (-not [string]::IsNullOrWhiteSpace($standardError)) {
+        Write-Output "SMOKE_MODE_STDERR=$Mode"
+        Write-Output $standardError.TrimEnd()
+    }
     Write-Output "SMOKE_MODE_EXIT=$Mode`:$($process.ExitCode)"
     if ($process.ExitCode -ne 0) {
         throw "Smoke mode failed: $Mode (exit $($process.ExitCode))"
@@ -180,6 +196,7 @@ try {
         "--smoke-config",
         "--smoke-layout",
         "--smoke-shell-new",
+        "--smoke-shell-rename",
         "--smoke-managed-items",
         "--smoke-legacy-storage-migration",
         "--smoke-category-storage",

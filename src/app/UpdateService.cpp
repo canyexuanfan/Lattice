@@ -21,6 +21,13 @@ constexpr wchar_t kApiHost[] = L"api.github.com";
 constexpr wchar_t kApiPath[] = L"/repos/canyexuanfan/Lattice/releases/latest";
 constexpr std::uint64_t kMaximumMetadataBytes = 2ULL * 1024ULL * 1024ULL;
 constexpr std::uint64_t kMaximumInstallerBytes = 128ULL * 1024ULL * 1024ULL;
+#if defined(LATTICE_OFFLINE_PACKAGE) && LATTICE_OFFLINE_PACKAGE
+constexpr UpdatePackageVariant kCurrentUpdatePackageVariant =
+    UpdatePackageVariant::Offline;
+#else
+constexpr UpdatePackageVariant kCurrentUpdatePackageVariant =
+    UpdatePackageVariant::Standard;
+#endif
 
 struct InternetHandle {
     HINTERNET value = nullptr;
@@ -105,7 +112,7 @@ bool ReadResponse(HINTERNET request, std::uint64_t maximumBytes, std::string& ou
 }
 
 bool RequestHttps(const wchar_t* host, INTERNET_PORT port, const std::wstring& path, HINTERNET& requestOut, InternetHandle& session, InternetHandle& connection, InternetHandle& request) {
-    session.value = WinHttpOpen(L"Lattice/0.4.46", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    session.value = WinHttpOpen(L"Lattice/0.4.48", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
     if (session.value == nullptr) return false;
     WinHttpSetTimeouts(session.value, 5000, 5000, 10000, 10000);
     connection.value = WinHttpConnect(session.value, host, port, 0);
@@ -264,7 +271,21 @@ int UpdateService::CompareVersions(const std::wstring& left, const std::wstring&
     return 0;
 }
 
-bool UpdateService::SelectReleaseAsset(const std::string& json, std::wstring& version, std::wstring& downloadUrl) {
+bool UpdateService::SelectReleaseAsset(
+    const std::string& json,
+    std::wstring& version,
+    std::wstring& downloadUrl) {
+    return SelectReleaseAssetForVariant(
+        json, kCurrentUpdatePackageVariant, version, downloadUrl);
+}
+
+bool UpdateService::SelectReleaseAssetForVariant(
+    const std::string& json,
+    UpdatePackageVariant variant,
+    std::wstring& version,
+    std::wstring& downloadUrl) {
+    version.clear();
+    downloadUrl.clear();
     std::string tag;
     size_t end = 0;
     if (!ExtractJsonString(json, "tag_name", 0, tag, end)) return false;
@@ -277,8 +298,18 @@ bool UpdateService::SelectReleaseAsset(const std::string& json, std::wstring& ve
         if ((character < L'0' || character > L'9') && character != L'.') return false;
         versionAscii.push_back(static_cast<char>(character));
     }
-    const std::string desired = "Lattice-Setup-" + versionAscii + ".exe";
-    std::string fallback;
+    const std::array<std::string, 4> candidateNames{
+        "Lattice-Setup-" + versionAscii + ".exe",
+        "Lattice-Setup-Latest.exe",
+        "Lattice-Setup-" + versionAscii + "-Offline.exe",
+        "Lattice-Setup-Latest-Offline.exe",
+    };
+    struct Candidate {
+        bool seen = false;
+        bool ambiguous = false;
+        std::string url;
+    };
+    std::array<Candidate, 4> candidates{};
     size_t cursor = json.find("\"assets\"");
     if (cursor == std::string::npos) return false;
     while (cursor < json.size()) {
@@ -288,18 +319,45 @@ bool UpdateService::SelectReleaseAsset(const std::string& json, std::wstring& ve
         std::string url;
         size_t urlEnd = 0;
         if (ExtractJsonString(json, "browser_download_url", nameEnd, url, urlEnd)) {
-            if (name == desired) {
-                downloadUrl = Utf8ToWide(url);
-                return !downloadUrl.empty();
+            for (size_t index = 0; index < candidateNames.size(); ++index) {
+                if (name != candidateNames[index]) continue;
+                Candidate& candidate = candidates[index];
+                if (!candidate.seen) {
+                    candidate.seen = true;
+                    candidate.url = url;
+                } else if (candidate.url != url) {
+                    candidate.ambiguous = true;
+                }
+                break;
             }
-            if (name == "Lattice-Setup-Latest.exe") fallback = url;
             cursor = urlEnd;
         } else {
             cursor = nameEnd;
         }
     }
-    downloadUrl = Utf8ToWide(fallback);
-    return !downloadUrl.empty();
+
+    std::array<size_t, 4> priority{0, 1, 2, 3};
+    size_t priorityCount = priority.size();
+    if (variant == UpdatePackageVariant::Offline) {
+        priority = {2, 3, 0, 1};
+        priorityCount = 2;
+    }
+    for (size_t priorityIndex = 0;
+         priorityIndex < priorityCount;
+         ++priorityIndex) {
+        const Candidate& candidate = candidates[priority[priorityIndex]];
+        if (candidate.ambiguous) {
+            version.clear();
+            return false;
+        }
+        if (!candidate.seen) continue;
+        downloadUrl = Utf8ToWide(candidate.url);
+        if (!downloadUrl.empty()) return true;
+        version.clear();
+        return false;
+    }
+    version.clear();
+    return false;
 }
 
 bool UpdateService::Start(HWND notificationWindow, bool manual, HWND dialogOwner) {

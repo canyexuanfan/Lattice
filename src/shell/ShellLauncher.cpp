@@ -45,24 +45,74 @@ HRESULT CreateSingleContextMenu(
     return result;
 }
 
-bool TrackShellContextMenu(
+bool IsCanonicalRenameVerb(
+    IContextMenu* contextMenu,
+    UINT commandOffset) {
+    wchar_t wideVerb[128]{};
+    if (SUCCEEDED(contextMenu->GetCommandString(
+            commandOffset,
+            GCS_VERBW,
+            nullptr,
+            reinterpret_cast<LPSTR>(wideVerb),
+            ARRAYSIZE(wideVerb) - 1)) &&
+        CompareStringOrdinal(
+            wideVerb, -1, L"rename", -1, TRUE) == CSTR_EQUAL) {
+        return true;
+    }
+
+    char ansiVerb[128]{};
+    return SUCCEEDED(contextMenu->GetCommandString(
+               commandOffset,
+               GCS_VERBA,
+               nullptr,
+               ansiVerb,
+               ARRAYSIZE(ansiVerb) - 1)) &&
+           lstrcmpiA(ansiVerb, "rename") == 0;
+}
+
+ShellContextMenuResult TrackShellContextMenu(
     HWND ownerWindow,
     IContextMenu* contextMenu,
-    POINT screenPoint) {
+    POINT screenPoint,
+    bool allowRename) {
     if (contextMenu == nullptr) {
-        return false;
+        return ShellContextMenuResult::Failed;
     }
     HMENU menu = CreatePopupMenu();
     if (menu == nullptr) {
-        return false;
+        return ShellContextMenuResult::Failed;
     }
     constexpr UINT kFirstCommand = 1;
     constexpr UINT kLastCommand = 0x7FFF;
+    UINT flags = CMF_NORMAL;
+    if (allowRename) {
+        flags |= CMF_CANRENAME;
+    }
     HRESULT result = contextMenu->QueryContextMenu(
-        menu, 0, kFirstCommand, kLastCommand, CMF_NORMAL);
+        menu, 0, kFirstCommand, kLastCommand, flags);
     if (FAILED(result)) {
         DestroyMenu(menu);
-        return false;
+        return ShellContextMenuResult::Failed;
+    }
+    constexpr UINT kNoCommand = static_cast<UINT>(-1);
+    UINT renameCommandOffset = kNoCommand;
+    if (allowRename) {
+        const UINT reportedCommandCount =
+            static_cast<UINT>(HRESULT_CODE(result));
+        const UINT maximumCommandCount =
+            kLastCommand - kFirstCommand + 1;
+        const UINT commandCount = reportedCommandCount < maximumCommandCount
+            ? reportedCommandCount
+            : maximumCommandCount;
+        for (UINT commandOffset = 0;
+             commandOffset < commandCount;
+             ++commandOffset) {
+            if (IsCanonicalRenameVerb(
+                    contextMenu, commandOffset)) {
+                renameCommandOffset = commandOffset;
+                break;
+            }
+        }
     }
     Microsoft::WRL::ComPtr<IContextMenu2> contextMenu2;
     Microsoft::WRL::ComPtr<IContextMenu3> contextMenu3;
@@ -82,27 +132,36 @@ bool TrackShellContextMenu(
         nullptr);
     gActiveContextMenu3 = nullptr;
     gActiveContextMenu2 = nullptr;
-    bool invoked = selected == 0;
+    ShellContextMenuResult outcome = selected == 0
+        ? ShellContextMenuResult::Cancelled
+        : ShellContextMenuResult::Failed;
     if (selected >= kFirstCommand &&
         selected <= kLastCommand) {
-        CMINVOKECOMMANDINFOEX invoke{};
-        invoke.cbSize = sizeof(invoke);
-        invoke.fMask =
-            CMIC_MASK_UNICODE | CMIC_MASK_PTINVOKE;
-        invoke.hwnd = ownerWindow;
-        invoke.lpVerb = MAKEINTRESOURCEA(
-            selected - kFirstCommand);
-        invoke.lpVerbW = MAKEINTRESOURCEW(
-            selected - kFirstCommand);
-        invoke.nShow = SW_SHOWNORMAL;
-        invoke.ptInvoke = screenPoint;
-        invoked = SUCCEEDED(contextMenu->InvokeCommand(
-            reinterpret_cast<LPCMINVOKECOMMANDINFO>(
-                &invoke)));
+        const UINT commandOffset = selected - kFirstCommand;
+        if (commandOffset == renameCommandOffset) {
+            outcome = ShellContextMenuResult::RenameRequested;
+        } else {
+            CMINVOKECOMMANDINFOEX invoke{};
+            invoke.cbSize = sizeof(invoke);
+            invoke.fMask =
+                CMIC_MASK_UNICODE | CMIC_MASK_PTINVOKE;
+            invoke.hwnd = ownerWindow;
+            invoke.lpVerb = MAKEINTRESOURCEA(
+                commandOffset);
+            invoke.lpVerbW = MAKEINTRESOURCEW(
+                commandOffset);
+            invoke.nShow = SW_SHOWNORMAL;
+            invoke.ptInvoke = screenPoint;
+            outcome = SUCCEEDED(contextMenu->InvokeCommand(
+                reinterpret_cast<LPCMINVOKECOMMANDINFO>(
+                    &invoke)))
+                ? ShellContextMenuResult::Invoked
+                : ShellContextMenuResult::Failed;
+        }
     }
     DestroyMenu(menu);
     PostMessageW(ownerWindow, WM_NULL, 0, 0);
-    return invoked;
+    return outcome;
 }
 
 }  // namespace
@@ -162,7 +221,8 @@ bool ShellLauncher::ShowContextMenu(
         contextMenu.GetAddressOf());
     return SUCCEEDED(result) &&
         TrackShellContextMenu(
-            ownerWindow, contextMenu.Get(), screenPoint);
+            ownerWindow, contextMenu.Get(), screenPoint, false) !=
+            ShellContextMenuResult::Failed;
 }
 
 bool ShellLauncher::ShowContextMenu(
@@ -184,7 +244,32 @@ bool ShellLauncher::ShowContextMenu(
         return false;
     }
     return TrackShellContextMenu(
-        ownerWindow, contextMenu.Get(), screenPoint);
+        ownerWindow, contextMenu.Get(), screenPoint, false) !=
+        ShellContextMenuResult::Failed;
+}
+
+ShellContextMenuResult ShellLauncher::ShowDesktopContextMenu(
+    HWND ownerWindow,
+    const std::vector<ShellItemReference>& items,
+    POINT screenPoint,
+    bool allowRename) const {
+    if (ownerWindow == nullptr || items.empty()) {
+        return ShellContextMenuResult::Failed;
+    }
+    Microsoft::WRL::ComPtr<IContextMenu> contextMenu;
+    const HRESULT result = CreateDesktopShellSelectionObject(
+        ownerWindow,
+        items,
+        IID_IContextMenu,
+        reinterpret_cast<void**>(contextMenu.GetAddressOf()));
+    if (FAILED(result) || contextMenu == nullptr) {
+        return ShellContextMenuResult::Failed;
+    }
+    return TrackShellContextMenu(
+        ownerWindow,
+        contextMenu.Get(),
+        screenPoint,
+        allowRename && items.size() == 1);
 }
 
 bool ShellLauncher::ForwardContextMenuMessage(

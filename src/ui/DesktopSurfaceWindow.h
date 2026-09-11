@@ -23,6 +23,11 @@ public:
     using DisplayPositionCommitHandler =
         std::function<bool(
             const std::vector<DesktopPosition>&)>;
+    using RenameCommitHandler =
+        std::function<bool(
+            const std::wstring&,
+            const std::wstring&,
+            const std::wstring&)>;
 
     explicit DesktopSurfaceWindow(HINSTANCE instance);
     ~DesktopSurfaceWindow();
@@ -36,13 +41,16 @@ public:
     void Show();
     void Hide();
     void Close();
-    bool Refresh(std::wstring& errorMessage);
+    bool Refresh(
+        std::wstring& errorMessage,
+        bool refreshWallpaper = true);
     void UpdateAssignedIdentities(
         const std::vector<std::wstring>& assignedIdentities);
     void UpdateDisplayPositions(
         const std::vector<DesktopPosition>& viewPositions);
     void SetDisplayPositionCommitHandler(
         DisplayPositionCommitHandler handler);
+    void SetRenameCommitHandler(RenameCommitHandler handler);
     void PresentUnassignedItemAt(
         const std::wstring& identity,
         POINT screenPoint);
@@ -78,15 +86,41 @@ private:
         MarqueeActive,
     };
 
+#ifndef NDEBUG
+    enum class InternalDropStage {
+        None,
+        SessionBegan,
+        DragEntered,
+        DropReceived,
+        PlanRejected,
+        PlannedNoChange,
+        CoordinateRejected,
+        CommitRejected,
+        Applied,
+    };
+#endif
+
     static LRESULT CALLBACK WindowProc(
         HWND hwnd,
         UINT message,
+        WPARAM wParam,
+        LPARAM lParam);
+    static LRESULT CALLBACK RenameEditProc(
+        HWND hwnd,
+        UINT message,
+        WPARAM wParam,
+        LPARAM lParam,
+        UINT_PTR subclassId,
+        DWORD_PTR referenceData);
+    static LRESULT CALLBACK KeyboardHookProc(
+        int code,
         WPARAM wParam,
         LPARAM lParam);
     LRESULT HandleMessage(UINT message, WPARAM wParam, LPARAM lParam);
     void Render();
     int HitTest(POINT clientPoint) const;
     RECT CellRect(const DesktopViewItem& item) const;
+    RECT LabelRect(const DesktopViewItem& item) const;
     RECT FallbackInteractionRect(
         const DesktopViewItem& item) const;
     bool IsInFallbackHitRegion(
@@ -120,6 +154,11 @@ private:
     void AddSelected(const std::wstring& identity);
     void RemoveSelected(const std::wstring& identity);
     void SelectOnly(const std::wstring& identity);
+    bool ActivateExplorerDesktopView() const noexcept;
+    bool SynchronizeExplorerSelection();
+    bool ResolveExplorerViewItem(
+        const DesktopViewItem& item,
+        PIDLIST_RELATIVE& currentPidl) const;
     void PruneSelectionToVisibleItems();
     std::vector<std::wstring> SelectedPathsInVisibleOrder() const;
     std::vector<ShellItemReference>
@@ -132,6 +171,17 @@ private:
     void CompletePointerGesture();
     void ResetPointerGesture() noexcept;
     void CancelPointerCapture() noexcept;
+    void CancelPendingRename() noexcept;
+    bool InstallKeyboardHook() noexcept;
+    void RemoveKeyboardHook() noexcept;
+    bool ShouldRouteDesktopF2() const noexcept;
+    bool BeginRename(const std::wstring& identity);
+    void FinishRename(bool commit);
+    void UpdateRenameEditGeometry();
+    bool FocusKeyboardWindow(HWND target) const noexcept;
+    void ReplaceRenamedIdentity(
+        const std::wstring& previousIdentity,
+        const DesktopShellRenameResult& renamedItem);
     void ApplyMarqueeSelection(const RECT& marqueeRect);
     bool IsAssigned(const std::wstring& identity) const;
     void RebuildVisibleItems();
@@ -172,11 +222,17 @@ private:
     HINSTANCE instance_ = nullptr;
     HWND hwnd_ = nullptr;
     DesktopViewSnapshot snapshot_;
+    Microsoft::WRL::ComPtr<IFolderView> explorerFolderView_;
+    Microsoft::WRL::ComPtr<IShellView> explorerShellView_;
+    Microsoft::WRL::ComPtr<IShellFolder> explorerDesktopFolder_;
+    HRESULT lastExplorerSelectionSyncResult_ = E_PENDING;
+    int lastExplorerSelectionSyncStage_ = 0;
     std::vector<std::wstring> assignedIdentities_;
     std::vector<DesktopViewItem> visibleItems_;
     std::vector<RECT> visibleInteractionRects_;
     std::vector<PositionOverride> positionOverrides_;
     DisplayPositionCommitHandler displayPositionCommitHandler_;
+    RenameCommitHandler renameCommitHandler_;
     D2DContext d2d_;
     IconCache iconCache_;
     WallpaperBackdrop wallpaper_;
@@ -191,11 +247,25 @@ private:
     PointerGesture pointerGesture_ = PointerGesture::None;
     bool controlAtPointerDown_ = false;
     bool pressedWasSelected_ = false;
+    bool renameClickCandidate_ = false;
+    std::wstring pendingRenameIdentity_;
+    HWND renameEdit_ = nullptr;
+    HFONT renameFont_ = nullptr;
+    std::wstring renameIdentity_;
+    std::wstring renameOriginalDisplayName_;
+    bool renameFinalizing_ = false;
+    HHOOK keyboardHook_ = nullptr;
+    bool desktopKeyboardSelectionArmed_ = false;
+    bool swallowF2Key_ = false;
+    static DesktopSurfaceWindow* keyboardHookOwner_;
     size_t shellDragStartCount_ = 0;
     bool suppressShellDragForSmoke_ = false;
     bool internalDragActive_ = false;
     POINT internalDragSourceScreenPoint_{};
     std::vector<DesktopPosition> internalDragOriginalPositions_;
+#ifndef NDEBUG
+    InternalDropStage internalDropStage_ = InternalDropStage::None;
+#endif
     bool dropTargetRegistered_ = false;
     Microsoft::WRL::ComPtr<IDropTarget> desktopDropTarget_;
     int cellWidth_ = 76;

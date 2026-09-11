@@ -91,8 +91,12 @@ void NotifyDesktopItemsCreated(
 
 HRESULT GetDesktopFolderViewOnce(
     ComPtr<IFolderView>& folderView,
-    HWND* viewWindow = nullptr) {
+    HWND* viewWindow = nullptr,
+    ComPtr<IShellView>* activeShellView = nullptr) {
     folderView.Reset();
+    if (activeShellView != nullptr) {
+        activeShellView->Reset();
+    }
     if (viewWindow != nullptr) {
         *viewWindow = nullptr;
     }
@@ -135,6 +139,9 @@ HRESULT GetDesktopFolderViewOnce(
         if (FAILED(result)) {
             return result;
         }
+    }
+    if (activeShellView != nullptr) {
+        *activeShellView = shellView;
     }
     return shellView.As(&folderView);
 }
@@ -531,6 +538,35 @@ struct DesktopSnapshotState {
 };
 
 }  // namespace
+
+bool DesktopLayout::AcquireFolderViewOnce(
+    IFolderView** folderView,
+    IShellView** shellView,
+    HWND& shellViewWindow,
+    std::wstring& errorMessage) const {
+    shellViewWindow = nullptr;
+    errorMessage.clear();
+    if (folderView == nullptr || shellView == nullptr) {
+        errorMessage = L"Explorer桌面视图输出参数无效。";
+        return false;
+    }
+    *folderView = nullptr;
+    *shellView = nullptr;
+    ComPtr<IFolderView> view;
+    ComPtr<IShellView> activeView;
+    const HRESULT result = GetDesktopFolderViewOnce(
+        view, &shellViewWindow, &activeView);
+    if (FAILED(result) || view == nullptr ||
+        activeView == nullptr || shellViewWindow == nullptr) {
+        errorMessage =
+            L"无法连接当前Explorer桌面选择视图，HRESULT=" +
+            std::to_wstring(static_cast<long long>(result)) + L"。";
+        return false;
+    }
+    *folderView = view.Detach();
+    *shellView = activeView.Detach();
+    return true;
+}
 
 bool DesktopLayout::CaptureViewSnapshot(
     DesktopViewSnapshot& snapshot,

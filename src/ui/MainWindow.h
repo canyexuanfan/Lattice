@@ -53,6 +53,8 @@ public:
     void FinishPendingDesktopPlacements();
 
 private:
+    friend struct MainWindowSmokeAccess;
+
     struct TileView {
         std::wstring categoryId;
         std::wstring name;

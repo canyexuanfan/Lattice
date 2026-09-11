@@ -99,6 +99,10 @@ public:
         bool updateItemOrder) const;
     bool SaveDesktopDisplayPositionsAsync(
         const std::vector<DesktopPlacementConfig>& positions) const;
+    bool SaveShellRenameAsync(
+        const std::wstring& previousIdentity,
+        const std::wstring& newIdentity,
+        const std::wstring& newDisplayName) const;
     static bool DrainPendingWrites(unsigned long timeoutMilliseconds);
     bool ExportAppConfig(const std::wstring& path) const;
     bool ImportAppConfig(const std::wstring& path) const;

@@ -46,7 +46,7 @@ constexpr UINT kIconDragPollMilliseconds = 16;
 constexpr UINT_PTR kInteractionSaveTimerId = 6;
 constexpr UINT kInteractionSaveDelayMilliseconds = 240;
 constexpr wchar_t kAlignmentGuideClassName[] = L"Lattice.AlignmentGuide";
-constexpr wchar_t kCurrentVersion[] = L"0.4.46";
+constexpr wchar_t kCurrentVersion[] = L"0.4.48";
 constexpr UINT kShellNewCommandFirst = 0x5000;
 constexpr UINT kShellNewCommandLast = 0x5FFF;
 

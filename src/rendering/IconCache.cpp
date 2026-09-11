@@ -874,7 +874,12 @@ void IconCache::PreloadShellIcon(
         desiredPixelSize);
 }
 
-void IconCache::Alias(const std::wstring& sourcePath, const std::wstring& destinationPath) {
+void IconCache::Alias(
+    const std::wstring& sourcePath,
+    const std::wstring& destinationPath,
+    int systemImageIndex,
+    int overlayIndex,
+    int desiredPixelSize) {
     if (sourcePath.empty() || destinationPath.empty() || sourcePath == destinationPath) {
         return;
     }
@@ -938,7 +943,11 @@ void IconCache::Alias(const std::wstring& sourcePath, const std::wstring& destin
         enqueueDestination = true;
     }
     if (enqueueDestination) {
-        Enqueue(destinationPath);
+        Enqueue(
+            destinationPath,
+            systemImageIndex,
+            overlayIndex,
+            desiredPixelSize);
     }
 }
 

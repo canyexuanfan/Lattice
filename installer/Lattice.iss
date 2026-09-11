@@ -2,17 +2,28 @@
 ; 先运行 scripts\package.ps1 构建 Release 并调用 ISCC.exe。
 
 #define MyAppName "Lattice"
-#define MyAppVersion "0.4.46"
+#define MyAppVersion "0.4.48"
+#define MyAuthorSignature "@十七°"
 #define MyAppPublisher "Lattice"
 #define MyAppExeName "Lattice.exe"
 #define MyAppFolderName "Lattice"
-#define BuildDir "..\x64\Release"
+#ifndef OfflineBuild
+  #define OfflineBuild 0
+#endif
+#if Int(OfflineBuild) == 1
+  #define BuildDir "..\x64\ReleaseOffline"
+  #define InstallerSuffix "-Offline"
+#else
+  #define BuildDir "..\x64\Release"
+  #define InstallerSuffix ""
+#endif
+#define InstallerBaseName "Lattice-Setup-" + MyAppVersion + InstallerSuffix
 
 [Setup]
 AppId={{6D5B2D54-44D8-4F80-8B94-1C6D1A3DBA0E}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
-AppVerName={#MyAppName} {#MyAppVersion}
+AppVerName={#MyAppName} {#MyAppVersion} {#MyAuthorSignature}
 AppPublisher={#MyAppPublisher}
 VersionInfoVersion={#MyAppVersion}.0
 DefaultDirName=E:\Program\Lattice
@@ -22,7 +33,7 @@ DisableDirPage=no
 AppendDefaultDirName=yes
 UninstallDisplayIcon={app}\{#MyAppExeName}
 OutputDir=..\release
-OutputBaseFilename=Lattice-Setup-{#MyAppVersion}
+OutputBaseFilename={#InstallerBaseName}
 Compression=lzma2/ultra64
 SolidCompression=yes
 ArchitecturesAllowed=x64compatible
@@ -39,6 +50,7 @@ WizardSmallImageFile=assets\wizard-small.png
 WizardSmallImageBackColor=$071222
 CloseApplications=yes
 RestartApplications=no
+UsePreviousTasks=yes
 
 [Languages]
 Name: "chinesesimplified"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
@@ -68,17 +80,24 @@ Name: "{app}\Data"; Permissions: users-modify
 
 [Tasks]
 Name: "startup"; Description: "随 Windows 启动"; GroupDescription: "附加选项："
+Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: "附加选项："
+Name: "startmenuicon"; Description: "添加到开始菜单"; GroupDescription: "附加选项："
 
 [Icons]
-Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
-Name: "{group}\卸载 {#MyAppName}"; Filename: "{uninstallexe}"
+Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: startmenuicon
+Name: "{group}\卸载 {#MyAppName}"; Filename: "{uninstallexe}"; Tasks: startmenuicon
+Name: "{userdesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
 
 [Registry]
-Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "Lattice"; ValueData: "{app}\{#MyAppExeName}"; Flags: uninsdeletevalue; Tasks: startup
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: none; ValueName: "Lattice"; Flags: deletevalue; Check: not WizardIsTaskSelected('startup')
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "Lattice"; ValueData: """{app}\{#MyAppExeName}"""; Flags: uninsdeletevalue; Tasks: startup
 
 [InstallDelete]
 Type: files; Name: "{app}\Luno.exe"
 Type: files; Name: "{app}\DesktopOrganizer.exe"
+Type: files; Name: "{userdesktop}\{#MyAppName}.lnk"; Check: not WizardIsTaskSelected('desktopicon')
+Type: files; Name: "{group}\{#MyAppName}.lnk"; Check: not WizardIsTaskSelected('startmenuicon')
+Type: files; Name: "{group}\卸载 {#MyAppName}.lnk"; Check: not WizardIsTaskSelected('startmenuicon')
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "启动 {#MyAppName}"; Flags: nowait postinstall skipifsilent
@@ -270,7 +289,7 @@ end;
 
 procedure MigrateLegacyStartupState;
 begin
-  if LegacyStartupWasEnabled then
+  if LegacyStartupWasEnabled and WizardIsTaskSelected('startup') then
   begin
     if not RegWriteStringValue(
       HKCU,
@@ -293,7 +312,7 @@ begin
   VersionLabel.Transparent := True;
   VersionLabel.AutoSize := True;
   VersionLabel.ShowAccelChar := False;
-  VersionLabel.Caption := 'Lattice / {#MyAppVersion}';
+  VersionLabel.Caption := 'Lattice / {#MyAppVersion} {#MyAuthorSignature}';
   VersionLabel.Font.Name := 'Microsoft YaHei UI';
   VersionLabel.Font.Color := StrToColor('#CBECF9');
   VersionLabel.Font.Style := [];

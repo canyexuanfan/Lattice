@@ -40,7 +40,12 @@ public:
         int systemImageIndex,
         int overlayIndex,
         int desiredPixelSize);
-    void Alias(const std::wstring& sourcePath, const std::wstring& destinationPath);
+    void Alias(
+        const std::wstring& sourcePath,
+        const std::wstring& destinationPath,
+        int systemImageIndex = -1,
+        int overlayIndex = 0,
+        int desiredPixelSize = 0);
     void Clear();
     size_t Size() const noexcept;
     void SetCapacity(size_t capacity);

@@ -14,6 +14,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <utility>
 
 #include "util/PathUtil.h"
 #include "util/StringUtil.h"
@@ -248,12 +249,23 @@ struct InteractionMutation {
     WindowConfig layout;
     std::vector<std::wstring> itemIds;
     std::vector<DesktopPlacementConfig> desktopDisplayPositionUpdates;
+    std::wstring renamePreviousIdentity;
+    std::wstring renameNewIdentity;
+    std::wstring renameNewDisplayName;
     bool updateItemOrder = false;
     std::uint64_t version = 0;
 };
 
 constexpr wchar_t kDesktopDisplayMutationKey[] =
     L"\x1fdesktop-display-layout";
+constexpr wchar_t kShellRenameMutationKeyPrefix[] =
+    L"\x1fshell-rename:";
+
+void ApplyShellRename(
+    const std::wstring& previousIdentity,
+    const std::wstring& newIdentity,
+    const std::wstring& newDisplayName,
+    AppConfig& config);
 
 std::mutex& InteractionMutationMutex() {
     static std::mutex mutex;
@@ -263,6 +275,11 @@ std::mutex& InteractionMutationMutex() {
 std::map<std::wstring, std::map<std::wstring, InteractionMutation>>& PendingInteractionMutations() {
     static std::map<std::wstring, std::map<std::wstring, InteractionMutation>> mutations;
     return mutations;
+}
+
+std::map<std::wstring, std::function<bool()>>& PendingInteractionFlushTasks() {
+    static std::map<std::wstring, std::function<bool()>> tasks;
+    return tasks;
 }
 
 std::uint64_t& NextInteractionMutationVersion() {
@@ -373,29 +390,63 @@ std::vector<InteractionMutation> SnapshotInteractionMutations(const std::wstring
         (void)categoryId;
         result.push_back(mutation);
     }
+    std::sort(
+        result.begin(), result.end(),
+        [](const InteractionMutation& left,
+           const InteractionMutation& right) {
+            return left.version < right.version;
+        });
     return result;
 }
 
 void ApplyInteractionMutations(
     const std::vector<InteractionMutation>& mutations,
     AppConfig& config) {
+    std::vector<std::pair<std::wstring, std::wstring>>
+        renameAliases;
+    const auto resolveIdentity = [&](std::wstring identity) {
+        for (const auto& [previousIdentity, newIdentity] :
+             renameAliases) {
+            if (CompareStringOrdinal(
+                    identity.c_str(), -1,
+                    previousIdentity.c_str(), -1,
+                    TRUE) == CSTR_EQUAL) {
+                identity = newIdentity;
+            }
+        }
+        return identity;
+    };
     for (const InteractionMutation& mutation : mutations) {
+        if (!mutation.renamePreviousIdentity.empty()) {
+            ApplyShellRename(
+                mutation.renamePreviousIdentity,
+                mutation.renameNewIdentity,
+                mutation.renameNewDisplayName,
+                config);
+            renameAliases.emplace_back(
+                mutation.renamePreviousIdentity,
+                mutation.renameNewIdentity);
+            continue;
+        }
         if (mutation.categoryId == kDesktopDisplayMutationKey) {
             for (const DesktopPlacementConfig& update :
                  mutation.desktopDisplayPositionUpdates) {
+                DesktopPlacementConfig resolved = update;
+                resolved.path = resolveIdentity(update.path);
                 const auto existing = std::find_if(
                     config.desktopDisplayLayout.begin(),
                     config.desktopDisplayLayout.end(),
                     [&](const DesktopPlacementConfig& value) {
                         return CompareStringOrdinal(
                                    value.path.c_str(), -1,
-                                   update.path.c_str(), -1,
+                                   resolved.path.c_str(), -1,
                                    TRUE) == CSTR_EQUAL;
                     });
                 if (existing == config.desktopDisplayLayout.end()) {
-                    config.desktopDisplayLayout.push_back(update);
+                    config.desktopDisplayLayout.push_back(
+                        std::move(resolved));
                 } else {
-                    *existing = update;
+                    *existing = std::move(resolved);
                 }
             }
             continue;
@@ -423,6 +474,56 @@ void ApplyInteractionMutations(
     }
 }
 
+void ApplyShellRename(
+    const std::wstring& previousIdentity,
+    const std::wstring& newIdentity,
+    const std::wstring& newDisplayName,
+    AppConfig& config) {
+    const auto matchesPrevious = [&](const std::wstring& value) {
+        return CompareStringOrdinal(
+            value.c_str(), -1,
+            previousIdentity.c_str(), -1,
+            TRUE) == CSTR_EQUAL;
+    };
+    for (ItemConfig& item : config.items) {
+        if (matchesPrevious(item.path)) {
+            item.path = newIdentity;
+            item.displayName = newDisplayName;
+        }
+        if (!item.originalDesktopPath.empty() &&
+            matchesPrevious(item.originalDesktopPath)) {
+            item.originalDesktopPath = newIdentity;
+        }
+    }
+    const auto migrateLayout = [&](std::vector<DesktopPlacementConfig>& layout) {
+        for (DesktopPlacementConfig& position : layout) {
+            if (matchesPrevious(position.path)) {
+                position.path = newIdentity;
+            }
+        }
+        std::vector<DesktopPlacementConfig> unique;
+        unique.reserve(layout.size());
+        for (DesktopPlacementConfig& position : layout) {
+            const auto existing = std::find_if(
+                unique.begin(), unique.end(),
+                [&](const DesktopPlacementConfig& value) {
+                    return CompareStringOrdinal(
+                               value.path.c_str(), -1,
+                               position.path.c_str(), -1,
+                               TRUE) == CSTR_EQUAL;
+                });
+            if (existing == unique.end()) {
+                unique.push_back(std::move(position));
+            } else {
+                *existing = std::move(position);
+            }
+        }
+        layout = std::move(unique);
+    };
+    migrateLayout(config.desktopLayout);
+    migrateLayout(config.desktopDisplayLayout);
+}
+
 void RemoveAppliedInteractionMutations(
     const std::wstring& configPath,
     const std::vector<InteractionMutation>& applied) {
@@ -439,6 +540,7 @@ void RemoveAppliedInteractionMutations(
     }
     if (byPath->second.empty()) {
         PendingInteractionMutations().erase(byPath);
+        PendingInteractionFlushTasks().erase(configPath);
     }
 }
 
@@ -876,6 +978,9 @@ bool ConfigStore::SaveInteractionStateAsync(
     if (categoryId.empty()) {
         return false;
     }
+    const ConfigStore store = *this;
+    const std::function<bool()> flush =
+        [store]() { return store.FlushInteractionStateToDisk(); };
     {
         std::lock_guard<std::mutex> lock(InteractionMutationMutex());
         std::uint64_t& nextVersion = NextInteractionMutationVersion();
@@ -891,11 +996,12 @@ bool ConfigStore::SaveInteractionStateAsync(
         PendingInteractionMutations()[configPath_].insert_or_assign(
             categoryId,
             std::move(mutation));
+        PendingInteractionFlushTasks().insert_or_assign(
+            configPath_, flush);
     }
-    const ConfigStore store = *this;
-    return AsyncConfigWriter::Instance().Enqueue(
-        configPath_,
-        [store]() { return store.FlushInteractionStateToDisk(); });
+    (void)AsyncConfigWriter::Instance().Enqueue(
+        configPath_, flush);
+    return true;
 }
 
 bool ConfigStore::SaveDesktopDisplayPositionsAsync(
@@ -903,6 +1009,9 @@ bool ConfigStore::SaveDesktopDisplayPositionsAsync(
     if (positions.empty()) {
         return true;
     }
+    const ConfigStore store = *this;
+    const std::function<bool()> flush =
+        [store]() { return store.FlushInteractionStateToDisk(); };
     {
         std::lock_guard<std::mutex> lock(InteractionMutationMutex());
         std::uint64_t& nextVersion = NextInteractionMutationVersion();
@@ -916,37 +1025,142 @@ bool ConfigStore::SaveDesktopDisplayPositionsAsync(
             mutation = current->second;
         }
         mutation.categoryId = kDesktopDisplayMutationKey;
-        for (const DesktopPlacementConfig& position : positions) {
-            const auto existing = std::find_if(
-                mutation.desktopDisplayPositionUpdates.begin(),
-                mutation.desktopDisplayPositionUpdates.end(),
-                [&](const DesktopPlacementConfig& value) {
-                    return CompareStringOrdinal(
-                               value.path.c_str(), -1,
-                               position.path.c_str(), -1,
-                               TRUE) == CSTR_EQUAL;
-                });
-            if (existing ==
-                mutation.desktopDisplayPositionUpdates.end()) {
-                mutation.desktopDisplayPositionUpdates.push_back(
-                    position);
-            } else {
-                *existing = position;
+        std::vector<const InteractionMutation*> pendingRenames;
+        pendingRenames.reserve(pending.size());
+        for (const auto& [key, candidate] : pending) {
+            (void)key;
+            if (!candidate.renamePreviousIdentity.empty()) {
+                pendingRenames.push_back(&candidate);
             }
         }
+        std::sort(
+            pendingRenames.begin(), pendingRenames.end(),
+            [](const InteractionMutation* left,
+               const InteractionMutation* right) {
+                return left->version < right->version;
+            });
+        const auto resolvePendingRename =
+            [&](std::wstring identity) {
+                for (const InteractionMutation* rename :
+                     pendingRenames) {
+                    if (CompareStringOrdinal(
+                            identity.c_str(), -1,
+                            rename->renamePreviousIdentity.c_str(), -1,
+                            TRUE) == CSTR_EQUAL) {
+                        identity = rename->renameNewIdentity;
+                    }
+                }
+                return identity;
+            };
+        std::vector<DesktopPlacementConfig> normalizedPositions;
+        normalizedPositions.reserve(
+            mutation.desktopDisplayPositionUpdates.size() +
+            positions.size());
+        const auto appendLatestPosition =
+            [&](const DesktopPlacementConfig& position) {
+                DesktopPlacementConfig resolved = position;
+                resolved.path = resolvePendingRename(
+                    std::move(resolved.path));
+                const auto existing = std::find_if(
+                    normalizedPositions.begin(),
+                    normalizedPositions.end(),
+                    [&](const DesktopPlacementConfig& value) {
+                        return CompareStringOrdinal(
+                                   value.path.c_str(), -1,
+                                   resolved.path.c_str(), -1,
+                                   TRUE) == CSTR_EQUAL;
+                    });
+                if (existing != normalizedPositions.end()) {
+                    normalizedPositions.erase(existing);
+                }
+                normalizedPositions.push_back(std::move(resolved));
+            };
+        for (const DesktopPlacementConfig& position :
+             mutation.desktopDisplayPositionUpdates) {
+            appendLatestPosition(position);
+        }
+        for (const DesktopPlacementConfig& position : positions) {
+            appendLatestPosition(position);
+        }
+        mutation.desktopDisplayPositionUpdates =
+            std::move(normalizedPositions);
         mutation.version = nextVersion++;
         pending.insert_or_assign(
             kDesktopDisplayMutationKey,
             std::move(mutation));
+        PendingInteractionFlushTasks().insert_or_assign(
+            configPath_, flush);
     }
+    (void)AsyncConfigWriter::Instance().Enqueue(
+        configPath_, flush);
+    return true;
+}
+
+bool ConfigStore::SaveShellRenameAsync(
+    const std::wstring& previousIdentity,
+    const std::wstring& newIdentity,
+    const std::wstring& newDisplayName) const {
+    if (previousIdentity.empty() || newIdentity.empty() ||
+        newDisplayName.empty()) {
+        return false;
+    }
+    InteractionMutation mutation;
+    mutation.categoryId =
+        std::wstring(kShellRenameMutationKeyPrefix) +
+        previousIdentity;
+    mutation.renamePreviousIdentity = previousIdentity;
+    mutation.renameNewIdentity = newIdentity;
+    mutation.renameNewDisplayName = newDisplayName;
     const ConfigStore store = *this;
-    return AsyncConfigWriter::Instance().Enqueue(
-        configPath_,
-        [store]() { return store.FlushInteractionStateToDisk(); });
+    const std::function<bool()> flush =
+        [store]() { return store.FlushInteractionStateToDisk(); };
+    {
+        std::lock_guard<std::mutex> lock(InteractionMutationMutex());
+        std::uint64_t& nextVersion =
+            NextInteractionMutationVersion();
+        if (nextVersion == 0) {
+            ++nextVersion;
+        }
+        mutation.version = nextVersion++;
+        PendingInteractionMutations()[configPath_].insert_or_assign(
+            mutation.categoryId,
+            mutation);
+        PendingInteractionFlushTasks().insert_or_assign(
+            configPath_, flush);
+    }
+    AsyncConfigWriter::Instance().Enqueue(
+        configPath_, flush);
+    return true;
 }
 
 bool ConfigStore::DrainPendingWrites(unsigned long timeoutMilliseconds) {
-    return AsyncConfigWriter::Instance().Drain(timeoutMilliseconds);
+    std::vector<std::pair<std::wstring, std::function<bool()>>>
+        pendingFlushes;
+    {
+        std::lock_guard<std::mutex> lock(
+            InteractionMutationMutex());
+        pendingFlushes.reserve(
+            PendingInteractionFlushTasks().size());
+        for (const auto& [configPath, flush] :
+             PendingInteractionFlushTasks()) {
+            if (PendingInteractionMutations().contains(configPath)) {
+                pendingFlushes.emplace_back(configPath, flush);
+            }
+        }
+    }
+    for (const auto& [configPath, flush] : pendingFlushes) {
+        if (!AsyncConfigWriter::Instance().Enqueue(
+                configPath, flush)) {
+            return false;
+        }
+    }
+    if (!AsyncConfigWriter::Instance().Drain(
+            timeoutMilliseconds)) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(
+        InteractionMutationMutex());
+    return PendingInteractionMutations().empty();
 }
 
 bool ConfigStore::FlushInteractionStateToDisk() const {
