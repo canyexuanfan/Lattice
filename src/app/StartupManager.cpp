@@ -1,6 +1,9 @@
 #include "app/StartupManager.h"
 
 #include <Windows.h>
+#include <shellapi.h>
+
+#include <vector>
 
 namespace {
 
@@ -29,15 +32,67 @@ bool StartupManager::IsEnabled() const {
 
     DWORD type = 0;
     DWORD byteCount = 0;
-    LONG result = RegQueryValueExW(key, kValueName, nullptr, &type, nullptr, &byteCount);
-    if (result == ERROR_FILE_NOT_FOUND) {
-        result = RegQueryValueExW(key, kLegacyValueName, nullptr, &type, nullptr, &byteCount);
+    LONG result = RegQueryValueExW(
+        key, kValueName, nullptr, &type, nullptr, &byteCount);
+    if (result != ERROR_SUCCESS ||
+        (type != REG_SZ && type != REG_EXPAND_SZ) ||
+        byteCount < sizeof(wchar_t)) {
+        RegCloseKey(key);
+        return false;
     }
-    if (result == ERROR_FILE_NOT_FOUND) {
-        result = RegQueryValueExW(key, kOldestValueName, nullptr, &type, nullptr, &byteCount);
-    }
+    std::vector<wchar_t> buffer(
+        static_cast<size_t>(byteCount / sizeof(wchar_t)) + 1, L'\0');
+    result = RegQueryValueExW(
+        key,
+        kValueName,
+        nullptr,
+        &type,
+        reinterpret_cast<BYTE*>(buffer.data()),
+        &byteCount);
     RegCloseKey(key);
-    return result == ERROR_SUCCESS && (type == REG_SZ || type == REG_EXPAND_SZ) && byteCount > sizeof(wchar_t);
+    if (result != ERROR_SUCCESS ||
+        (type != REG_SZ && type != REG_EXPAND_SZ)) {
+        return false;
+    }
+    buffer.back() = L'\0';
+    std::wstring command(buffer.data());
+    if (type == REG_EXPAND_SZ) {
+        const DWORD required = ExpandEnvironmentStringsW(
+            command.c_str(), nullptr, 0);
+        if (required == 0) {
+            return false;
+        }
+        std::wstring expanded(required, L'\0');
+        const DWORD copied = ExpandEnvironmentStringsW(
+            command.c_str(), expanded.data(), required);
+        if (copied == 0 || copied > required) {
+            return false;
+        }
+        expanded.resize(copied - 1);
+        command = std::move(expanded);
+    }
+    return CommandTargetsExecutable(command, CurrentExecutablePath());
+}
+
+bool StartupManager::CommandTargetsExecutable(
+    const std::wstring& command,
+    const std::wstring& executablePath) {
+    if (command.empty() || executablePath.empty()) {
+        return false;
+    }
+    int argumentCount = 0;
+    LPWSTR* arguments = CommandLineToArgvW(command.c_str(), &argumentCount);
+    if (arguments == nullptr) {
+        return false;
+    }
+    const bool matches =
+        argumentCount == 1 && arguments[0] != nullptr &&
+        CompareStringOrdinal(
+            arguments[0], -1,
+            executablePath.c_str(), -1,
+            TRUE) == CSTR_EQUAL;
+    LocalFree(arguments);
+    return matches;
 }
 
 bool StartupManager::SetEnabled(bool enabled) const {
@@ -59,6 +114,10 @@ bool StartupManager::SetEnabled(bool enabled) const {
     LONG result = ERROR_SUCCESS;
     if (enabled) {
         const std::wstring path = CurrentExecutablePath();
+        if (path.empty()) {
+            RegCloseKey(key);
+            return false;
+        }
         const std::wstring command = L"\"" + path + L"\"";
         result = RegSetValueExW(
             key,

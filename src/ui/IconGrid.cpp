@@ -282,6 +282,46 @@ int IconGrid::InsertionIndexForPoint(POINT point) const {
     return static_cast<int>(std::clamp<long long>(candidate, 0, itemCount));
 }
 
+int IconGrid::ReorderInsertionIndexForPoint(POINT point) const {
+    const int itemCount = static_cast<int>(items_.size());
+    const int width = bounds_.right - bounds_.left;
+    const int height = bounds_.bottom - bounds_.top;
+    if (width <= 0 || height <= 0 || itemCount == 0) {
+        return itemCount;
+    }
+    if (point.y < bounds_.top) {
+        return 0;
+    }
+    if (point.y >= bounds_.bottom) {
+        return itemCount;
+    }
+
+    const int columns = listMode_ ? 1 : std::max(1, width / cellWidth_);
+    const int layoutCellHeight = listMode_ ? 32 : cellHeight_;
+    const int contentY = point.y - bounds_.top + scrollOffset_;
+    const int row = std::max(0, contentY / layoutCellHeight);
+    int column = 0;
+    if (!listMode_) {
+        const int contentX = std::clamp(
+            static_cast<int>(point.x - bounds_.left),
+            0,
+            std::max(0, width - 1));
+        column = std::clamp(contentX / cellWidth_, 0, columns - 1);
+    }
+
+    const long long candidateValue =
+        static_cast<long long>(row) * columns + column;
+    if (candidateValue >= itemCount) {
+        return itemCount;
+    }
+    const int candidate = static_cast<int>(candidateValue);
+    const RECT cell = cells_[static_cast<size_t>(candidate)];
+    const bool after = listMode_
+        ? point.y >= cell.top + (cell.bottom - cell.top) / 2
+        : point.x >= cell.left + (cell.right - cell.left) / 2;
+    return std::clamp(candidate + (after ? 1 : 0), 0, itemCount);
+}
+
 void IconGrid::Draw(D2DContext& d2d, IconCache& iconCache) {
     lastFallbackDrawCount_ = 0;
     lastPlaceholderDrawCount_ = 0;

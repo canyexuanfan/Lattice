@@ -1,5 +1,8 @@
 #pragma once
 
+#include <Windows.h>
+
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -69,6 +72,24 @@ struct CategoryConfig {
     WindowConfig layout;
 };
 
+struct AutoOrganizeMembershipChange {
+    std::wstring itemId;
+    std::wstring identity;
+    std::wstring beforeCategoryId;
+    std::wstring afterCategoryId;
+    int beforeIndex = -1;
+    int afterIndex = -1;
+    bool itemWasRegistered = true;
+    ItemConfig registeredItem;
+};
+
+struct AutoOrganizeUndoRecord {
+    std::wstring transactionId;
+    std::uint64_t timestamp = 0;
+    std::vector<AutoOrganizeMembershipChange> changes;
+    std::vector<CategoryConfig> createdCategories;
+};
+
 struct AppConfig {
     AppSettings settings;
     WindowConfig window;
@@ -80,9 +101,70 @@ struct AppConfig {
     std::vector<DesktopPlacementConfig> desktopDisplayLayout;
     std::vector<std::wstring> uncategorizedItemIds;
     std::vector<CategoryConfig> categories;
+    std::vector<AutoOrganizeUndoRecord> autoOrganizeUndoHistory;
+};
+
+struct ConfiguredItemMembership {
+    std::wstring categoryId;
+    int index = -1;
+    int matchCount = 0;
+
+    bool IsAssigned() const noexcept { return matchCount > 0; }
+    bool IsUnique() const noexcept { return matchCount <= 1; }
+};
+
+template <typename Category>
+ConfiguredItemMembership FindConfiguredItemMembership(
+    const std::vector<std::wstring>& uncategorizedItemIds,
+    const std::vector<Category>& categories,
+    const std::wstring& itemId) {
+    ConfiguredItemMembership result;
+    const auto inspect = [&](const std::wstring& categoryId,
+                             const std::vector<std::wstring>& itemIds) {
+        for (std::size_t index = 0; index < itemIds.size(); ++index) {
+            if (itemIds[index] != itemId) continue;
+            result.categoryId = categoryId;
+            result.index = static_cast<int>(index);
+            ++result.matchCount;
+        }
+    };
+    inspect(L"uncategorized", uncategorizedItemIds);
+    for (const Category& category : categories) {
+        inspect(category.id, category.itemIds);
+    }
+    return result;
+}
+
+struct AutoOrganizeMoveRequest {
+    ItemConfig item;
+    std::wstring identity;
+    std::wstring expectedSourceCategoryId;
+    int expectedSourceIndex = -1;
+    std::wstring targetCategoryId;
+};
+
+struct AutoOrganizeApplyRequest {
+    std::wstring transactionId;
+    std::vector<AutoOrganizeMoveRequest> moves;
+    std::vector<CategoryConfig> newCategories;
+};
+
+struct AutoOrganizeTransactionResult {
+    std::uint64_t token = 0;
+    bool succeeded = false;
+    bool conflict = false;
+    int appliedChanges = 0;
+    int preservedChanges = 0;
+    std::wstring message;
 };
 
 std::wstring CategoryStorageFolder(const AppConfig& config, const std::wstring& categoryId);
+inline ConfiguredItemMembership FindConfiguredItemMembership(
+    const AppConfig& config,
+    const std::wstring& itemId) {
+    return FindConfiguredItemMembership(
+        config.uncategorizedItemIds, config.categories, itemId);
+}
 
 class ConfigStore {
 public:
@@ -105,6 +187,15 @@ public:
         const std::wstring& previousIdentity,
         const std::wstring& newIdentity,
         const std::wstring& newDisplayName) const;
+    bool ApplyAutoOrganizeAsync(
+        const AutoOrganizeApplyRequest& request,
+        HWND notificationWindow,
+        UINT notificationMessage,
+        std::uint64_t token) const;
+    bool UndoAutoOrganizeAsync(
+        HWND notificationWindow,
+        UINT notificationMessage,
+        std::uint64_t token) const;
     static bool DrainPendingWrites(unsigned long timeoutMilliseconds);
     bool ExportAppConfig(const std::wstring& path) const;
     bool ImportAppConfig(const std::wstring& path) const;

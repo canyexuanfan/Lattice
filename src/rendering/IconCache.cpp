@@ -1146,6 +1146,11 @@ size_t IconCache::Size() const noexcept {
     return cache_.size();
 }
 
+size_t IconCache::Capacity() const noexcept {
+    std::lock_guard<std::mutex> lock(cacheMutex_);
+    return capacity_;
+}
+
 void IconCache::SetCapacity(size_t capacity) {
     std::scoped_lock lock(cacheMutex_, asyncState_->mutex);
     capacity_ = std::max<size_t>(64, capacity);

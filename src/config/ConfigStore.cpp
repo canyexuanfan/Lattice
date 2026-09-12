@@ -10,12 +10,14 @@
 #include <fstream>
 #include <functional>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <sstream>
 #include <string>
 #include <thread>
 #include <utility>
 
+#include "organize/AutoOrganizeTransaction.h"
 #include "util/PathUtil.h"
 #include "util/StringUtil.h"
 
@@ -24,6 +26,16 @@ namespace {
 int ParseInt(const std::wstring& value, int fallback) {
     try {
         return std::stoi(value);
+    } catch (...) {
+        return fallback;
+    }
+}
+
+std::uint64_t ParseUnsigned64(
+    const std::wstring& value,
+    std::uint64_t fallback) {
+    try {
+        return std::stoull(value);
     } catch (...) {
         return fallback;
     }
@@ -42,6 +54,14 @@ bool ParseBool(const std::wstring& value, bool fallback) {
 bool IsRegularFile(const std::wstring& path) {
     const DWORD attributes = GetFileAttributesW(path.c_str());
     return attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0;
+}
+
+bool ShouldInjectSmokeConfigWriteFailure(const std::wstring& path) {
+    wchar_t enabled[2]{};
+    return GetEnvironmentVariableW(
+               L"LATTICE_SMOKE_FAIL_CONFIG_WRITE", enabled,
+               ARRAYSIZE(enabled)) == 1 && enabled[0] == L'1' &&
+        ToLowerCopy(path).find(L"\\smoke-runs\\") != std::wstring::npos;
 }
 
 void MigrateLegacyConfigDirectory(
@@ -1039,6 +1059,131 @@ AppConfig ConfigStore::LoadAppConfigFromDisk() const {
         }
         config.categories.push_back(std::move(category));
     }
+
+    const int undoCount = std::clamp(
+        readInt(L"autoOrganize.undo.count", 0), 0, 10);
+    for (int undoIndex = 0; undoIndex < undoCount; ++undoIndex) {
+        const std::wstring prefix = L"autoOrganize.undo." +
+            std::to_wstring(undoIndex) + L".";
+        const auto transactionIt = values.find(prefix + L"transactionId");
+        if (transactionIt == values.end() || transactionIt->second.empty()) {
+            continue;
+        }
+        AutoOrganizeUndoRecord record;
+        record.transactionId = transactionIt->second;
+        const auto timestampIt = values.find(prefix + L"timestamp");
+        if (timestampIt != values.end()) {
+            record.timestamp = ParseUnsigned64(timestampIt->second, 0);
+        }
+        const int changeCount = std::clamp(
+            readInt(prefix + L"change.count", 0), 0, 4096);
+        for (int changeIndex = 0; changeIndex < changeCount; ++changeIndex) {
+            const std::wstring changePrefix = prefix + L"change." +
+                std::to_wstring(changeIndex) + L".";
+            const auto itemIdIt = values.find(changePrefix + L"itemId");
+            const auto identityIt = values.find(changePrefix + L"identity");
+            if (itemIdIt == values.end() || itemIdIt->second.empty() ||
+                identityIt == values.end() || identityIt->second.empty()) {
+                continue;
+            }
+            AutoOrganizeMembershipChange change;
+            change.itemId = itemIdIt->second;
+            change.identity = identityIt->second;
+            const auto readText = [&](const std::wstring& key) {
+                const auto found = values.find(changePrefix + key);
+                return found == values.end() ? std::wstring{} : found->second;
+            };
+            change.beforeCategoryId = readText(L"beforeCategoryId");
+            change.afterCategoryId = readText(L"afterCategoryId");
+            change.beforeIndex = readInt(changePrefix + L"beforeIndex", -1);
+            change.afterIndex = readInt(changePrefix + L"afterIndex", -1);
+            change.itemWasRegistered = readBool(
+                changePrefix + L"itemWasRegistered", true);
+            ItemConfig& item = change.registeredItem;
+            item.id = change.itemId;
+            item.path = readText(L"registered.path");
+            item.displayName = readText(L"registered.displayName");
+            item.originalDesktopPath = readText(L"registered.originalDesktopPath");
+            item.desktopX = readInt(changePrefix + L"registered.desktopX", 0);
+            item.desktopY = readInt(changePrefix + L"registered.desktopY", 0);
+            item.hasDesktopPosition = readBool(
+                changePrefix + L"registered.hasDesktopPosition", false);
+            item.desktopVisibilityMode = readInt(
+                changePrefix + L"registered.desktopVisibilityMode", 0);
+            item.desktopVisibilityOriginalFlags = readInt(
+                changePrefix + L"registered.desktopVisibilityOriginalFlags", 0);
+            item.desktopVisibilityNewStartValue = readInt(
+                changePrefix + L"registered.desktopVisibilityNewStartValue", -1);
+            item.desktopVisibilityClassicValue = readInt(
+                changePrefix + L"registered.desktopVisibilityClassicValue", -1);
+            record.changes.push_back(std::move(change));
+        }
+        const int createdCount = std::clamp(
+            readInt(prefix + L"created.count", 0), 0, 256);
+        for (int createdIndex = 0; createdIndex < createdCount; ++createdIndex) {
+            const std::wstring createdPrefix = prefix + L"created." +
+                std::to_wstring(createdIndex) + L".";
+            const auto idIt = values.find(createdPrefix + L"id");
+            const auto nameIt = values.find(createdPrefix + L"name");
+            if (idIt == values.end() || idIt->second.empty() ||
+                nameIt == values.end() || nameIt->second.empty()) {
+                continue;
+            }
+            const auto readCreatedText = [&](const std::wstring& key) {
+                const auto found = values.find(createdPrefix + key);
+                return found == values.end() ? std::wstring{} : found->second;
+            };
+            CategoryConfig created;
+            created.id = idIt->second;
+            created.name = nameIt->second;
+            created.storageFolder = readCreatedText(L"storageFolder");
+            created.color = readCreatedText(L"color");
+            created.icon = readCreatedText(L"icon");
+            created.tileCollapsed = readBool(
+                createdPrefix + L"tileCollapsed", false);
+            created.layout.x = readInt(createdPrefix + L"x", created.layout.x);
+            created.layout.y = readInt(createdPrefix + L"y", created.layout.y);
+            created.layout.width = readInt(
+                createdPrefix + L"width", created.layout.width);
+            created.layout.height = readInt(
+                createdPrefix + L"height", created.layout.height);
+            created.layout.opacity = readInt(
+                createdPrefix + L"opacity", created.layout.opacity);
+            created.layout.normalHeight = readInt(
+                createdPrefix + L"normalHeight", created.layout.normalHeight);
+            created.layout.iconSize = readInt(
+                createdPrefix + L"iconSize", created.layout.iconSize);
+            created.layout.density = readInt(
+                createdPrefix + L"density", created.layout.density);
+            created.layout.viewMode = readInt(
+                createdPrefix + L"viewMode", created.layout.viewMode);
+            created.layout.contentViewMode = readInt(
+                createdPrefix + L"contentViewMode", created.layout.contentViewMode);
+            created.layout.sortMode = readInt(
+                createdPrefix + L"sortMode", created.layout.sortMode);
+            created.layout.tabSide = readInt(
+                createdPrefix + L"tabSide", created.layout.tabSide);
+            created.layout.titleOpacity = readInt(
+                createdPrefix + L"titleOpacity", created.layout.titleOpacity);
+            created.layout.dpi = readInt(
+                createdPrefix + L"dpi", created.layout.dpi);
+            created.layout.monitorId = readCreatedText(L"monitorId");
+            created.layout.collapsed = readBool(
+                createdPrefix + L"collapsed", created.layout.collapsed);
+            created.layout.locked = readBool(
+                createdPrefix + L"locked", created.layout.locked);
+            created.layout.showBorder = readBool(
+                createdPrefix + L"showBorder", created.layout.showBorder);
+            created.layout.autoArrange = readBool(
+                createdPrefix + L"autoArrange", created.layout.autoArrange);
+            created.layout.fixedExpanded = readBool(
+                createdPrefix + L"fixedExpanded", created.layout.fixedExpanded);
+            record.createdCategories.push_back(std::move(created));
+        }
+        if (!record.changes.empty()) {
+            config.autoOrganizeUndoHistory.push_back(std::move(record));
+        }
+    }
     return config;
 }
 
@@ -1263,6 +1408,104 @@ bool ConfigStore::SaveShellRenameAsync(
     return true;
 }
 
+bool ConfigStore::ApplyAutoOrganizeAsync(
+    const AutoOrganizeApplyRequest& request,
+    HWND notificationWindow,
+    UINT notificationMessage,
+    std::uint64_t token) const {
+    if (request.transactionId.empty() || notificationMessage == 0) {
+        return false;
+    }
+    const ConfigStore store = *this;
+    const std::wstring jobKey = configPath_ + L"\x1fauto-organize-apply:" +
+        request.transactionId;
+    return AsyncConfigWriter::Instance().Enqueue(
+        jobKey,
+        [store, request, notificationWindow, notificationMessage, token]() {
+            auto result = std::make_unique<AutoOrganizeTransactionResult>();
+            result->token = token;
+            bool writerSucceeded = true;
+            {
+                std::lock_guard<std::mutex> fileLock(ConfigFileWriteMutex());
+                const std::vector<InteractionMutation> mutations =
+                    SnapshotInteractionMutations(store.configPath_);
+                AppConfig current = store.LoadAppConfigFromDisk();
+                ApplyInteractionMutations(mutations, current);
+                AppConfig candidate;
+                if (lattice::organize::ApplyAutoOrganizeTransaction(
+                        current, request, candidate, *result)) {
+                    if (!store.SaveAppConfigToDisk(candidate)) {
+                        result->succeeded = false;
+                        result->conflict = false;
+                        result->message =
+                            L"配置写入失败，未应用任何调整。";
+                        writerSucceeded = false;
+                    } else {
+                        RemoveAppliedInteractionMutations(
+                            store.configPath_, mutations);
+                    }
+                }
+            }
+            // Pure transaction helpers reset the result structure so stale
+            // fields never leak across calls. Restore the async correlation
+            // token only after that boundary.
+            result->token = token;
+            if (notificationWindow != nullptr &&
+                IsWindow(notificationWindow) != FALSE &&
+                PostMessageW(notificationWindow, notificationMessage, 0,
+                    reinterpret_cast<LPARAM>(result.get())) != FALSE) {
+                result.release();
+            }
+            return writerSucceeded;
+        });
+}
+
+bool ConfigStore::UndoAutoOrganizeAsync(
+    HWND notificationWindow,
+    UINT notificationMessage,
+    std::uint64_t token) const {
+    if (notificationMessage == 0) return false;
+    const ConfigStore store = *this;
+    const std::wstring jobKey = configPath_ + L"\x1fauto-organize-undo:" +
+        std::to_wstring(token);
+    return AsyncConfigWriter::Instance().Enqueue(
+        jobKey,
+        [store, notificationWindow, notificationMessage, token]() {
+            auto result = std::make_unique<AutoOrganizeTransactionResult>();
+            result->token = token;
+            bool writerSucceeded = true;
+            {
+                std::lock_guard<std::mutex> fileLock(ConfigFileWriteMutex());
+                const std::vector<InteractionMutation> mutations =
+                    SnapshotInteractionMutations(store.configPath_);
+                AppConfig current = store.LoadAppConfigFromDisk();
+                ApplyInteractionMutations(mutations, current);
+                AppConfig candidate;
+                if (lattice::organize::UndoLastAutoOrganizeTransaction(
+                        current, candidate, *result)) {
+                    if (!store.SaveAppConfigToDisk(candidate)) {
+                        result->succeeded = false;
+                        result->conflict = false;
+                        result->message =
+                            L"撤销写入失败，当前配置保持不变。";
+                        writerSucceeded = false;
+                    } else {
+                        RemoveAppliedInteractionMutations(
+                            store.configPath_, mutations);
+                    }
+                }
+            }
+            result->token = token;
+            if (notificationWindow != nullptr &&
+                IsWindow(notificationWindow) != FALSE &&
+                PostMessageW(notificationWindow, notificationMessage, 0,
+                    reinterpret_cast<LPARAM>(result.get())) != FALSE) {
+                result.release();
+            }
+            return writerSucceeded;
+        });
+}
+
 bool ConfigStore::DrainPendingWrites(unsigned long timeoutMilliseconds) {
     std::vector<std::pair<std::wstring, std::function<bool()>>>
         pendingFlushes;
@@ -1310,8 +1553,9 @@ bool ConfigStore::FlushInteractionStateToDisk() const {
 }
 
 bool ConfigStore::SaveAppConfigToDisk(const AppConfig& config) const {
+    if (ShouldInjectSmokeConfigWriteFailure(configPath_)) return false;
     std::ostringstream output;
-    output << "schemaVersion=12\n";
+    output << "schemaVersion=13\n";
     output << "settings.launchOnStartup=" << (config.settings.launchOnStartup ? 1 : 0) << "\n";
     output << "settings.showPublicDesktopItems=" << (config.settings.showPublicDesktopItems ? 1 : 0) << "\n";
     output << "settings.restoreHiddenState=" << (config.settings.restoreHiddenState ? 1 : 0) << "\n";
@@ -1416,6 +1660,113 @@ bool ConfigStore::SaveAppConfigToDisk(const AppConfig& config) const {
         output << "category." << index << ".item.count=" << category.itemIds.size() << "\n";
         for (size_t itemIndex = 0; itemIndex < category.itemIds.size(); ++itemIndex) {
             output << "category." << index << ".item." << itemIndex << "=" << WideToUtf8(category.itemIds[itemIndex]) << "\n";
+        }
+    }
+
+    const std::size_t undoStart = config.autoOrganizeUndoHistory.size() > 10
+        ? config.autoOrganizeUndoHistory.size() - 10 : 0;
+    output << "autoOrganize.undo.count="
+           << config.autoOrganizeUndoHistory.size() - undoStart << "\n";
+    for (std::size_t sourceIndex = undoStart, undoIndex = 0;
+         sourceIndex < config.autoOrganizeUndoHistory.size();
+         ++sourceIndex, ++undoIndex) {
+        const AutoOrganizeUndoRecord& record =
+            config.autoOrganizeUndoHistory[sourceIndex];
+        const std::string prefix = "autoOrganize.undo." +
+            std::to_string(undoIndex) + ".";
+        output << prefix << "transactionId="
+               << WideToUtf8(record.transactionId) << "\n";
+        output << prefix << "timestamp=" << record.timestamp << "\n";
+        output << prefix << "change.count=" << record.changes.size() << "\n";
+        for (std::size_t changeIndex = 0;
+             changeIndex < record.changes.size(); ++changeIndex) {
+            const AutoOrganizeMembershipChange& change =
+                record.changes[changeIndex];
+            const std::string changePrefix = prefix + "change." +
+                std::to_string(changeIndex) + ".";
+            output << changePrefix << "itemId="
+                   << WideToUtf8(change.itemId) << "\n";
+            output << changePrefix << "identity="
+                   << WideToUtf8(change.identity) << "\n";
+            output << changePrefix << "beforeCategoryId="
+                   << WideToUtf8(change.beforeCategoryId) << "\n";
+            output << changePrefix << "afterCategoryId="
+                   << WideToUtf8(change.afterCategoryId) << "\n";
+            output << changePrefix << "beforeIndex="
+                   << change.beforeIndex << "\n";
+            output << changePrefix << "afterIndex="
+                   << change.afterIndex << "\n";
+            output << changePrefix << "itemWasRegistered="
+                   << (change.itemWasRegistered ? 1 : 0) << "\n";
+            const ItemConfig& item = change.registeredItem;
+            output << changePrefix << "registered.path="
+                   << WideToUtf8(item.path) << "\n";
+            output << changePrefix << "registered.displayName="
+                   << WideToUtf8(item.displayName) << "\n";
+            output << changePrefix << "registered.originalDesktopPath="
+                   << WideToUtf8(item.originalDesktopPath) << "\n";
+            output << changePrefix << "registered.desktopX="
+                   << item.desktopX << "\n";
+            output << changePrefix << "registered.desktopY="
+                   << item.desktopY << "\n";
+            output << changePrefix << "registered.hasDesktopPosition="
+                   << (item.hasDesktopPosition ? 1 : 0) << "\n";
+            output << changePrefix << "registered.desktopVisibilityMode="
+                   << item.desktopVisibilityMode << "\n";
+            output << changePrefix << "registered.desktopVisibilityOriginalFlags="
+                   << item.desktopVisibilityOriginalFlags << "\n";
+            output << changePrefix << "registered.desktopVisibilityNewStartValue="
+                   << item.desktopVisibilityNewStartValue << "\n";
+            output << changePrefix << "registered.desktopVisibilityClassicValue="
+                   << item.desktopVisibilityClassicValue << "\n";
+        }
+        output << prefix << "created.count="
+               << record.createdCategories.size() << "\n";
+        for (std::size_t createdIndex = 0;
+             createdIndex < record.createdCategories.size(); ++createdIndex) {
+            const CategoryConfig& created =
+                record.createdCategories[createdIndex];
+            const std::string createdPrefix = prefix + "created." +
+                std::to_string(createdIndex) + ".";
+            output << createdPrefix << "id=" << WideToUtf8(created.id) << "\n";
+            output << createdPrefix << "name=" << WideToUtf8(created.name) << "\n";
+            output << createdPrefix << "storageFolder="
+                   << WideToUtf8(created.storageFolder) << "\n";
+            output << createdPrefix << "color=" << WideToUtf8(created.color) << "\n";
+            output << createdPrefix << "icon=" << WideToUtf8(created.icon) << "\n";
+            output << createdPrefix << "tileCollapsed="
+                   << (created.tileCollapsed ? 1 : 0) << "\n";
+            output << createdPrefix << "x=" << created.layout.x << "\n";
+            output << createdPrefix << "y=" << created.layout.y << "\n";
+            output << createdPrefix << "width=" << created.layout.width << "\n";
+            output << createdPrefix << "height=" << created.layout.height << "\n";
+            output << createdPrefix << "opacity=" << created.layout.opacity << "\n";
+            output << createdPrefix << "normalHeight="
+                   << created.layout.normalHeight << "\n";
+            output << createdPrefix << "iconSize="
+                   << created.layout.iconSize << "\n";
+            output << createdPrefix << "density=" << created.layout.density << "\n";
+            output << createdPrefix << "viewMode=" << created.layout.viewMode << "\n";
+            output << createdPrefix << "contentViewMode="
+                   << created.layout.contentViewMode << "\n";
+            output << createdPrefix << "sortMode="
+                   << created.layout.sortMode << "\n";
+            output << createdPrefix << "tabSide=" << created.layout.tabSide << "\n";
+            output << createdPrefix << "titleOpacity="
+                   << created.layout.titleOpacity << "\n";
+            output << createdPrefix << "dpi=" << created.layout.dpi << "\n";
+            output << createdPrefix << "monitorId="
+                   << WideToUtf8(created.layout.monitorId) << "\n";
+            output << createdPrefix << "collapsed="
+                   << (created.layout.collapsed ? 1 : 0) << "\n";
+            output << createdPrefix << "locked="
+                   << (created.layout.locked ? 1 : 0) << "\n";
+            output << createdPrefix << "showBorder="
+                   << (created.layout.showBorder ? 1 : 0) << "\n";
+            output << createdPrefix << "autoArrange="
+                   << (created.layout.autoArrange ? 1 : 0) << "\n";
+            output << createdPrefix << "fixedExpanded="
+                   << (created.layout.fixedExpanded ? 1 : 0) << "\n";
         }
     }
 

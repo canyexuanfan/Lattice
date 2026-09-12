@@ -21,6 +21,7 @@
 #include "rendering/IconCache.h"
 #include "shell/ShellLauncher.h"
 #include "ui/IconGrid.h"
+#include "ui/AutoOrganizePreviewWindow.h"
 #include "ui/DesktopSurfaceWindow.h"
 #include "ui/SettingsDialog.h"
 #include "ui/WidgetWindow.h"
@@ -77,11 +78,27 @@ private:
     void ToggleAllVisible();
     void ToggleAllLocked();
     void ToggleStartup();
+    AppSettings SettingsForDialog() const;
     void RefreshSearchQuery();
     void LayoutSearchEdit();
     void ShowTrayMenu();
     void OpenAllCategoryWidgets();
     void ShowSettings();
+    void ShowAutoOrganizePreview();
+    void UndoLastAutoOrganize();
+    AutoOrganizePreviewInput BuildAutoOrganizePreviewInput() const;
+    AutoOrganizeApplyRequest BuildAutoOrganizeApplyRequest(
+        const lattice::organize::Plan& plan,
+        const lattice::organize::LayoutPlan& layout) const;
+    void ApplyAutoOrganizePlan(
+        const lattice::organize::Plan& plan,
+        const lattice::organize::LayoutPlan& layout,
+        HWND sourceWindow);
+    void HandleAutoOrganizeTransactionResult(
+        AutoOrganizeTransactionResult* rawResult);
+    bool PublishReloadedOrganizerState(
+        const std::vector<std::wstring>& newCategoryIds);
+    void ApplyLiveSettings(bool publicDesktopChanged);
     void ExportConfig();
     void ImportConfig();
     void OpenCurrentCategoryWidget();
@@ -197,6 +214,7 @@ private:
     int hoverTabIndex_ = -1;
     int hoverButtonIndex_ = -1;
     std::vector<std::unique_ptr<WidgetWindow>> widgetWindows_;
+    std::unique_ptr<AutoOrganizePreviewWindow> autoOrganizePreview_;
     std::unique_ptr<DesktopSurfaceWindow> desktopSurface_;
     std::vector<TileView> tileViews_;
     std::unordered_map<std::wstring, bool> tileCollapsed_;
@@ -210,4 +228,13 @@ private:
     bool normalExitInProgress_ = false;
     bool normalExitCompleted_ = false;
     std::wstring lastNormalExitError_;
+    enum class AutoOrganizeOperation {
+        None,
+        Apply,
+        Undo,
+        Rollback,
+    };
+    AutoOrganizeOperation autoOrganizeOperation_ = AutoOrganizeOperation::None;
+    std::uint64_t autoOrganizeOperationToken_ = 0;
+    std::vector<std::wstring> pendingAutoOrganizeCategoryIds_;
 };

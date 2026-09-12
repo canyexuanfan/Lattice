@@ -33,6 +33,7 @@ public:
     int HitTest(POINT point) const;
     int SlotIndexForPoint(POINT point) const;
     int InsertionIndexForPoint(POINT point) const;
+    int ReorderInsertionIndexForPoint(POINT point) const;
     void Draw(D2DContext& d2d, IconCache& iconCache);
 
     const DesktopItem* ItemAt(size_t index) const;
@@ -46,6 +47,7 @@ public:
     size_t LastPlaceholderDrawCount() const noexcept {
         return lastPlaceholderDrawCount_;
     }
+    bool UsesLightTheme() const noexcept { return lightTheme_; }
 
 private:
     void RecalculateLayout();

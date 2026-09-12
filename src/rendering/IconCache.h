@@ -55,6 +55,7 @@ public:
         int shellImageLogicalSize = 0);
     void Clear();
     size_t Size() const noexcept;
+    size_t Capacity() const noexcept;
     void SetCapacity(size_t capacity);
     void SetInvalidateCallback(std::function<void()> callback);
 

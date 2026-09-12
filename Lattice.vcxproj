@@ -142,6 +142,9 @@
     <ClCompile Include="src\rendering\D2DContext.cpp" />
     <ClCompile Include="src\rendering\IconCache.cpp" />
     <ClCompile Include="src\rendering\WallpaperBackdrop.cpp" />
+    <ClCompile Include="src\organize\AutoOrganizer.cpp" />
+    <ClCompile Include="src\organize\AutoOrganizeLayout.cpp" />
+    <ClCompile Include="src\organize\AutoOrganizeTransaction.cpp" />
     <ClCompile Include="src\shell\ShellLauncher.cpp" />
     <ClCompile Include="src\shell\ShellDragDrop.cpp" />
     <ClCompile Include="src\shell\ShellItemReference.cpp" />
@@ -151,6 +154,7 @@
       <ExcludedFromBuild Condition="'$(Configuration)'=='ReleaseOffline'">true</ExcludedFromBuild>
     </ClCompile>
     <ClCompile Include="src\ui\DragGhostWindow.cpp" />
+    <ClCompile Include="src\ui\AutoOrganizePreviewWindow.cpp" />
     <ClCompile Include="src\ui\DesktopSurfaceWindow.cpp" />
     <ClCompile Include="src\ui\IconGrid.cpp" />
     <ClCompile Include="src\ui\InputDialog.cpp" />
@@ -187,6 +191,7 @@
     <ClInclude Include="src\shell\ShellDropTarget.h" />
     <ClInclude Include="src\testing\SmokeCommands.h" />
     <ClInclude Include="src\ui\DragGhostWindow.h" />
+    <ClInclude Include="src\ui\AutoOrganizePreviewWindow.h" />
     <ClInclude Include="src\ui\DesktopSurfaceWindow.h" />
     <ClInclude Include="src\ui\IconGrid.h" />
     <ClInclude Include="src\ui\InputDialog.h" />
@@ -195,6 +200,9 @@
     <ClInclude Include="src\ui\SettingsDialog.h" />
     <ClInclude Include="src\ui\WidgetWindow.h" />
     <ClInclude Include="src\model\OrganizerModel.h" />
+    <ClInclude Include="src\organize\AutoOrganizer.h" />
+    <ClInclude Include="src\organize\AutoOrganizeLayout.h" />
+    <ClInclude Include="src\organize\AutoOrganizeTransaction.h" />
     <ClInclude Include="src\util\ComInit.h" />
     <ClInclude Include="src\util\PathUtil.h" />
     <ClInclude Include="src\util\StringUtil.h" />

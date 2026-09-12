@@ -181,6 +181,20 @@ void DesktopScanner::MergeRegisteredItem(
         existing = items.end();
     }
     if (existing == items.end()) {
+        existing = std::find_if(
+            items.begin(),
+            items.end(),
+            [&](const DesktopItem& item) {
+                return CompareStringOrdinal(
+                           item.path.c_str(), -1,
+                           path.c_str(), -1,
+                           TRUE) == CSTR_EQUAL;
+            });
+        if (existing != items.end()) {
+            existing->id = itemId;
+        }
+    }
+    if (existing == items.end()) {
         DesktopItem registered = CreateItemFromPath(path);
         registered.id = itemId;
         items.push_back(std::move(registered));

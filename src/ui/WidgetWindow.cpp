@@ -18,6 +18,7 @@
 #include "desktop/DesktopPlacementCoordinator.h"
 #include "desktop/CategoryStorageManager.h"
 #include "app/resource.h"
+#include "app/StartupManager.h"
 #include "model/OrganizerModel.h"
 #include "shell/ShellDragDrop.h"
 #include "shell/ShellDropTarget.h"
@@ -49,7 +50,7 @@ constexpr UINT_PTR kShellMutationCleanupTimerId = 7;
 constexpr UINT kShellMutationCleanupDelayMilliseconds = 500;
 constexpr unsigned int kMaximumShellMutationCleanupAttempts = 20;
 constexpr wchar_t kAlignmentGuideClassName[] = L"Lattice.AlignmentGuide";
-constexpr wchar_t kCurrentVersion[] = L"0.4.50";
+constexpr wchar_t kCurrentVersion[] = L"0.4.57";
 constexpr UINT kShellNewCommandFirst = 0x5000;
 constexpr UINT kShellNewCommandLast = 0x5FFF;
 
@@ -698,6 +699,10 @@ LRESULT WidgetWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) 
 
         case WM_SETTINGCHANGE:
         case WM_THEMECHANGED:
+            if (theme_ == 2) {
+                iconGrid_.SetLightTheme(UseLightTheme(theme_));
+                InvalidateRect(hwnd_, nullptr, FALSE);
+            }
             ScheduleWallpaperBackdropRefresh();
             return 0;
 
@@ -866,7 +871,10 @@ LRESULT WidgetWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) 
                     draggingItemId_ = dragItem->id;
                     draggingSelectionIds_ =
                         SelectedItemIdsInVisibleOrder();
-                    dragTargetIndex_ = iconIndex;
+                    dragInsertionIndex_ = static_cast<int>(
+                        NormalizeReorderInsertionIndex(
+                            static_cast<size_t>(
+                                iconGrid_.ReorderInsertionIndexForPoint(point))));
                     dragStartPoint_ = point;
                     const bool shortcut =
                         dragItem->kind == DesktopItemKind::Shortcut ||
@@ -2313,31 +2321,6 @@ bool WidgetWindow::FlushPendingInteractionSave() {
     return true;
 }
 
-void WidgetWindow::ReorderItem(size_t fromIndex, size_t toIndex) {
-    if (fromIndex >= currentItems_.size() || toIndex >= currentItems_.size() || fromIndex == toIndex) {
-        return;
-    }
-    windowConfig_.autoArrange = false;
-    windowConfig_.sortMode = 0;
-    DesktopItem moving = currentItems_[fromIndex];
-    currentItems_.erase(currentItems_.begin() + static_cast<std::ptrdiff_t>(fromIndex));
-    currentItems_.insert(
-        currentItems_.begin() + static_cast<std::ptrdiff_t>(std::min(toIndex, currentItems_.size())),
-        std::move(moving));
-    iconGrid_.SetItems(currentItems_);
-    SyncSelectionToGrid();
-    pendingLayout_ = windowConfig_;
-    pendingOrderIds_.clear();
-    pendingOrderIds_.reserve(currentItems_.size());
-    for (const DesktopItem& item : currentItems_) {
-        pendingOrderIds_.push_back(item.id);
-    }
-    pendingOrderValid_ = true;
-    interactionSavePending_ = true;
-    ScheduleInteractionSave();
-    InvalidateRect(hwnd_, nullptr, FALSE);
-}
-
 void WidgetWindow::ToggleCollapsed() {
     if (windowConfig_.fixedExpanded && !windowConfig_.collapsed) {
         return;
@@ -2759,6 +2742,8 @@ void WidgetWindow::ShowBackgroundMenu(POINT screenPoint) {
     constexpr int kFeedbackCommand = 35;
     constexpr int kPersonalCenterCommand = 36;
     constexpr int kCheckUpdateCommand = 37;
+    constexpr int kAutoOrganizeCommand = 38;
+    constexpr int kUndoAutoOrganizeCommand = 39;
 
     HMENU menu = CreatePopupMenu();
     HMENU shellRootMenu = nullptr;
@@ -2786,6 +2771,12 @@ void WidgetWindow::ShowBackgroundMenu(POINT screenPoint) {
     AppendMenuW(sortMenu, MF_STRING | (windowConfig_.sortMode == 3 ? MF_CHECKED : 0), kSortModifiedCommand, L"修改时间");
     AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(sortMenu), L"排序方式(O)");
     AppendMenuW(menu, MF_STRING, kRefreshCommand, L"刷新(E)");
+    AppendMenuW(menu, MF_STRING, kAutoOrganizeCommand, L"自动整理桌面…");
+    AppendMenuW(
+        menu,
+        currentConfig.autoOrganizeUndoHistory.empty() ? MF_GRAYED : MF_STRING,
+        kUndoAutoOrganizeCommand,
+        L"撤销上次自动整理");
     AppendMenuW(menu, pasteState, kPasteCommand, L"粘贴(P)");
     AppendMenuW(menu, pasteState, kPasteShortcutCommand, L"粘贴快捷方式(S)");
 
@@ -2862,7 +2853,7 @@ void WidgetWindow::ShowBackgroundMenu(POINT screenPoint) {
     HMENU settingsMenu = CreatePopupMenu();
     AppendMenuW(
         settingsMenu,
-        MF_STRING | (currentConfig.settings.launchOnStartup ? MF_CHECKED : 0),
+        MF_STRING | (StartupManager{}.IsEnabled() ? MF_CHECKED : 0),
         kToggleStartupCommand,
         L"开机自启");
     AppendMenuW(settingsMenu, MF_STRING, kExportConfigCommand, L"导出全部配置...");
@@ -2918,6 +2909,16 @@ void WidgetWindow::ShowBackgroundMenu(POINT screenPoint) {
     } else if (command == kRefreshCommand) {
         LoadItems();
         InvalidateRect(hwnd_, nullptr, FALSE);
+    } else if (command == kAutoOrganizeCommand && owner_ != nullptr) {
+        SendMessageW(
+            owner_, kWidgetHostCommandMessage,
+            static_cast<WPARAM>(WidgetHostCommand::AutoOrganize),
+            reinterpret_cast<LPARAM>(hwnd_));
+    } else if (command == kUndoAutoOrganizeCommand && owner_ != nullptr) {
+        SendMessageW(
+            owner_, kWidgetHostCommandMessage,
+            static_cast<WPARAM>(WidgetHostCommand::UndoAutoOrganize),
+            reinterpret_cast<LPARAM>(hwnd_));
     } else if (command == kPasteCommand || command == kPasteShortcutCommand) {
         PasteClipboardShortcuts();
     } else if (command == kFeedbackCommand) {
@@ -3283,17 +3284,21 @@ bool WidgetWindow::UpdateIconDrag(POINT pixelPoint) {
 
     const RECT gridBounds = GridBounds();
     if (PtInRect(&gridBounds, point) != FALSE) {
-        const int nextTarget = iconGrid_.SlotIndexForPoint(point);
-        if (nextTarget != dragTargetIndex_) {
-            dragTargetIndex_ = nextTarget;
-            iconGrid_.SetHoverIndex(nextTarget);
+        const int rawInsertionIndex =
+            iconGrid_.ReorderInsertionIndexForPoint(point);
+        const int nextInsertionIndex = static_cast<int>(
+            NormalizeReorderInsertionIndex(
+                static_cast<size_t>(rawInsertionIndex)));
+        if (nextInsertionIndex != dragInsertionIndex_) {
+            dragInsertionIndex_ = nextInsertionIndex;
+            iconGrid_.SetHoverIndex(-1);
             InvalidateRect(hwnd_, nullptr, FALSE);
         }
         return true;
     }
 
-    const bool targetChanged = dragTargetIndex_ != -1;
-    dragTargetIndex_ = -1;
+    const bool targetChanged = dragInsertionIndex_ != -1;
+    dragInsertionIndex_ = -1;
     const bool hoverChanged = iconGrid_.SetHoverIndex(-1);
     if (targetChanged || hoverChanged) {
         InvalidateRect(hwnd_, nullptr, FALSE);
@@ -3341,8 +3346,12 @@ void WidgetWindow::FinishIconDrag(POINT pixelPoint) {
     WidgetWindow* targetWidget = droppedInside
         ? nullptr
         : DropTargetWidgetAtScreenPoint(cursorScreenPoint);
-    const int targetIndex = droppedInside
-        ? (dragTargetIndex_ >= 0 ? dragTargetIndex_ : iconGrid_.SlotIndexForPoint(point))
+    const int insertionIndex = droppedInside
+        ? (dragInsertionIndex_ >= 0
+            ? dragInsertionIndex_
+            : static_cast<int>(NormalizeReorderInsertionIndex(
+                static_cast<size_t>(
+                    iconGrid_.ReorderInsertionIndexForPoint(point)))))
         : -1;
     const bool completedDrag = dragVisualActive_;
     const std::uint64_t dragGhostGeneration =
@@ -3356,7 +3365,7 @@ void WidgetWindow::FinishIconDrag(POINT pixelPoint) {
     KillTimer(hwnd_, kIconDragTimerId);
     iconGrid_.SetDraggingIndex(-1);
     draggingIconIndex_ = -1;
-    dragTargetIndex_ = -1;
+    dragInsertionIndex_ = -1;
     iconGrid_.SetHoverIndex(-1);
     dragVisualActive_ = false;
     dragGhostGeneration_ = 0;
@@ -3415,9 +3424,9 @@ void WidgetWindow::FinishIconDrag(POINT pixelPoint) {
                         itemGhostGeneration);
                 }
             }
-        } else if (originIndex >= 0 && targetIndex >= 0) {
+        } else if (originIndex >= 0 && insertionIndex >= 0) {
             DragGhostWindow::Instance().EndIfGeneration(dragGhostGeneration);
-            ReorderSelectedItems(static_cast<size_t>(targetIndex));
+            ReorderSelectedItems(static_cast<size_t>(insertionIndex));
         } else {
             DragGhostWindow::Instance().EndIfGeneration(dragGhostGeneration);
         }
@@ -3438,7 +3447,7 @@ void WidgetWindow::CancelIconDrag() {
     ResetPointerSelection();
     iconGrid_.SetDraggingIndex(-1);
     draggingIconIndex_ = -1;
-    dragTargetIndex_ = -1;
+    dragInsertionIndex_ = -1;
     iconGrid_.SetHoverIndex(-1);
     if (GetCapture() == hwnd_) {
         ReleaseCapture();
@@ -3771,52 +3780,67 @@ void WidgetWindow::ResetPointerSelection() {
     pressedItemId_.clear();
 }
 
-void WidgetWindow::ReorderSelectedItems(size_t targetIndex) {
+size_t WidgetWindow::NormalizeReorderInsertionIndex(
+    size_t rawInsertionIndex) const {
+    rawInsertionIndex = std::min(rawInsertionIndex, currentItems_.size());
+    size_t selectedBeforeInsertion = 0;
+    size_t movingCount = 0;
+    for (size_t index = 0; index < currentItems_.size(); ++index) {
+        if (std::find(
+                draggingSelectionIds_.begin(),
+                draggingSelectionIds_.end(),
+                currentItems_[index].id) == draggingSelectionIds_.end()) {
+            continue;
+        }
+        ++movingCount;
+        if (index < rawInsertionIndex) {
+            ++selectedBeforeInsertion;
+        }
+    }
+    const size_t insertionIndex =
+        rawInsertionIndex - selectedBeforeInsertion;
+    return std::min(
+        insertionIndex,
+        currentItems_.size() - std::min(movingCount, currentItems_.size()));
+}
+
+void WidgetWindow::ReorderSelectedItems(size_t insertionIndex) {
     const std::vector<std::wstring> selected =
         SelectedItemIdsInVisibleOrder();
-    if (selected.empty() || targetIndex >= currentItems_.size()) {
+    if (selected.empty()) {
         return;
     }
-    if (selected.size() == 1) {
-        const auto source = std::find_if(
-            currentItems_.begin(), currentItems_.end(),
-            [&](const DesktopItem& item) {
-                return item.id == selected.front();
-            });
-        if (source != currentItems_.end()) {
-            ReorderItem(
-                static_cast<size_t>(
-                    std::distance(currentItems_.begin(), source)),
-                targetIndex);
-        }
-        return;
+    std::vector<size_t> movingIndices;
+    std::vector<size_t> remainingIndices;
+    movingIndices.reserve(selected.size());
+    remainingIndices.reserve(currentItems_.size() - selected.size());
+    for (size_t index = 0; index < currentItems_.size(); ++index) {
+        (IsItemSelected(currentItems_[index].id)
+             ? movingIndices
+             : remainingIndices).push_back(index);
     }
-    const std::wstring targetId = currentItems_[targetIndex].id;
-    if (IsItemSelected(targetId)) {
-        return;
-    }
-    std::vector<DesktopItem> moving;
-    std::vector<DesktopItem> remaining;
-    moving.reserve(selected.size());
-    remaining.reserve(currentItems_.size() - selected.size());
-    for (DesktopItem& item : currentItems_) {
-        if (IsItemSelected(item.id)) {
-            moving.push_back(std::move(item));
-        } else {
-            remaining.push_back(std::move(item));
+    insertionIndex = std::min(insertionIndex, remainingIndices.size());
+    std::vector<size_t> order = remainingIndices;
+    order.insert(
+        order.begin() + static_cast<std::ptrdiff_t>(insertionIndex),
+        movingIndices.begin(),
+        movingIndices.end());
+    bool changed = false;
+    for (size_t index = 0; index < order.size(); ++index) {
+        if (order[index] != index) {
+            changed = true;
+            break;
         }
     }
-    const auto target = std::find_if(
-        remaining.begin(), remaining.end(),
-        [&](const DesktopItem& item) { return item.id == targetId; });
-    const size_t insertionIndex = target == remaining.end()
-        ? remaining.size()
-        : static_cast<size_t>(std::distance(remaining.begin(), target));
-    remaining.insert(
-        remaining.begin() + static_cast<std::ptrdiff_t>(insertionIndex),
-        std::make_move_iterator(moving.begin()),
-        std::make_move_iterator(moving.end()));
-    currentItems_ = std::move(remaining);
+    if (!changed) {
+        return;
+    }
+    std::vector<DesktopItem> reordered;
+    reordered.reserve(currentItems_.size());
+    for (const size_t index : order) {
+        reordered.push_back(std::move(currentItems_[index]));
+    }
+    currentItems_ = std::move(reordered);
     windowConfig_.autoArrange = false;
     windowConfig_.sortMode = 0;
     iconGrid_.SetItems(currentItems_);
@@ -4685,14 +4709,19 @@ void WidgetWindow::Render() {
                         marquee, marqueeBorderBrush.Get(), 1.0f);
                 }
             }
-            if (shellDropPreviewActive_ &&
-                shellDropInsertionIndex_ >= 0) {
+            const int visibleInsertionIndex =
+                dragVisualActive_ && dragInsertionIndex_ >= 0
+                    ? dragInsertionIndex_
+                    : (shellDropPreviewActive_
+                        ? shellDropInsertionIndex_
+                        : -1);
+            if (visibleInsertionIndex >= 0) {
                 Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> insertionBrush;
                 target->CreateSolidColorBrush(
                     D2D1::ColorF(0x63D3F1, 0.92f),
                     insertionBrush.GetAddressOf());
                 RECT slot = iconGrid_.InsertionCellAt(
-                    static_cast<size_t>(shellDropInsertionIndex_));
+                    static_cast<size_t>(visibleInsertionIndex));
                 const RECT gridBounds = GridBounds();
                 RECT clipped{};
                 if (insertionBrush != nullptr &&
@@ -4721,6 +4750,7 @@ void WidgetWindow::Render() {
     ++renderCount_;
 #endif
     if (hr == D2DERR_RECREATE_TARGET) {
+        dragInsertionIndex_ = -1;
         shellDropProjectionPainted_ = false;
         iconCache_.Clear();
         d2d_.RecreateTarget(hwnd_);

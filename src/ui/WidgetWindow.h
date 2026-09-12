@@ -41,6 +41,8 @@ enum class WidgetHostCommand : UINT {
     MoveCategoryDown,
     ExitApplication,
     CheckForUpdates,
+    AutoOrganize,
+    UndoAutoOrganize,
 };
 
 class WidgetWindow {
@@ -129,7 +131,6 @@ private:
         const DesktopCollectionItemResult& result);
     void FinishDesktopCollectionBatch(bool allSucceeded, const std::wstring& errorMessage);
     void RefreshCurrentItems();
-    void ReorderItem(size_t fromIndex, size_t toIndex);
     void ShowBackgroundMenu(POINT screenPoint);
     bool RequestApplicationExit();
     void ApplyMovingSnap(RECT& movingRect) const;
@@ -191,7 +192,8 @@ private:
     void UpdateMarqueeSelection(POINT point);
     void CompletePointerSelection(bool dragged);
     void ResetPointerSelection();
-    void ReorderSelectedItems(size_t targetIndex);
+    size_t NormalizeReorderInsertionIndex(size_t rawInsertionIndex) const;
+    void ReorderSelectedItems(size_t insertionIndex);
     WidgetWindow* DropTargetWidgetAtScreenPoint(POINT screenPoint) const;
     void MoveItemToCategory(const std::wstring& itemId, const std::wstring& targetCategoryId);
     void MoveItemsToCategory(
@@ -225,7 +227,7 @@ private:
     std::vector<DesktopItem> currentItems_;
     std::vector<ItemConfig> registeredItems_;
     int draggingIconIndex_ = -1;
-    int dragTargetIndex_ = -1;
+    int dragInsertionIndex_ = -1;
     POINT dragStartPoint_{};
     bool dragVisualActive_ = false;
     std::uint64_t dragGhostGeneration_ = 0;

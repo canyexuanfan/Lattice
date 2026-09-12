@@ -7,8 +7,10 @@
 #include <wrl/client.h>
 
 #include <algorithm>
+#include <cwctype>
 #include <filesystem>
 #include <iterator>
+#include <tuple>
 #include <unordered_set>
 #include <utility>
 
@@ -79,6 +81,8 @@ constexpr int kResetLayoutCommand = 2062;
 constexpr int kDensityCompactCommand = 2040;
 constexpr int kDensityStandardCommand = 2041;
 constexpr int kDensitySpaciousCommand = 2042;
+constexpr int kAutoOrganizeCommand = 2067;
+constexpr int kUndoAutoOrganizeCommand = 2068;
 constexpr int kTrayToggleVisibleCommand = 2020;
 constexpr int kTrayToggleLockCommand = 2021;
 constexpr int kTrayRefreshCommand = 2022;
@@ -88,6 +92,7 @@ constexpr int kSearchEditId = 4001;
 constexpr int kSearchScopeId = 4002;
 constexpr UINT kDesktopChangedMessage = WM_APP + 11;
 constexpr UINT kIconReadyMessage = WM_APP + 14;
+constexpr UINT kAutoOrganizeTransactionCompleteMessage = WM_APP + 64;
 const UINT kUpdateExitMessage = RegisterWindowMessageW(L"Lattice.RequestExitForUpdate.V1");
 const UINT kTaskbarCreatedMessage = RegisterWindowMessageW(L"TaskbarCreated");
 constexpr UINT kDesktopRefreshTimerId = 7001;
@@ -100,6 +105,103 @@ constexpr int kRefreshIconCommand = 2106;
 constexpr int kMoveItemBaseCommand = 3000;
 constexpr int kTileToggleCollapseCommand = 17;
 constexpr int kTileOpenWidgetCommand = 18;
+
+UINT MonitorDpi(HMONITOR monitor) {
+    using GetDpiForMonitorFunction = HRESULT(WINAPI*)(
+        HMONITOR, int, UINT*, UINT*);
+    HMODULE shcore = LoadLibraryExW(
+        L"shcore.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (shcore != nullptr) {
+        const auto getDpiForMonitor =
+            reinterpret_cast<GetDpiForMonitorFunction>(
+                GetProcAddress(shcore, "GetDpiForMonitor"));
+        UINT x = 96;
+        UINT y = 96;
+        const HRESULT result = getDpiForMonitor == nullptr
+            ? E_NOINTERFACE : getDpiForMonitor(monitor, 0, &x, &y);
+        FreeLibrary(shcore);
+        if (SUCCEEDED(result) && x > 0) return x;
+    }
+    return GetDpiForSystem();
+}
+
+std::wstring MonitorId(HMONITOR monitor) {
+    MONITORINFOEXW info{};
+    info.cbSize = sizeof(info);
+    return monitor != nullptr && GetMonitorInfoW(monitor, &info)
+        ? std::wstring(info.szDevice) : std::wstring{};
+}
+
+std::vector<lattice::organize::MonitorLayout> CurrentMonitorLayouts() {
+    std::vector<lattice::organize::MonitorLayout> monitors;
+    EnumDisplayMonitors(
+        nullptr, nullptr,
+        [](HMONITOR monitor, HDC, LPRECT, LPARAM context) -> BOOL {
+            auto* result = reinterpret_cast<
+                std::vector<lattice::organize::MonitorLayout>*>(context);
+            MONITORINFOEXW info{};
+            info.cbSize = sizeof(info);
+            if (GetMonitorInfoW(monitor, &info)) {
+                result->push_back(lattice::organize::MonitorLayout{
+                    info.szDevice,
+                    lattice::organize::RectI{
+                        info.rcWork.left, info.rcWork.top,
+                        info.rcWork.right, info.rcWork.bottom},
+                    MonitorDpi(monitor)});
+            }
+            return TRUE;
+        },
+        reinterpret_cast<LPARAM>(&monitors));
+    std::sort(monitors.begin(), monitors.end(),
+        [](const auto& left, const auto& right) {
+            return std::tie(left.workArea.left, left.workArea.top, left.id) <
+                std::tie(right.workArea.left, right.workArea.top, right.id);
+        });
+    return monitors;
+}
+
+template <typename Config>
+std::uint64_t AutoOrganizeRevision(const Config& config) {
+    constexpr std::uint64_t prime = 1099511628211ull;
+    std::uint64_t hash = 1469598103934665603ull;
+    const auto append = [&](const std::wstring& value) {
+        for (wchar_t ch : value) {
+            hash ^= static_cast<std::uint64_t>(std::towlower(ch));
+            hash *= prime;
+        }
+        hash ^= 0xffu;
+        hash *= prime;
+    };
+    for (const auto& item : config.items) {
+        append(item.id);
+        append(item.path);
+    }
+    for (const std::wstring& itemId : config.uncategorizedItemIds) {
+        append(L"uncategorized");
+        append(itemId);
+    }
+    for (const auto& category : config.categories) {
+        append(category.id);
+        append(category.name);
+        append(category.layout.monitorId);
+        hash ^= static_cast<std::uint64_t>(category.layout.x);
+        hash *= prime;
+        hash ^= static_cast<std::uint64_t>(category.layout.y);
+        hash *= prime;
+        for (const std::wstring& itemId : category.itemIds) append(itemId);
+    }
+    return hash;
+}
+
+bool ShouldInjectSmokeAutoOrganizeWindowFailure(
+    const std::wstring& configPath) {
+    wchar_t enabled[2]{};
+    return GetEnvironmentVariableW(
+               L"LATTICE_SMOKE_FAIL_AUTO_ORGANIZE_WINDOW_PREPARE",
+               enabled, ARRAYSIZE(enabled)) == 1 && enabled[0] == L'1' &&
+        ToLowerCopy(configPath).find(L"\\smoke-runs\\") !=
+            std::wstring::npos;
+}
 
 const wchar_t* DeskGoPaletteColor(size_t index) {
     constexpr const wchar_t* kPalette[] = {
@@ -296,6 +398,10 @@ void MainWindow::RequestNormalExit() {
 }
 
 MainWindow::~MainWindow() {
+    if (autoOrganizePreview_ != nullptr) {
+        autoOrganizePreview_->Close();
+        autoOrganizePreview_.reset();
+    }
     if (desktopSurface_ != nullptr) {
         desktopSurface_->Close();
         desktopSurface_.reset();
@@ -805,6 +911,16 @@ LRESULT MainWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
             }
             EnsureWindowVisible();
             return 0;
+
+        case WM_SETTINGCHANGE:
+        case WM_THEMECHANGED:
+            if (organizerConfig_.settings.theme == 2) {
+                iconGrid_.SetLightTheme(
+                    UseLightTheme(organizerConfig_.settings.theme));
+                RefreshTileViews();
+                InvalidateRect(hwnd_, nullptr, FALSE);
+            }
+            break;
 
         case WM_GETMINMAXINFO: {
             auto* minMax = reinterpret_cast<MINMAXINFO*>(lParam);
@@ -1383,6 +1499,9 @@ LRESULT MainWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
                     desktopSurface_->Refresh(ignored);
                 }
                 LoadDesktopItems();
+                if (autoOrganizePreview_ != nullptr) {
+                    autoOrganizePreview_->MarkDesktopChanged();
+                }
                 InvalidateRect(hwnd_, nullptr, FALSE);
                 UpdateWindow(hwnd_);
                 return 0;
@@ -1409,7 +1528,15 @@ LRESULT MainWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
             LoadOrganizerConfig();
             windowConfig_ = organizerConfig_.window;
             LoadDesktopItems();
+            if (autoOrganizePreview_ != nullptr) {
+                autoOrganizePreview_->MarkDesktopChanged();
+            }
             InvalidateRect(hwnd_, nullptr, FALSE);
+            return 0;
+
+        case kAutoOrganizeTransactionCompleteMessage:
+            HandleAutoOrganizeTransactionResult(
+                reinterpret_cast<AutoOrganizeTransactionResult*>(lParam));
             return 0;
 
         case kOrganizerConfigSyncMessage:
@@ -1500,6 +1627,12 @@ LRESULT MainWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
                     break;
                 case WidgetHostCommand::CheckForUpdates:
                     CheckForUpdates(reinterpret_cast<HWND>(lParam));
+                    break;
+                case WidgetHostCommand::AutoOrganize:
+                    ShowAutoOrganizePreview();
+                    break;
+                case WidgetHostCommand::UndoAutoOrganize:
+                    UndoLastAutoOrganize();
                     break;
             }
             return 0;
@@ -1709,6 +1842,14 @@ LRESULT MainWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
                 ShowSettings();
                 return 0;
             }
+            if (command == kAutoOrganizeCommand) {
+                ShowAutoOrganizePreview();
+                return 0;
+            }
+            if (command == kUndoAutoOrganizeCommand) {
+                UndoLastAutoOrganize();
+                return 0;
+            }
             if (command == kExportConfigCommand) {
                 ExportConfig();
                 return 0;
@@ -1759,6 +1900,10 @@ LRESULT MainWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
             return 0;
 
         case WM_DESTROY:
+            if (autoOrganizePreview_ != nullptr) {
+                autoOrganizePreview_->Close();
+                autoOrganizePreview_.reset();
+            }
             iconCache_.SetInvalidateCallback(nullptr);
             DragGhostWindow::Instance().End();
             desktopPlacementCoordinator_.DetachNotificationWindow(hwnd_);
@@ -2019,8 +2164,14 @@ void MainWindow::ToggleStartup() {
     SaveOrganizerConfig();
 }
 
+AppSettings MainWindow::SettingsForDialog() const {
+    AppSettings settings = organizerConfig_.settings;
+    settings.launchOnStartup = startupManager_.IsEnabled();
+    return settings;
+}
+
 void MainWindow::ShowSettings() {
-    AppSettings pending = organizerConfig_.settings;
+    AppSettings pending = SettingsForDialog();
     if (!SettingsDialog::Show(instance_, hwnd_, pending)) {
         return;
     }
@@ -2030,15 +2181,532 @@ void MainWindow::ShowSettings() {
         MessageDialog::Show(instance_, hwnd_, L"开机自启设置没有成功写入，其他设置仍会保存。", L"Lattice", MB_OK | MB_ICONWARNING);
         pending.launchOnStartup = startupManager_.IsEnabled();
     }
-    const bool publicDesktopChanged = pending.showPublicDesktopItems != organizerConfig_.settings.showPublicDesktopItems;
+    const AppSettings previousSettings = organizerConfig_.settings;
+    const bool publicDesktopChanged =
+        pending.showPublicDesktopItems !=
+        previousSettings.showPublicDesktopItems;
     organizerConfig_.settings = pending;
-    SaveOrganizerConfig();
+    if (!SaveOrganizerConfig()) {
+        organizerConfig_.settings = previousSettings;
+        organizerConfig_.settings.launchOnStartup =
+            startupManager_.IsEnabled();
+        MessageDialog::Show(
+            instance_, hwnd_,
+            L"设置没有成功保存，请稍后重试。",
+            L"Lattice", MB_OK | MB_ICONWARNING);
+        return;
+    }
+    ApplyLiveSettings(publicDesktopChanged);
+}
+
+void MainWindow::ApplyLiveSettings(bool publicDesktopChanged) {
     iconCache_.SetCapacity(static_cast<size_t>(organizerConfig_.settings.iconCacheSize));
     iconGrid_.SetLightTheme(UseLightTheme(organizerConfig_.settings.theme));
     if (publicDesktopChanged) {
         LoadDesktopItems();
+    } else {
+        RefreshTileViews();
     }
     InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+AutoOrganizePreviewInput MainWindow::BuildAutoOrganizePreviewInput() const {
+    AutoOrganizePreviewInput input;
+    const AppConfig currentConfig = configStore_.LoadAppConfig();
+    input.undoAvailable = !currentConfig.autoOrganizeUndoHistory.empty();
+    input.snapshot.configRevision = AutoOrganizeRevision(currentConfig);
+    input.layoutContext.gap = 12;
+    input.layoutContext.defaultWidth = 390;
+    input.layoutContext.monitors = CurrentMonitorLayouts();
+    if (input.layoutContext.monitors.empty()) {
+        MONITORINFO info{};
+        info.cbSize = sizeof(info);
+        const HMONITOR primary = MonitorFromPoint(
+            POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
+        if (primary != nullptr && GetMonitorInfoW(primary, &info)) {
+            input.layoutContext.monitors.push_back({
+                MonitorId(primary),
+                {info.rcWork.left, info.rcWork.top,
+                 info.rcWork.right, info.rcWork.bottom},
+                MonitorDpi(primary)});
+        }
+    }
+    const std::wstring fallbackMonitor = input.layoutContext.monitors.empty()
+        ? std::wstring{} : input.layoutContext.monitors.front().id;
+
+    const auto monitorForPoint = [&](POINT point) {
+        const std::wstring id = MonitorId(MonitorFromPoint(
+            point, MONITOR_DEFAULTTONEAREST));
+        return id.empty() ? fallbackMonitor : id;
+    };
+    const auto appendExistingLayout = [&](
+        const std::wstring& id,
+        const WindowConfig& layout) {
+        lattice::organize::ExistingWidgetLayout widget;
+        widget.id = id;
+        widget.monitorId = layout.monitorId.empty()
+            ? monitorForPoint(POINT{layout.x, layout.y})
+            : layout.monitorId;
+        widget.bounds = {layout.x, layout.y,
+            layout.x + layout.width, layout.y + layout.height};
+        input.layoutContext.existingWidgets.push_back(std::move(widget));
+    };
+    appendExistingLayout(kUncategorizedCategoryId, currentConfig.window);
+    for (const CategoryConfig& category : currentConfig.categories) {
+        input.snapshot.categories.push_back({
+            category.id,
+            category.name,
+            category.layout.monitorId.empty()
+                ? monitorForPoint(POINT{category.layout.x, category.layout.y})
+                : category.layout.monitorId,
+            category.layout.locked});
+        appendExistingLayout(category.id, category.layout);
+    }
+
+    const DesktopViewSnapshot* desktopSnapshot =
+        desktopSurface_ == nullptr ? nullptr : &desktopSurface_->Snapshot();
+    for (const DesktopItem& item : items_) {
+        lattice::organize::ItemSnapshot snapshot;
+        snapshot.id = item.id;
+        snapshot.parsingIdentity = item.path;
+        snapshot.displayName = item.displayName;
+        snapshot.path = item.path;
+        snapshot.targetPath = item.targetPath;
+        snapshot.arguments = item.arguments;
+        snapshot.workingDirectory = item.workingDirectory;
+        snapshot.kind = item.kind;
+        snapshot.missing = item.missing;
+
+        const ConfiguredItemMembership membership =
+            FindConfiguredItemMembership(currentConfig, item.id);
+        snapshot.sourceCategoryId = membership.categoryId;
+        snapshot.sourceIndex = membership.index < 0
+            ? 0u : static_cast<std::size_t>(membership.index);
+        if (membership.categoryId == kUncategorizedCategoryId) {
+            snapshot.sourceCategoryName = currentConfig.uncategorizedName;
+            snapshot.monitorId = currentConfig.window.monitorId.empty()
+                ? monitorForPoint(POINT{
+                    currentConfig.window.x, currentConfig.window.y})
+                : currentConfig.window.monitorId;
+        } else if (!membership.categoryId.empty()) {
+            const auto category = std::find_if(
+                currentConfig.categories.begin(), currentConfig.categories.end(),
+                [&](const CategoryConfig& value) {
+                    return value.id == membership.categoryId;
+                });
+            if (category != currentConfig.categories.end()) {
+                snapshot.sourceCategoryName = category->name;
+                snapshot.monitorId = category->layout.monitorId.empty()
+                    ? monitorForPoint(POINT{
+                        category->layout.x, category->layout.y})
+                    : category->layout.monitorId;
+            }
+        }
+        if (desktopSnapshot != nullptr) {
+            const auto displayed = std::find_if(
+                desktopSnapshot->items.begin(), desktopSnapshot->items.end(),
+                [&](const DesktopViewItem& value) {
+                    return CompareStringOrdinal(
+                        value.path.c_str(), -1, item.path.c_str(), -1,
+                        TRUE) == CSTR_EQUAL;
+                });
+            if (displayed != desktopSnapshot->items.end()) {
+                snapshot.displayX = displayed->screenPoint.x;
+                snapshot.displayY = displayed->screenPoint.y;
+                snapshot.hasDisplayPosition = true;
+                if (snapshot.monitorId.empty()) {
+                    snapshot.monitorId = monitorForPoint(displayed->screenPoint);
+                }
+            }
+        }
+        if (snapshot.monitorId.empty()) snapshot.monitorId = fallbackMonitor;
+        input.snapshot.items.push_back(std::move(snapshot));
+    }
+    return input;
+}
+
+AutoOrganizeApplyRequest MainWindow::BuildAutoOrganizeApplyRequest(
+    const lattice::organize::Plan& plan,
+    const lattice::organize::LayoutPlan& layout) const {
+    AutoOrganizeApplyRequest request;
+    request.transactionId = plan.id + L"-" +
+        std::to_wstring(GetTickCount64());
+    std::unordered_set<std::wstring> selectedTargets;
+    for (const lattice::organize::Decision& decision : plan.decisions) {
+        if (!decision.selected || decision.targetCategoryId.empty() ||
+            decision.targetCategoryId == decision.sourceCategoryId) {
+            continue;
+        }
+        const auto desktopItem = std::find_if(
+            items_.begin(), items_.end(),
+            [&](const DesktopItem& item) { return item.id == decision.itemId; });
+        if (desktopItem == items_.end() || desktopItem->missing ||
+            CompareStringOrdinal(
+                desktopItem->path.c_str(), -1,
+                decision.parsingIdentity.c_str(), -1, TRUE) != CSTR_EQUAL) {
+            continue;
+        }
+        AutoOrganizeMoveRequest move;
+        move.identity = decision.parsingIdentity;
+        move.expectedSourceCategoryId = decision.sourceCategoryId;
+        move.expectedSourceIndex = -1;
+        move.targetCategoryId = decision.targetCategoryId;
+        const auto registered = std::find_if(
+            organizerConfig_.items.begin(), organizerConfig_.items.end(),
+            [&](const RegisteredItem& item) { return item.id == decision.itemId; });
+        if (registered != organizerConfig_.items.end()) {
+            move.item.id = registered->id;
+            move.item.path = registered->path;
+            move.item.displayName = registered->displayName;
+            move.item.originalDesktopPath = registered->originalDesktopPath;
+            move.item.desktopX = registered->desktopX;
+            move.item.desktopY = registered->desktopY;
+            move.item.hasDesktopPosition = registered->hasDesktopPosition;
+            move.item.desktopVisibilityMode = registered->desktopVisibilityMode;
+            move.item.desktopVisibilityOriginalFlags =
+                registered->desktopVisibilityOriginalFlags;
+            move.item.desktopVisibilityNewStartValue =
+                registered->desktopVisibilityNewStartValue;
+            move.item.desktopVisibilityClassicValue =
+                registered->desktopVisibilityClassicValue;
+        } else {
+            move.item.id = desktopItem->id;
+            move.item.path = desktopItem->path;
+            move.item.displayName = desktopItem->displayName;
+            move.item.originalDesktopPath = desktopItem->path;
+            const auto snapshot = desktopSurface_ == nullptr
+                ? std::vector<DesktopViewItem>::const_iterator{}
+                : std::find_if(
+                    desktopSurface_->Snapshot().items.begin(),
+                    desktopSurface_->Snapshot().items.end(),
+                    [&](const DesktopViewItem& value) {
+                        return CompareStringOrdinal(
+                            value.path.c_str(), -1,
+                            desktopItem->path.c_str(), -1, TRUE) == CSTR_EQUAL;
+                    });
+            if (desktopSurface_ != nullptr &&
+                snapshot != desktopSurface_->Snapshot().items.end()) {
+                move.item.desktopX = snapshot->screenPoint.x;
+                move.item.desktopY = snapshot->screenPoint.y;
+                move.item.hasDesktopPosition = true;
+            }
+        }
+        const auto sourceIndex = [&](const std::vector<std::wstring>& ids) {
+            const auto found = std::find(ids.begin(), ids.end(), decision.itemId);
+            return found == ids.end() ? -1 : static_cast<int>(
+                std::distance(ids.begin(), found));
+        };
+        if (decision.sourceCategoryId == kUncategorizedCategoryId) {
+            move.expectedSourceIndex = sourceIndex(
+                organizerConfig_.uncategorizedItemIds);
+        } else if (!decision.sourceCategoryId.empty()) {
+            const Category* source = FindCategory(decision.sourceCategoryId);
+            if (source != nullptr) move.expectedSourceIndex = sourceIndex(source->itemIds);
+        }
+        selectedTargets.insert(decision.targetCategoryId);
+        request.moves.push_back(std::move(move));
+    }
+
+    static const wchar_t* colors[]{
+        L"#AA7CFF", L"#35C9A5", L"#F2B84B", L"#2D8CFF"};
+    const std::vector<lattice::organize::MonitorLayout> monitors =
+        CurrentMonitorLayouts();
+    for (const lattice::organize::GroupPlan& group : plan.groups) {
+        if (!group.createNewCategory || !selectedTargets.contains(group.id)) continue;
+        const auto placement = std::find_if(
+            layout.placements.begin(), layout.placements.end(),
+            [&](const lattice::organize::WidgetPlacement& value) {
+                return value.groupId == group.id && value.placed;
+            });
+        if (placement == layout.placements.end()) continue;
+        CategoryConfig category;
+        category.id = group.id;
+        category.name = group.name;
+        category.storageFolder = group.id;
+        category.color = colors[request.newCategories.size() % ARRAYSIZE(colors)];
+        category.icon = L"apps";
+        category.layout = WindowConfig{};
+        category.layout.x = placement->bounds.left;
+        category.layout.y = placement->bounds.top;
+        category.layout.width = placement->bounds.Width();
+        category.layout.height = placement->bounds.Height();
+        category.layout.normalHeight = category.layout.height;
+        category.layout.monitorId = placement->monitorId;
+        const auto monitor = std::find_if(
+            monitors.begin(), monitors.end(),
+            [&](const lattice::organize::MonitorLayout& value) {
+                return value.id == placement->monitorId;
+            });
+        category.layout.dpi = monitor == monitors.end()
+            ? 96 : static_cast<int>(monitor->dpi);
+        request.newCategories.push_back(std::move(category));
+    }
+    return request;
+}
+
+void MainWindow::ShowAutoOrganizePreview() {
+    if (autoOrganizePreview_ == nullptr) {
+        autoOrganizePreview_ = std::make_unique<AutoOrganizePreviewWindow>(
+            instance_, nullptr,
+            [this]() { return BuildAutoOrganizePreviewInput(); },
+            [this](const lattice::organize::Plan& plan,
+                   const lattice::organize::LayoutPlan& layout,
+                   HWND sourceWindow) {
+                ApplyAutoOrganizePlan(plan, layout, sourceWindow);
+            },
+            [this](HWND) { UndoLastAutoOrganize(); });
+    }
+    autoOrganizePreview_->ShowOrActivate();
+}
+
+void MainWindow::ApplyAutoOrganizePlan(
+    const lattice::organize::Plan& plan,
+    const lattice::organize::LayoutPlan& layout,
+    HWND) {
+    if (autoOrganizeOperation_ != AutoOrganizeOperation::None) {
+        if (autoOrganizePreview_ != nullptr) {
+            autoOrganizePreview_->CompleteApply(
+                false, L"另一项配置事务尚未结束，请稍后重试。");
+        }
+        return;
+    }
+    const AutoOrganizePreviewInput current =
+        BuildAutoOrganizePreviewInput();
+    bool relatedContextChanged = !lattice::organize::IsMonitorContextCurrent(
+            layout.monitorContextSignature,
+            current.layoutContext.monitors);
+    std::size_t expectedMoveCount = 0;
+    for (const lattice::organize::Decision& decision : plan.decisions) {
+        if (!decision.selected || decision.targetCategoryId.empty() ||
+            decision.targetCategoryId == decision.sourceCategoryId) continue;
+        ++expectedMoveCount;
+        const auto item = std::find_if(
+            current.snapshot.items.begin(), current.snapshot.items.end(),
+            [&](const lattice::organize::ItemSnapshot& value) {
+                return value.id == decision.itemId;
+            });
+        if (item == current.snapshot.items.end() || item->missing ||
+            CompareStringOrdinal(
+                item->parsingIdentity.c_str(), -1,
+                decision.parsingIdentity.c_str(), -1, TRUE) != CSTR_EQUAL ||
+            item->sourceCategoryId != decision.sourceCategoryId ||
+            item->sourceIndex != decision.sourceIndex) {
+            relatedContextChanged = true;
+            break;
+        }
+        if (decision.targetIsExistingCategory) {
+            const auto target = std::find_if(
+                current.snapshot.categories.begin(),
+                current.snapshot.categories.end(),
+                [&](const lattice::organize::ExistingCategorySnapshot& value) {
+                    return value.id == decision.targetCategoryId;
+                });
+            if (target == current.snapshot.categories.end() || target->locked) {
+                relatedContextChanged = true;
+                break;
+            }
+        }
+        if (!decision.sourceCategoryId.empty() &&
+            decision.sourceCategoryId != kUncategorizedCategoryId) {
+            const auto source = std::find_if(
+                current.snapshot.categories.begin(),
+                current.snapshot.categories.end(),
+                [&](const lattice::organize::ExistingCategorySnapshot& value) {
+                    return value.id == decision.sourceCategoryId;
+                });
+            if (source == current.snapshot.categories.end() || source->locked) {
+                relatedContextChanged = true;
+                break;
+            }
+        }
+    }
+    if (relatedContextChanged) {
+        if (autoOrganizePreview_ != nullptr) {
+            autoOrganizePreview_->CompleteApply(
+                false, L"桌面、格子或显示器布局已经变化，请重新生成建议。");
+        }
+        return;
+    }
+    AutoOrganizeApplyRequest request =
+        BuildAutoOrganizeApplyRequest(plan, layout);
+    if (request.moves.empty() || request.moves.size() != expectedMoveCount) {
+        if (autoOrganizePreview_ != nullptr) {
+            autoOrganizePreview_->CompleteApply(
+                false, request.moves.empty()
+                    ? L"没有可应用的有效调整，配置保持不变。"
+                    : L"至少一个涉及项目的身份已经变化，请重新生成建议。");
+        }
+        return;
+    }
+    std::unordered_set<std::wstring> newIds;
+    for (const CategoryConfig& category : request.newCategories) {
+        newIds.insert(category.id);
+    }
+    for (const AutoOrganizeMoveRequest& move : request.moves) {
+        const bool targetExists = FindCategory(move.targetCategoryId) != nullptr;
+        if (!targetExists && !newIds.contains(move.targetCategoryId)) {
+            if (autoOrganizePreview_ != nullptr) {
+                autoOrganizePreview_->CompleteApply(
+                    false, L"候选格子尚未放置，请调整位置或重新生成建议。");
+            }
+            return;
+        }
+    }
+    pendingAutoOrganizeCategoryIds_.assign(newIds.begin(), newIds.end());
+    autoOrganizeOperation_ = AutoOrganizeOperation::Apply;
+    const std::uint64_t token = ++autoOrganizeOperationToken_;
+    if (!configStore_.ApplyAutoOrganizeAsync(
+            request, hwnd_, kAutoOrganizeTransactionCompleteMessage, token)) {
+        autoOrganizeOperation_ = AutoOrganizeOperation::None;
+        pendingAutoOrganizeCategoryIds_.clear();
+        if (autoOrganizePreview_ != nullptr) {
+            autoOrganizePreview_->CompleteApply(
+                false, L"配置写入队列正忙，未应用任何调整。");
+        }
+    }
+}
+
+void MainWindow::UndoLastAutoOrganize() {
+    if (autoOrganizeOperation_ != AutoOrganizeOperation::None) {
+        ShowNonBlockingNotice(
+            L"自动整理", L"另一项配置事务尚未结束，请稍后重试。");
+        return;
+    }
+    if (configStore_.LoadAppConfig().autoOrganizeUndoHistory.empty()) {
+        ShowNonBlockingNotice(L"自动整理", L"没有可撤销的自动整理记录。");
+        return;
+    }
+    autoOrganizeOperation_ = AutoOrganizeOperation::Undo;
+    const std::uint64_t token = ++autoOrganizeOperationToken_;
+    if (!configStore_.UndoAutoOrganizeAsync(
+            hwnd_, kAutoOrganizeTransactionCompleteMessage, token)) {
+        autoOrganizeOperation_ = AutoOrganizeOperation::None;
+        ShowNonBlockingNotice(
+            L"自动整理", L"撤销任务未能进入配置队列，请稍后重试。");
+    }
+}
+
+bool MainWindow::PublishReloadedOrganizerState(
+    const std::vector<std::wstring>& newCategoryIds) {
+    LoadOrganizerConfig();
+    windowConfig_ = organizerConfig_.window;
+    if (!newCategoryIds.empty() &&
+        ShouldInjectSmokeAutoOrganizeWindowFailure(
+            configStore_.ConfigPath())) {
+        return false;
+    }
+    std::vector<std::unique_ptr<WidgetWindow>> preparedWidgets;
+    for (const std::wstring& categoryId : newCategoryIds) {
+        if (FindCategory(categoryId) == nullptr) continue;
+        const bool alreadyOpen = std::any_of(
+            widgetWindows_.begin(), widgetWindows_.end(),
+            [&](const std::unique_ptr<WidgetWindow>& widget) {
+                return widget != nullptr && widget->IsOpen() &&
+                    widget->IsForCategory(categoryId);
+            });
+        if (alreadyOpen) continue;
+        auto widget = std::make_unique<WidgetWindow>(
+            instance_, hwnd_, categoryId,
+            static_cast<int>(widgetWindows_.size() +
+                preparedWidgets.size()) * 36);
+        if (!widget->Create()) {
+            for (auto& prepared : preparedWidgets) prepared->Close();
+            return false;
+        }
+        preparedWidgets.push_back(std::move(widget));
+    }
+    for (auto iterator = widgetWindows_.begin();
+         iterator != widgetWindows_.end();) {
+        const bool valid = *iterator != nullptr && (*iterator)->IsOpen() &&
+            ((*iterator)->IsForCategory(kUncategorizedCategoryId) ||
+             std::any_of(
+                 organizerConfig_.categories.begin(),
+                 organizerConfig_.categories.end(),
+                 [&](const Category& category) {
+                     return (*iterator)->IsForCategory(category.id);
+                 }));
+        if (!valid) {
+            if (*iterator != nullptr) (*iterator)->Close();
+            iterator = widgetWindows_.erase(iterator);
+        } else {
+            ++iterator;
+        }
+    }
+    LoadDesktopItems();
+    for (auto& widget : preparedWidgets) {
+        widget->Show(SW_SHOWNOACTIVATE);
+        widgetWindows_.push_back(std::move(widget));
+    }
+    InvalidateRect(hwnd_, nullptr, FALSE);
+    return true;
+}
+
+void MainWindow::HandleAutoOrganizeTransactionResult(
+    AutoOrganizeTransactionResult* rawResult) {
+    std::unique_ptr<AutoOrganizeTransactionResult> result(rawResult);
+    if (result == nullptr || result->token != autoOrganizeOperationToken_) return;
+    const AutoOrganizeOperation completedOperation = autoOrganizeOperation_;
+    if (!result->succeeded) {
+        autoOrganizeOperation_ = AutoOrganizeOperation::None;
+        pendingAutoOrganizeCategoryIds_.clear();
+        if (completedOperation == AutoOrganizeOperation::Apply &&
+            autoOrganizePreview_ != nullptr) {
+            autoOrganizePreview_->CompleteApply(false, result->message);
+        } else if (completedOperation == AutoOrganizeOperation::Undo &&
+                   autoOrganizePreview_ != nullptr &&
+                   autoOrganizePreview_->IsOpen()) {
+            autoOrganizePreview_->CompleteUndo(
+                false, result->conflict, result->message);
+        } else {
+            ShowNonBlockingNotice(L"自动整理", result->message);
+        }
+        return;
+    }
+
+    if (completedOperation == AutoOrganizeOperation::Apply) {
+        if (!PublishReloadedOrganizerState(
+                pendingAutoOrganizeCategoryIds_)) {
+            autoOrganizeOperation_ = AutoOrganizeOperation::Rollback;
+            const std::uint64_t rollbackToken = ++autoOrganizeOperationToken_;
+            if (!configStore_.UndoAutoOrganizeAsync(
+                    hwnd_, kAutoOrganizeTransactionCompleteMessage,
+                    rollbackToken)) {
+                autoOrganizeOperation_ = AutoOrganizeOperation::None;
+                ShowNonBlockingNotice(
+                    L"自动整理",
+                    L"新格子窗口创建失败，且恢复任务未能排队；请重新启动 Lattice 以读取完整配置。");
+            }
+            return;
+        }
+        autoOrganizeOperation_ = AutoOrganizeOperation::None;
+        pendingAutoOrganizeCategoryIds_.clear();
+        if (autoOrganizePreview_ != nullptr) {
+            autoOrganizePreview_->CompleteApply(true, result->message);
+        }
+        return;
+    }
+
+    const bool published = PublishReloadedOrganizerState({});
+    autoOrganizeOperation_ = AutoOrganizeOperation::None;
+    pendingAutoOrganizeCategoryIds_.clear();
+    if (completedOperation == AutoOrganizeOperation::Rollback) {
+        if (autoOrganizePreview_ != nullptr) {
+            autoOrganizePreview_->CompleteApply(
+                false,
+                published
+                    ? L"新格子窗口无法完成准备，整次调整已回滚。"
+                    : L"调整已回滚；重新启动 Lattice 后将恢复原界面。");
+        }
+    } else {
+        if (autoOrganizePreview_ != nullptr &&
+            autoOrganizePreview_->IsOpen()) {
+            autoOrganizePreview_->CompleteUndo(
+                published, result->preservedChanges > 0,
+                published ? result->message
+                          : L"撤销已写入，但界面刷新失败；重新启动 Lattice 后将读取正确配置。");
+        }
+        ShowNonBlockingNotice(L"自动整理", result->message);
+    }
 }
 
 void MainWindow::ExportConfig() {
@@ -2123,6 +2791,14 @@ void MainWindow::ShowTrayMenu() {
     AppendMenuW(menu, MF_STRING, kTrayToggleVisibleCommand, anyVisible ? L"隐藏全部格子" : L"显示全部格子");
     AppendMenuW(menu, MF_STRING, kTrayToggleLockCommand, windowConfig_.locked ? L"解除布局锁定" : L"锁定全部布局");
     AppendMenuW(menu, MF_STRING, kTrayRefreshCommand, L"刷新桌面项目");
+    AppendMenuW(menu, MF_STRING, kAutoOrganizeCommand, L"自动整理桌面…");
+    const bool canUndoAutoOrganize =
+        !configStore_.LoadAppConfig().autoOrganizeUndoHistory.empty();
+    AppendMenuW(
+        menu,
+        canUndoAutoOrganize ? MF_STRING : MF_GRAYED,
+        kUndoAutoOrganizeCommand,
+        L"撤销上次自动整理");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(
         menu,
@@ -2218,6 +2894,7 @@ void MainWindow::LoadOrganizerConfig() {
     organizerConfig_.window = appConfig.window;
     organizerConfig_.window.viewMode = 1;
     organizerConfig_.settings = appConfig.settings;
+    organizerConfig_.settings.launchOnStartup = startupManager_.IsEnabled();
     organizerConfig_.currentCategoryId = appConfig.currentCategoryId.empty() ? kUncategorizedCategoryId : appConfig.currentCategoryId;
     organizerConfig_.uncategorizedName = appConfig.uncategorizedName.empty() ? L"未分类" : appConfig.uncategorizedName;
     organizerConfig_.uncategorizedStorageFolder = appConfig.uncategorizedStorageFolder.empty()
@@ -3527,6 +4204,13 @@ void MainWindow::ShowBackgroundMenu(POINT screenPoint) {
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, kImportDesktopCommand, L"\u5bfc\u5165\u672a\u6536\u7eb3\u684c\u9762\u9879");
     AppendMenuW(menu, MF_STRING, kRefreshDesktopCommand, L"刷新桌面项目");
+    AppendMenuW(menu, MF_STRING, kAutoOrganizeCommand, L"自动整理桌面…");
+    AppendMenuW(
+        menu,
+        configStore_.LoadAppConfig().autoOrganizeUndoHistory.empty()
+            ? MF_GRAYED : MF_STRING,
+        kUndoAutoOrganizeCommand,
+        L"撤销上次自动整理");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, kToggleCollapseCommand, windowConfig_.collapsed ? L"展开格子" : L"折叠格子");
     AppendMenuW(menu, MF_STRING, kToggleLockCommand, windowConfig_.locked ? L"解除锁定" : L"锁定位置");
@@ -4377,15 +5061,10 @@ DesktopItem* MainWindow::FindItem(const std::wstring& itemId) {
 }
 
 bool MainWindow::IsItemAssigned(const std::wstring& itemId) const {
-    if (std::find(organizerConfig_.uncategorizedItemIds.begin(), organizerConfig_.uncategorizedItemIds.end(), itemId) != organizerConfig_.uncategorizedItemIds.end()) {
-        return true;
-    }
-    for (const Category& category : organizerConfig_.categories) {
-        if (std::find(category.itemIds.begin(), category.itemIds.end(), itemId) != category.itemIds.end()) {
-            return true;
-        }
-    }
-    return false;
+    return FindConfiguredItemMembership(
+        organizerConfig_.uncategorizedItemIds,
+        organizerConfig_.categories,
+        itemId).IsAssigned();
 }
 
 std::wstring MainWindow::StorageFolderForCategory(const std::wstring& categoryId) const {
