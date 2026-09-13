@@ -2931,7 +2931,8 @@ int RunSmokeDesktopLayout() {
     if (!layout.CaptureViewSnapshot(snapshot, errorMessage)) {
         const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - started).count();
-        diagnostics << "STATUS=FAIL\nELAPSED_MS=" << elapsed << "\n";
+        diagnostics << "STATUS=FAIL\nELAPSED_MS=" << elapsed
+                    << "\nERROR=" << Utf8Text(errorMessage) << "\n";
         diagnostics.flush();
         std::wcerr << L"Desktop layout snapshot failed: " << errorMessage << L"\n";
         return 1;
@@ -11248,6 +11249,267 @@ int RunSettingsDialogPreview(HINSTANCE instance) {
     return 0;
 }
 
+int RunSmokeUpdatePackages() {
+    AttachParentConsole();
+    const auto environmentValue = [](const wchar_t* name) {
+        const DWORD required = GetEnvironmentVariableW(name, nullptr, 0);
+        if (required == 0) return std::wstring{};
+        std::wstring value(required, L'\0');
+        const DWORD copied = GetEnvironmentVariableW(
+            name,
+            value.data(),
+            static_cast<DWORD>(value.size()));
+        if (copied == 0 || copied >= value.size()) return std::wstring{};
+        value.resize(copied);
+        return value;
+    };
+    const auto parseDigest = [](const std::wstring& text,
+                                std::array<std::uint8_t, 32>& digest) {
+        if (text.size() != digest.size() * 2) return false;
+        const auto hex = [](wchar_t character) {
+            if (character >= L'0' && character <= L'9') {
+                return static_cast<int>(character - L'0');
+            }
+            if (character >= L'a' && character <= L'f') {
+                return static_cast<int>(character - L'a' + 10);
+            }
+            if (character >= L'A' && character <= L'F') {
+                return static_cast<int>(character - L'A' + 10);
+            }
+            return -1;
+        };
+        for (size_t index = 0; index < digest.size(); ++index) {
+            const int high = hex(text[index * 2]);
+            const int low = hex(text[index * 2 + 1]);
+            if (high < 0 || low < 0) return false;
+            digest[index] = static_cast<std::uint8_t>((high << 4) | low);
+        }
+        return true;
+    };
+    const auto oldStrictIdentityAccepted = [](const std::wstring& path) {
+        DWORD handle = 0;
+        const DWORD infoSize = GetFileVersionInfoSizeW(path.c_str(), &handle);
+        if (infoSize == 0) return false;
+        std::vector<std::byte> versionInfo(infoSize);
+        VS_FIXEDFILEINFO* fixed = nullptr;
+        UINT fixedSize = 0;
+        if (GetFileVersionInfoW(
+                path.c_str(),
+                0,
+                infoSize,
+                versionInfo.data()) == FALSE ||
+            VerQueryValueW(
+                versionInfo.data(),
+                L"\\",
+                reinterpret_cast<void**>(&fixed),
+                &fixedSize) == FALSE ||
+            fixed == nullptr || fixedSize < sizeof(VS_FIXEDFILEINFO) ||
+            HIWORD(fixed->dwFileVersionMS) != 0 ||
+            LOWORD(fixed->dwFileVersionMS) != 4 ||
+            HIWORD(fixed->dwFileVersionLS) != 58) {
+            return false;
+        }
+        struct Translation {
+            WORD language;
+            WORD codePage;
+        };
+        Translation* translations = nullptr;
+        UINT translationBytes = 0;
+        if (VerQueryValueW(
+                versionInfo.data(),
+                L"\\VarFileInfo\\Translation",
+                reinterpret_cast<void**>(&translations),
+                &translationBytes) == FALSE ||
+            translations == nullptr) {
+            return false;
+        }
+        for (UINT index = 0;
+             index < translationBytes / sizeof(Translation);
+             ++index) {
+            wchar_t query[64]{};
+            swprintf_s(
+                query,
+                L"\\StringFileInfo\\%04x%04x\\ProductName",
+                translations[index].language,
+                translations[index].codePage);
+            wchar_t* product = nullptr;
+            UINT characters = 0;
+            if (VerQueryValueW(
+                    versionInfo.data(),
+                    query,
+                    reinterpret_cast<void**>(&product),
+                    &characters) != FALSE &&
+                product != nullptr &&
+                CompareStringOrdinal(
+                    product,
+                    -1,
+                    L"Lattice",
+                    -1,
+                    TRUE) == CSTR_EQUAL) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    const std::wstring standardPath = environmentValue(
+        L"LATTICE_SMOKE_UPDATE_STANDARD_INSTALLER");
+    const std::wstring offlinePath = environmentValue(
+        L"LATTICE_SMOKE_UPDATE_OFFLINE_INSTALLER");
+    const std::wstring standardDigest = environmentValue(
+        L"LATTICE_SMOKE_UPDATE_STANDARD_SHA256");
+    const std::wstring offlineDigest = environmentValue(
+        L"LATTICE_SMOKE_UPDATE_OFFLINE_SHA256");
+    const std::wstring rootValue = environmentValue(
+        L"LATTICE_SMOKE_UPDATE_ROOT");
+    if (standardPath.empty() || offlinePath.empty() ||
+        standardDigest.empty() || offlineDigest.empty() || rootValue.empty()) {
+        std::wcerr << L"Update package smoke environment is incomplete\n";
+        return 1;
+    }
+
+    const std::filesystem::path root =
+        std::filesystem::absolute(rootValue).lexically_normal();
+    std::error_code error;
+    std::filesystem::remove_all(root, error);
+    error.clear();
+    std::filesystem::create_directories(root, error);
+    if (error) {
+        std::wcerr << L"Update package smoke root could not be created\n";
+        return 2;
+    }
+
+    const std::array<std::pair<std::wstring, std::wstring>, 2> packages{{
+        {standardPath, standardDigest},
+        {offlinePath, offlineDigest},
+    }};
+    UpdateReleaseAsset standardAsset;
+    for (size_t index = 0; index < packages.size(); ++index) {
+        const std::filesystem::path source(packages[index].first);
+        if (!std::filesystem::is_regular_file(source, error) || error) {
+            std::wcerr << L"Update package fixture is missing\n";
+            return 3;
+        }
+        UpdateReleaseAsset asset;
+        asset.version = L"0.4.58";
+        asset.name = source.filename().wstring();
+        asset.downloadUrl = L"https://example.invalid/" + asset.name;
+        asset.size = std::filesystem::file_size(source, error);
+        if (error || !parseDigest(packages[index].second, asset.sha256)) {
+            std::wcerr << L"Update package digest fixture is invalid\n";
+            return 4;
+        }
+        if (!oldStrictIdentityAccepted(source.wstring()) ||
+            UpdateService::ValidateDownloadedInstaller(source.wstring(), asset) !=
+                UpdateInstallerValidationFailure::None) {
+            std::wcerr << L"Real update package identity validation failed\n";
+            return 5;
+        }
+
+        const std::filesystem::path partial =
+            root / (index == 0 ? L"standard.exe.part" : L"offline.exe.part");
+        std::filesystem::copy_file(
+            source,
+            partial,
+            std::filesystem::copy_options::overwrite_existing,
+            error);
+        if (error ||
+            UpdateService::ValidateDownloadedInstaller(partial.wstring(), asset) !=
+                UpdateInstallerValidationFailure::None) {
+            std::wcerr << L".exe.part update validation failed\n";
+            return 6;
+        }
+        if (index == 0) standardAsset = asset;
+    }
+
+    const std::filesystem::path standardSource(standardPath);
+    const std::filesystem::path corrupted = root / L"corrupted.exe.part";
+    std::filesystem::copy_file(
+        standardSource,
+        corrupted,
+        std::filesystem::copy_options::overwrite_existing,
+        error);
+    if (error) return 7;
+    {
+        std::fstream stream(
+            corrupted,
+            std::ios::in | std::ios::out | std::ios::binary);
+        char byte = 0;
+        stream.seekg(1024);
+        stream.read(&byte, 1);
+        byte ^= 0x5a;
+        stream.seekp(1024);
+        stream.write(&byte, 1);
+        if (!stream) return 8;
+    }
+    if (UpdateService::ValidateDownloadedInstaller(
+            corrupted.wstring(),
+            standardAsset) != UpdateInstallerValidationFailure::DigestMismatch) {
+        std::wcerr << L"Corrupted installer was not rejected by SHA-256\n";
+        return 9;
+    }
+
+    const std::filesystem::path truncated = root / L"truncated.exe.part";
+    std::filesystem::copy_file(
+        standardSource,
+        truncated,
+        std::filesystem::copy_options::overwrite_existing,
+        error);
+    if (error || standardAsset.size < 2) return 10;
+    std::filesystem::resize_file(truncated, standardAsset.size - 1, error);
+    if (error ||
+        UpdateService::ValidateDownloadedInstaller(
+            truncated.wstring(),
+            standardAsset) != UpdateInstallerValidationFailure::SizeMismatch) {
+        std::wcerr << L"Truncated installer was not rejected by size\n";
+        return 11;
+    }
+
+    UpdateReleaseAsset wrongDigest = standardAsset;
+    wrongDigest.sha256[0] ^= 0xff;
+    if (UpdateService::ValidateDownloadedInstaller(
+            standardPath,
+            wrongDigest) != UpdateInstallerValidationFailure::DigestMismatch) {
+        return 12;
+    }
+    UpdateReleaseAsset wrongVersion = standardAsset;
+    wrongVersion.version = L"0.4.59";
+    if (UpdateService::ValidateDownloadedInstaller(
+            standardPath,
+            wrongVersion) != UpdateInstallerValidationFailure::VersionMismatch) {
+        return 13;
+    }
+
+    const std::filesystem::path nonPe = root / L"not-an-installer.exe.part";
+    {
+        std::ofstream stream(nonPe, std::ios::binary);
+        stream.write("abc", 3);
+        if (!stream) return 14;
+    }
+    UpdateReleaseAsset nonPeAsset;
+    nonPeAsset.version = L"0.4.58";
+    nonPeAsset.size = 3;
+    if (!parseDigest(
+            L"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+            nonPeAsset.sha256) ||
+        UpdateService::ValidateDownloadedInstaller(
+            nonPe.wstring(),
+            nonPeAsset) !=
+            UpdateInstallerValidationFailure::VersionMetadataMissing) {
+        std::wcerr << L"Non-PE payload was not rejected by identity validation\n";
+        return 15;
+    }
+
+    std::filesystem::remove_all(root, error);
+    if (error || std::filesystem::exists(root)) {
+        std::wcerr << L"Update package smoke cleanup failed\n";
+        return 16;
+    }
+    std::wcout <<
+        L"Real standard/offline installers, .part, corruption and truncation passed\n";
+    return 0;
+}
+
 int RunSmokeUpdateAndDialog() {
     AttachParentConsole();
     std::wstring version;
@@ -11259,8 +11521,30 @@ int RunSmokeUpdateAndDialog() {
         return 1;
     }
 
-    const std::string allAssetsForward = R"({"tag_name":"v0.4.50","assets":[{"name":"Lattice-Setup-Latest-Offline.exe","browser_download_url":"https://example.invalid/Lattice-Setup-Latest-Offline.exe"},{"name":"Lattice-Setup-0.4.50-Offline.exe","browser_download_url":"https://example.invalid/Lattice-Setup-0.4.50-Offline.exe"},{"name":"Lattice-Setup-Latest.exe","browser_download_url":"https://example.invalid/Lattice-Setup-Latest.exe"},{"name":"Lattice-Setup-0.4.50.exe","browser_download_url":"https://example.invalid/Lattice-Setup-0.4.50.exe"}]})";
-    const std::string allAssetsReverse = R"({"tag_name":"v0.4.50","assets":[{"name":"Lattice-Setup-0.4.50.exe","browser_download_url":"https://example.invalid/Lattice-Setup-0.4.50.exe"},{"name":"Lattice-Setup-Latest.exe","browser_download_url":"https://example.invalid/Lattice-Setup-Latest.exe"},{"name":"Lattice-Setup-0.4.50-Offline.exe","browser_download_url":"https://example.invalid/Lattice-Setup-0.4.50-Offline.exe"},{"name":"Lattice-Setup-Latest-Offline.exe","browser_download_url":"https://example.invalid/Lattice-Setup-Latest-Offline.exe"}]})";
+    const std::string digestLower(64, 'a');
+    const std::string digestUpper(64, 'B');
+    const auto assetJson = [](const std::string& name,
+                              std::uint64_t size,
+                              const std::string& digest) {
+        return std::string{"{\"name\":\""} + name +
+            "\",\"browser_download_url\":\"https://example.invalid/" + name +
+            "\",\"size\":" + std::to_string(size) +
+            ",\"digest\":\"sha256:" + digest + "\"}";
+    };
+    const std::string versionedStandard =
+        assetJson("Lattice-Setup-0.4.50.exe", 1001, digestLower);
+    const std::string latestStandard =
+        assetJson("Lattice-Setup-Latest.exe", 1002, digestUpper);
+    const std::string versionedOffline =
+        assetJson("Lattice-Setup-0.4.50-Offline.exe", 1003, digestLower);
+    const std::string latestOffline =
+        assetJson("Lattice-Setup-Latest-Offline.exe", 1004, digestUpper);
+    const std::string allAssetsForward =
+        "{\"tag_name\":\"v0.4.50\",\"assets\":[" + latestOffline + "," +
+        versionedOffline + "," + latestStandard + "," + versionedStandard + "]}";
+    const std::string allAssetsReverse =
+        "{\"tag_name\":\"v0.4.50\",\"assets\":[" + versionedStandard + "," +
+        latestStandard + "," + versionedOffline + "," + latestOffline + "]}";
     const auto selects = [&version, &url](
         const std::string& metadata,
         UpdatePackageVariant variant,
@@ -11290,10 +11574,17 @@ int RunSmokeUpdateAndDialog() {
         return 2;
     }
 
-    const std::string standardLatestJson = R"({"tag_name":"0.4.50","assets":[{"name":"Lattice-Setup-Latest-Offline.exe","browser_download_url":"https://example.invalid/Lattice-Setup-Latest-Offline.exe"},{"name":"Lattice-Setup-0.4.50-Offline.exe","browser_download_url":"https://example.invalid/Lattice-Setup-0.4.50-Offline.exe"},{"name":"Lattice-Setup-Latest.exe","browser_download_url":"https://example.invalid/Lattice-Setup-Latest.exe"}]})";
-    const std::string offlineOnlyJson = R"({"tag_name":"0.4.50","assets":[{"name":"Lattice-Setup-Latest-Offline.exe","browser_download_url":"https://example.invalid/Lattice-Setup-Latest-Offline.exe"},{"name":"Lattice-Setup-0.4.50-Offline.exe","browser_download_url":"https://example.invalid/Lattice-Setup-0.4.50-Offline.exe"}]})";
-    const std::string latestOfflineJson = R"({"tag_name":"0.4.50","assets":[{"name":"Lattice-Setup-0.4.50.exe","browser_download_url":"https://example.invalid/Lattice-Setup-0.4.50.exe"},{"name":"Lattice-Setup-Latest-Offline.exe","browser_download_url":"https://example.invalid/Lattice-Setup-Latest-Offline.exe"}]})";
-    const std::string latestOfflineOnlyJson = R"({"tag_name":"0.4.50","assets":[{"name":"Lattice-Setup-Latest-Offline.exe","browser_download_url":"https://example.invalid/Lattice-Setup-Latest-Offline.exe"}]})";
+    const std::string standardLatestJson =
+        "{\"tag_name\":\"0.4.50\",\"assets\":[" + latestOffline + "," +
+        versionedOffline + "," + latestStandard + "]}";
+    const std::string offlineOnlyJson =
+        "{\"tag_name\":\"0.4.50\",\"assets\":[" + latestOffline + "," +
+        versionedOffline + "]}";
+    const std::string latestOfflineJson =
+        "{\"tag_name\":\"0.4.50\",\"assets\":[" + versionedStandard + "," +
+        latestOffline + "]}";
+    const std::string latestOfflineOnlyJson =
+        "{\"tag_name\":\"0.4.50\",\"assets\":[" + latestOffline + "]}";
     if (!selects(
             standardLatestJson,
             UpdatePackageVariant::Standard,
@@ -11317,7 +11608,22 @@ int RunSmokeUpdateAndDialog() {
         return 20;
     }
 
-    const std::string standardOnlyJson = R"({"tag_name":"0.4.50","assets":[{"name":"Lattice-Setup-0.4.50.exe","browser_download_url":"https://example.invalid/Lattice-Setup-0.4.50.exe"},{"name":"Lattice-Setup-Latest.exe","browser_download_url":"https://example.invalid/Lattice-Setup-Latest.exe"}]})";
+    UpdateReleaseAsset selectedAsset;
+    if (!UpdateService::SelectReleaseAssetMetadataForVariant(
+            allAssetsForward,
+            UpdatePackageVariant::Standard,
+            selectedAsset) ||
+        selectedAsset.version != L"0.4.50" ||
+        selectedAsset.name != L"Lattice-Setup-0.4.50.exe" ||
+        selectedAsset.size != 1001 || selectedAsset.sha256[0] != 0xaa ||
+        selectedAsset.sha256[31] != 0xaa) {
+        std::wcerr << L"Update release metadata parsing failed\n";
+        return 21;
+    }
+
+    const std::string standardOnlyJson =
+        "{\"tag_name\":\"0.4.50\",\"assets\":[" + versionedStandard + "," +
+        latestStandard + "]}";
     version = L"stale";
     url = L"stale";
     if (UpdateService::SelectReleaseAssetForVariant(
@@ -11329,7 +11635,46 @@ int RunSmokeUpdateAndDialog() {
         UpdateService::SelectReleaseAsset(
             R"({"tag_name":"next","assets":[]})", version, url)) {
         std::wcerr << L"Offline update asset selection did not fail closed\n";
-        return 21;
+        return 22;
+    }
+
+    const std::string missingDigest =
+        R"({"tag_name":"0.4.50","assets":[{"name":"Lattice-Setup-0.4.50.exe","browser_download_url":"https://example.invalid/Lattice-Setup-0.4.50.exe","size":1001}]})";
+    const std::string duplicateSize =
+        "{\"tag_name\":\"0.4.50\",\"assets\":[{\"name\":\"Lattice-Setup-0.4.50.exe\",\"browser_download_url\":\"https://example.invalid/Lattice-Setup-0.4.50.exe\",\"size\":1001,\"size\":1001,\"digest\":\"sha256:" +
+        digestLower + "\"}]}";
+    const std::string duplicateCandidate =
+        "{\"tag_name\":\"0.4.50\",\"assets\":[" + versionedStandard + "," +
+        versionedStandard + "]}";
+    const std::string insecureUrl =
+        "{\"tag_name\":\"0.4.50\",\"assets\":[{\"name\":\"Lattice-Setup-0.4.50.exe\",\"browser_download_url\":\"http://example.invalid/Lattice-Setup-0.4.50.exe\",\"size\":1001,\"digest\":\"sha256:" +
+        digestLower + "\"}]}";
+    const std::string invalidDigest =
+        "{\"tag_name\":\"0.4.50\",\"assets\":[{\"name\":\"Lattice-Setup-0.4.50.exe\",\"browser_download_url\":\"https://example.invalid/Lattice-Setup-0.4.50.exe\",\"size\":1001,\"digest\":\"sha256:" +
+        std::string(63, 'a') + "z\"}]}";
+    for (const std::string* invalid : {
+             &missingDigest,
+             &duplicateSize,
+             &duplicateCandidate,
+             &insecureUrl,
+             &invalidDigest}) {
+        if (UpdateService::SelectReleaseAssetMetadataForVariant(
+                *invalid,
+                UpdatePackageVariant::Standard,
+                selectedAsset)) {
+            std::wcerr << L"Invalid update metadata was accepted\n";
+            return 23;
+        }
+    }
+
+    if (!UpdateService::IsAcceptedInstallerProductName(L"Lattice") ||
+        !UpdateService::IsAcceptedInstallerProductName(L"lattice   ") ||
+        UpdateService::IsAcceptedInstallerProductName(L" Lattice") ||
+        UpdateService::IsAcceptedInstallerProductName(L"Lat tice") ||
+        UpdateService::IsAcceptedInstallerProductName(L"Lattice\u00a0") ||
+        UpdateService::IsAcceptedInstallerProductName(L"Luno")) {
+        std::wcerr << L"Installer ProductName normalization matrix failed\n";
+        return 24;
     }
 
     const RECT primaryWork{0, 0, 1920, 1040};
@@ -14380,6 +14725,9 @@ std::optional<int> RunSmokeOrPreviewCommand(
     }
     if (HasArgument(commandLine, L"--smoke-update-dialog")) {
         return RunSmokeUpdateAndDialog();
+    }
+    if (HasArgument(commandLine, L"--smoke-update-packages")) {
+        return RunSmokeUpdatePackages();
     }
     if (HasArgument(commandLine, L"--smoke-real-desktop-grid-snapshot")) {
         return RunSmokeRealDesktopGridSnapshot();

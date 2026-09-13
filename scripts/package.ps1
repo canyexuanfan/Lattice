@@ -9,9 +9,11 @@ $buildScript = Join-Path $PSScriptRoot "build.ps1"
 $projectFile = Join-Path $projectRoot "Lattice.vcxproj"
 $releaseDir = Join-Path $projectRoot "x64\Release"
 $offlineReleaseDir = Join-Path $projectRoot "x64\ReleaseOffline"
+$debugExe = Join-Path $projectRoot "x64\Debug\Lattice.exe"
 $releaseOutputDir = Join-Path $projectRoot "release"
 $installerScript = Join-Path $projectRoot "installer\Lattice.iss"
 $signScript = Join-Path $PSScriptRoot "sign-artifacts.ps1"
+$normalizeInstallerProductNameScript = Join-Path $PSScriptRoot "Normalize-InnoProductName.ps1"
 $shortcutOverlayAsset = Join-Path $projectRoot "assets\branding\lattice-shortcut-overlay.ico"
 $resourceScript = Join-Path $projectRoot "src\app\Lattice.rc"
 $iconCacheSourcePath = Join-Path $projectRoot "src\rendering\IconCache.cpp"
@@ -21,6 +23,7 @@ foreach ($requiredPath in @(
     $projectFile,
     $installerScript,
     $signScript,
+    $normalizeInstallerProductNameScript,
     $shortcutOverlayAsset,
     $resourceScript,
     $iconCacheSourcePath,
@@ -233,6 +236,7 @@ if ($forbiddenOfflineDependencies.Count -ne 0) {
 }
 $allowedOfflineDependencies = @(
     "ADVAPI32.DLL",
+    "BCRYPT.DLL",
     "COMDLG32.DLL",
     "COMCTL32.DLL",
     "D2D1.DLL",
@@ -314,6 +318,9 @@ if (!(Test-Path -LiteralPath $offlineVersionedInstaller)) {
     throw "Offline installer output not found: $offlineVersionedInstaller"
 }
 
+& $normalizeInstallerProductNameScript -Path $versionedInstaller | Out-Null
+& $normalizeInstallerProductNameScript -Path $offlineVersionedInstaller | Out-Null
+
 & $signScript -ArtifactPath @($versionedInstaller, $offlineVersionedInstaller) | Out-Null
 
 function Assert-InstallerMetadata([string]$Installer, [string]$Label) {
@@ -337,7 +344,7 @@ if (
     throw "$Label version mismatch. Expected file=$expectedBinaryVersion and product=$installerVersion, file-string=$installerFileVersionString, file-fixed=$installerFileVersionFixed, product=$installerProductVersionText"
 }
 if (
-    $installerVersionInfo.ProductName.Trim() -ne "Lattice" -or
+    $installerVersionInfo.ProductName -cne "Lattice" -or
     $installerVersionInfo.FileDescription.Trim() -ne "Lattice Setup" -or
     $installerVersionInfo.CompanyName.Trim() -ne "Lattice"
 ) {
@@ -403,6 +410,41 @@ if ($versionedHash -ne $latestHash) {
 }
 if ($offlineVersionedHash -ne $offlineLatestHash) {
     throw "Latest offline installer hash does not match the versioned offline installer."
+}
+
+if (!(Test-Path -LiteralPath $debugExe -PathType Leaf)) {
+    throw "Debug executable required for real update package validation was not found: $debugExe"
+}
+$updateSmokeRoot = Join-Path $projectRoot ".workspace\smoke-runs\update-package-validation"
+$previousUpdateSmokeEnvironment = @{}
+foreach ($name in @(
+    "LATTICE_SMOKE_UPDATE_STANDARD_INSTALLER",
+    "LATTICE_SMOKE_UPDATE_OFFLINE_INSTALLER",
+    "LATTICE_SMOKE_UPDATE_STANDARD_SHA256",
+    "LATTICE_SMOKE_UPDATE_OFFLINE_SHA256",
+    "LATTICE_SMOKE_UPDATE_ROOT")) {
+    $previousUpdateSmokeEnvironment[$name] = [Environment]::GetEnvironmentVariable($name, "Process")
+}
+try {
+    $env:LATTICE_SMOKE_UPDATE_STANDARD_INSTALLER = $versionedInstaller
+    $env:LATTICE_SMOKE_UPDATE_OFFLINE_INSTALLER = $offlineVersionedInstaller
+    $env:LATTICE_SMOKE_UPDATE_STANDARD_SHA256 = $versionedHash
+    $env:LATTICE_SMOKE_UPDATE_OFFLINE_SHA256 = $offlineVersionedHash
+    $env:LATTICE_SMOKE_UPDATE_ROOT = $updateSmokeRoot
+    & $debugExe --smoke-update-packages
+    if ($LASTEXITCODE -ne 0) {
+        throw "Real update package validation failed with exit code $LASTEXITCODE"
+    }
+} finally {
+    foreach ($name in $previousUpdateSmokeEnvironment.Keys) {
+        [Environment]::SetEnvironmentVariable(
+            $name,
+            $previousUpdateSmokeEnvironment[$name],
+            "Process")
+    }
+}
+if (Test-Path -LiteralPath $updateSmokeRoot) {
+    throw "Real update package validation did not clean its workspace root: $updateSmokeRoot"
 }
 
 Write-Host "Installer built: $versionedInstaller"

@@ -2,7 +2,7 @@
 ; 先运行 scripts\package.ps1 构建 Release 并调用 ISCC.exe。
 
 #define MyAppName "Lattice"
-#define MyAppVersion "0.4.57"
+#define MyAppVersion "0.4.58"
 #define MyAuthorSignature "@十七°"
 #define MyAppPublisher "Lattice"
 #define MyAppExeName "Lattice.exe"
