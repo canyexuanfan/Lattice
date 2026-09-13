@@ -13,6 +13,8 @@ public:
         bool required = false;
         bool completed = true;
         std::wstring warning;
+
+        std::wstring Notice() const;
     };
 
     static bool IsRequired(

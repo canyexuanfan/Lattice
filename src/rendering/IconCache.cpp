@@ -6,6 +6,7 @@
 #include <shellapi.h>
 #include <shlobj.h>
 #include <shobjidl.h>
+#include <shlwapi.h>
 
 #include <algorithm>
 #include <array>
@@ -89,6 +90,31 @@ struct IconAsyncState {
 namespace {
 
 constexpr ULONGLONG kFailedIconRetryDelayMilliseconds = 2000;
+constexpr int kDefaultThumbnailPixelSize = 72;
+
+bool IsShellImageFile(const std::wstring& path, DWORD attributes) {
+    if (path.empty() ||
+        attributes == INVALID_FILE_ATTRIBUTES ||
+        (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+        return false;
+    }
+    const wchar_t* extension = PathFindExtensionW(path.c_str());
+    if (extension == nullptr || *extension == L'\0') {
+        return false;
+    }
+    PERCEIVED perceived = PERCEIVED_TYPE_UNSPECIFIED;
+    PERCEIVEDFLAG flags = PERCEIVEDFLAG_UNDEFINED;
+    wchar_t* perceivedTypeName = nullptr;
+    const HRESULT result = AssocGetPerceivedType(
+        extension,
+        &perceived,
+        &flags,
+        &perceivedTypeName);
+    if (perceivedTypeName != nullptr) {
+        CoTaskMemFree(perceivedTypeName);
+    }
+    return SUCCEEDED(result) && perceived == PERCEIVED_TYPE_IMAGE;
+}
 
 void RecordFailedIconLoadLocked(
     IconAsyncState& state,
@@ -748,6 +774,10 @@ private:
             const bool directory =
                 attributes != INVALID_FILE_ATTRIBUTES &&
                 (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+            const bool imageFile = IsShellImageFile(loadPath, attributes);
+            const int thumbnailPixelSize = desiredPixelSize > 0
+                ? desiredPixelSize
+                : (imageFile ? kDefaultThumbnailPixelSize : 0);
             int shellSystemImageIndex = -1;
             int shellOverlayIndex = 0;
             const bool hasShellImageIdentity =
@@ -756,10 +786,10 @@ private:
                     loadPath,
                     shellSystemImageIndex,
                     shellOverlayIndex);
-            HICON icon = directory
+            HICON icon = (directory || imageFile)
                 ? LoadShellItemImage(
                     loadPath,
-                    desiredPixelSize,
+                    thumbnailPixelSize,
                     false)
                 : nullptr;
             if (icon != nullptr) {
@@ -770,7 +800,7 @@ private:
                         icon,
                         shellOverlayIndex,
                         needsShield,
-                        desiredPixelSize);
+                        thumbnailPixelSize);
                     if (decorated != nullptr) {
                         DestroyIcon(icon);
                         icon = decorated;

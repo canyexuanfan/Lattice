@@ -45,6 +45,18 @@ void ClearLegacyVisibility(ItemConfig& item) {
 
 }  // namespace
 
+std::wstring LegacyStorageMigrator::StartupAttempt::Notice() const {
+    if (completed) {
+        return {};
+    }
+    const std::wstring detail = warning.empty()
+        ? L"历史迁移未完成，具体原因暂不可用。"
+        : warning;
+    return
+        L"检测到旧版受管项目尚未全部迁回桌面：\n" + detail +
+        L"\n两端文件和配置均已保留；新收纳不会移动桌面原件。";
+}
+
 bool LegacyStorageMigrator::IsRequired(
     const AppConfig& config,
     const ManagedShortcutStore& managedStore) {

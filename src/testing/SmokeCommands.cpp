@@ -1944,6 +1944,54 @@ bool CaptureIconPixels(
     return succeeded;
 }
 
+HICON LoadSmokeShellItemImage(
+    const std::wstring& path,
+    int desiredPixelSize,
+    bool iconOnly) {
+    Microsoft::WRL::ComPtr<IShellItemImageFactory> imageFactory;
+    if (path.empty() || desiredPixelSize <= 0 ||
+        FAILED(SHCreateItemFromParsingName(
+            path.c_str(),
+            nullptr,
+            IID_PPV_ARGS(imageFactory.GetAddressOf()))) ||
+        imageFactory == nullptr) {
+        return nullptr;
+    }
+    HBITMAP bitmap = nullptr;
+    const SIZE size{desiredPixelSize, desiredPixelSize};
+    const SIIGBF flags = static_cast<SIIGBF>(
+        SIIGBF_RESIZETOFIT | SIIGBF_BIGGERSIZEOK |
+        (iconOnly ? SIIGBF_ICONONLY : 0));
+    if (FAILED(imageFactory->GetImage(size, flags, &bitmap)) ||
+        bitmap == nullptr) {
+        return nullptr;
+    }
+    BITMAP bitmapInfo{};
+    if (GetObjectW(bitmap, sizeof(bitmapInfo), &bitmapInfo) == 0 ||
+        bitmapInfo.bmWidth <= 0 || bitmapInfo.bmHeight <= 0) {
+        DeleteObject(bitmap);
+        return nullptr;
+    }
+    HBITMAP mask = CreateBitmap(
+        bitmapInfo.bmWidth,
+        bitmapInfo.bmHeight,
+        1,
+        1,
+        nullptr);
+    ICONINFO iconInfo{};
+    iconInfo.fIcon = TRUE;
+    iconInfo.hbmColor = bitmap;
+    iconInfo.hbmMask = mask;
+    HICON icon = mask != nullptr
+        ? CreateIconIndirect(&iconInfo)
+        : nullptr;
+    if (mask != nullptr) {
+        DeleteObject(mask);
+    }
+    DeleteObject(bitmap);
+    return icon;
+}
+
 HICON LoadSmokeShellIcon(
     const std::wstring& path,
     bool includeOverlay,
@@ -3963,6 +4011,120 @@ int RunSmokeShortcutOverlay(HINSTANCE instance) {
     std::wcout << L"Shortcut overlay index: " << overlayIndex << L"\n";
     std::wcout << L"Ordinary file overlay index: " << ordinaryOverlayIndex << L"\n";
     std::wcout << L"Shortcut overlay shell composition: PASS\n";
+    return 0;
+}
+
+int RunSmokeImageThumbnail() {
+    AttachParentConsole();
+    const DWORD required = GetEnvironmentVariableW(
+        L"DESKTOP_ORGANIZER_SMOKE_ITEMS_DIR", nullptr, 0);
+    if (required == 0) {
+        std::wcerr << L"Explicit image thumbnail smoke directory is required\n";
+        return 1;
+    }
+    std::wstring baseValue(required, L'\0');
+    const DWORD copied = GetEnvironmentVariableW(
+        L"DESKTOP_ORGANIZER_SMOKE_ITEMS_DIR",
+        baseValue.data(),
+        required);
+    if (copied == 0 || copied >= required) {
+        std::wcerr << L"Image thumbnail smoke directory is invalid\n";
+        return 1;
+    }
+    baseValue.resize(copied);
+
+    std::error_code fileError;
+    const std::filesystem::path testRoot =
+        std::filesystem::absolute(baseValue).lexically_normal() /
+        (L"image-thumbnail-" + std::to_wstring(GetCurrentProcessId()));
+    if (!std::filesystem::create_directories(testRoot, fileError) || fileError) {
+        std::wcerr << L"Image thumbnail smoke directory setup failed\n";
+        return 1;
+    }
+    const auto fail = [&](const std::wstring& message, int code) {
+        std::wcerr << message << L"\n";
+        std::error_code cleanupError;
+        std::filesystem::remove_all(testRoot, cleanupError);
+        return code;
+    };
+
+    constexpr LONG width = 96;
+    constexpr LONG height = 64;
+    std::vector<std::uint32_t> fixturePixels(
+        static_cast<size_t>(width) * height);
+    for (LONG y = 0; y < height; ++y) {
+        for (LONG x = 0; x < width; ++x) {
+            const bool accent = ((x / 12) + (y / 8)) % 2 == 0;
+            fixturePixels[static_cast<size_t>(y) * width + x] = accent
+                ? 0x00E04030U
+                : 0x0020A060U;
+        }
+    }
+    const std::filesystem::path imagePath = testRoot / L"内容预览.bmp";
+    if (!SaveCapturedPixelsBmp(
+            RECT{0, 0, width, height}, fixturePixels, imagePath)) {
+        return fail(L"Image thumbnail fixture creation failed", 2);
+    }
+
+    HICON expectedThumbnail = LoadSmokeShellItemImage(
+        imagePath.wstring(), 72, false);
+    HICON typeIcon = LoadSmokeShellItemImage(
+        imagePath.wstring(), 72, true);
+    IconCache widgetCache;
+    widgetCache.Preload(imagePath.wstring());
+    HICON widgetIcon = nullptr;
+    const ULONGLONG widgetDeadline = GetTickCount64() + 3000;
+    while (widgetIcon == nullptr && GetTickCount64() < widgetDeadline) {
+        Sleep(10);
+        widgetIcon = widgetCache.CopyReadyIconForDrag(imagePath.wstring());
+    }
+    IconCache desktopCache;
+    desktopCache.PreloadShellIcon(
+        imagePath.wstring(), -1, 0, 72, nullptr, 48);
+    HICON desktopIcon = nullptr;
+    const ULONGLONG desktopDeadline = GetTickCount64() + 3000;
+    while (desktopIcon == nullptr && GetTickCount64() < desktopDeadline) {
+        Sleep(10);
+        desktopIcon = desktopCache.CopyReadyIconForDrag(imagePath.wstring());
+    }
+
+    std::vector<std::uint32_t> expectedPixels;
+    std::vector<std::uint32_t> typePixels;
+    std::vector<std::uint32_t> widgetPixels;
+    std::vector<std::uint32_t> desktopPixels;
+    const bool captured =
+        CaptureIconPixels(expectedThumbnail, expectedPixels) &&
+        CaptureIconPixels(typeIcon, typePixels) &&
+        CaptureIconPixels(widgetIcon, widgetPixels) &&
+        CaptureIconPixels(desktopIcon, desktopPixels);
+    if (expectedThumbnail != nullptr) {
+        DestroyIcon(expectedThumbnail);
+    }
+    if (typeIcon != nullptr) {
+        DestroyIcon(typeIcon);
+    }
+    if (widgetIcon != nullptr) {
+        DestroyIcon(widgetIcon);
+    }
+    if (desktopIcon != nullptr) {
+        DestroyIcon(desktopIcon);
+    }
+    if (!captured) {
+        return fail(L"Image thumbnail Shell oracle or cache result was unavailable", 3);
+    }
+    if (expectedPixels == typePixels) {
+        return fail(L"Image thumbnail fixture did not distinguish content from its type icon", 4);
+    }
+    if (widgetPixels != expectedPixels || desktopPixels != expectedPixels) {
+        return fail(L"Widget or desktop image result did not match the Windows Shell thumbnail", 5);
+    }
+
+    std::filesystem::remove_all(testRoot, fileError);
+    if (fileError) {
+        std::wcerr << L"Unable to clean image thumbnail smoke fixture\n";
+        return 6;
+    }
+    std::wcout << L"Widget and desktop image Shell thumbnails: PASS\n";
     return 0;
 }
 
@@ -11391,7 +11553,7 @@ int RunSmokeUpdatePackages() {
             return 3;
         }
         UpdateReleaseAsset asset;
-        asset.version = L"0.4.58";
+        asset.version = L"0.4.59";
         asset.name = source.filename().wstring();
         asset.downloadUrl = L"https://example.invalid/" + asset.name;
         asset.size = std::filesystem::file_size(source, error);
@@ -11473,7 +11635,7 @@ int RunSmokeUpdatePackages() {
         return 12;
     }
     UpdateReleaseAsset wrongVersion = standardAsset;
-    wrongVersion.version = L"0.4.59";
+    wrongVersion.version = L"0.4.60";
     if (UpdateService::ValidateDownloadedInstaller(
             standardPath,
             wrongVersion) != UpdateInstallerValidationFailure::VersionMismatch) {
@@ -11487,7 +11649,7 @@ int RunSmokeUpdatePackages() {
         if (!stream) return 14;
     }
     UpdateReleaseAsset nonPeAsset;
-    nonPeAsset.version = L"0.4.58";
+    nonPeAsset.version = L"0.4.59";
     nonPeAsset.size = 3;
     if (!parseDigest(
             L"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
@@ -12543,12 +12705,16 @@ int RunSmokeLegacyStorageMigration() {
         migrator.AttemptForStartup(
             configStore, managedStore, owner);
     errorMessage = conflictAttempt.warning;
+    const std::wstring conflictNotice = conflictAttempt.Notice();
     const bool conflictRejected =
         conflictAttempt.required && !conflictAttempt.completed;
     const std::optional<std::string> configAfterConflict =
         ReadFileBytes(configStore.ConfigPath());
     if (!conflictRejected ||
         !configBeforeConflict.has_value() ||
+        conflictAttempt.warning.empty() ||
+        conflictNotice.find(conflictAttempt.warning) == std::wstring::npos ||
+        conflictNotice.find(conflictTarget.wstring()) == std::wstring::npos ||
         configAfterConflict != configBeforeConflict ||
         ReadFileBytes(conflictManaged.wstring()) != conflictSourceBytes ||
         ReadFileBytes(conflictTarget.wstring()) != conflictTargetBytes ||
@@ -14499,6 +14665,7 @@ int RunSmokeAutoOrganizePreview(HINSTANCE instance) {
         window.Close();
         return 251;
     }
+    AutoOrganizePreviewWindowSmokeAccess::RenderNow(window);
     DwmFlush();
     if (!CaptureScreenPixels(hoverBounds, hoverAfter) ||
         hoverBefore.size() != hoverAfter.size() ||
@@ -14662,6 +14829,9 @@ std::optional<int> RunSmokeOrPreviewCommand(
     }
     if (HasArgument(commandLine, L"--smoke-shortcut-overlay")) {
         return RunSmokeShortcutOverlay(instance);
+    }
+    if (HasArgument(commandLine, L"--smoke-image-thumbnail")) {
+        return RunSmokeImageThumbnail();
     }
     if (HasArgument(commandLine, L"--smoke-widget-alignment")) {
         return RunSmokeWidgetAlignment(instance);

@@ -88,7 +88,7 @@ bool App::InitializeInternal(int showCommand, bool enableDesktopTakeover) {
         if (!migration.completed) {
             mainWindow_->ShowNonBlockingNotice(
                 L"Lattice 历史项目待处理",
-                L"一个旧版受管项目与当前桌面项目冲突。两端均已保留，Lattice 已继续正常运行；新收纳不会移动桌面原件。");
+                migration.Notice());
         }
         return true;
     }
