@@ -50,7 +50,7 @@ constexpr UINT_PTR kShellMutationCleanupTimerId = 7;
 constexpr UINT kShellMutationCleanupDelayMilliseconds = 500;
 constexpr unsigned int kMaximumShellMutationCleanupAttempts = 20;
 constexpr wchar_t kAlignmentGuideClassName[] = L"Lattice.AlignmentGuide";
-constexpr wchar_t kCurrentVersion[] = L"0.4.57";
+constexpr wchar_t kCurrentVersion[] = L"0.4.58";
 constexpr UINT kShellNewCommandFirst = 0x5000;
 constexpr UINT kShellNewCommandLast = 0x5FFF;
 
