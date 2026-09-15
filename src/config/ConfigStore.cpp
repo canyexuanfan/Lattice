@@ -903,6 +903,9 @@ AppConfig ConfigStore::LoadAppConfigFromDisk() const {
     config.settings.backupCount = std::clamp(readInt(L"settings.backupCount", config.settings.backupCount), 1, 10);
     config.settings.iconCacheSize = std::clamp(readInt(L"settings.iconCacheSize", config.settings.iconCacheSize), 64, 4096);
     config.settings.theme = std::clamp(readInt(L"settings.theme", config.settings.theme), 0, 2);
+    config.settings.desktopGridAlignmentInitialized = readBool(
+        L"settings.desktopGridAlignmentInitialized",
+        config.settings.desktopGridAlignmentInitialized);
     const auto currentIt = values.find(L"currentCategoryId");
     if (currentIt != values.end() && !currentIt->second.empty()) {
         config.currentCategoryId = currentIt->second;
@@ -1565,6 +1568,9 @@ bool ConfigStore::SaveAppConfigToDisk(const AppConfig& config) const {
     output << "settings.backupCount=" << config.settings.backupCount << "\n";
     output << "settings.iconCacheSize=" << std::clamp(config.settings.iconCacheSize, 64, 4096) << "\n";
     output << "settings.theme=" << config.settings.theme << "\n";
+    output << "settings.desktopGridAlignmentInitialized="
+           << (config.settings.desktopGridAlignmentInitialized ? 1 : 0)
+           << "\n";
     output << "window.x=" << config.window.x << "\n";
     output << "window.y=" << config.window.y << "\n";
     output << "window.width=" << config.window.width << "\n";

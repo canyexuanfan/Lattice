@@ -486,6 +486,20 @@ bool MainWindow::EnableDesktopDisplayTakeover(
     return true;
 }
 
+void MainWindow::ConfigureWidgetShellDrop(WidgetWindow& widget) {
+    widget.SetDesktopShellDropHandler(
+        [this](
+            const std::vector<std::wstring>& sourcePaths,
+            POINT screenPoint) -> std::optional<bool> {
+            if (desktopSurface_ == nullptr ||
+                desktopSurface_->Window() == nullptr) {
+                return std::nullopt;
+            }
+            return desktopSurface_->DropShellItemsOnTargetAtScreenPoint(
+                sourcePaths, screenPoint);
+        });
+}
+
 void MainWindow::ReloadPersistedState() {
     LoadOrganizerConfig();
     LoadDesktopItems();
@@ -617,7 +631,12 @@ void MainWindow::FlushDeferredRefresh() {
         return;
     }
     refreshPending_ = false;
-    if (hwnd_ != nullptr && IsWindow(hwnd_) != FALSE) {
+    if (HasPendingDesktopChanges()) {
+        ScheduleDesktopRefresh();
+    }
+    if (organizerRefreshPending_ &&
+        hwnd_ != nullptr && IsWindow(hwnd_) != FALSE) {
+        organizerRefreshPending_ = false;
         PostMessageW(hwnd_, kOrganizerConfigChangedMessage, 0, 0);
     }
 }
@@ -863,10 +882,8 @@ LRESULT MainWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
             });
             LoadDesktopItems();
             trayIcon_.Initialize(hwnd_, instance_);
-            desktopWatcher_.Start([hwnd = hwnd_]() {
-                if (hwnd != nullptr) {
-                    PostMessageW(hwnd, kDesktopChangedMessage, 0, 0);
-                }
+            desktopWatcher_.Start([this](DesktopChangeBatch changes) {
+                QueueDesktopChanges(std::move(changes));
             });
             desktopPlacementCoordinator_.AttachNotificationWindow(hwnd_);
             LayoutSearchEdit();
@@ -1494,6 +1511,37 @@ LRESULT MainWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
                     refreshPending_ = true;
                     return 0;
                 }
+                DesktopChangeBatch changes =
+                    TakePendingDesktopChanges();
+                if (changes.Empty()) {
+                    return 0;
+                }
+                if (changes.paths.empty()) {
+                    iconCache_.Clear();
+                    if (desktopSurface_ != nullptr) {
+                        desktopSurface_->RefreshIconCache();
+                    }
+                    for (auto& widget : widgetWindows_) {
+                        if (widget != nullptr && widget->IsOpen()) {
+                            widget->RefreshIconCache();
+                        }
+                    }
+                } else {
+                    iconCache_.Invalidate(changes.paths);
+                    if (desktopSurface_ != nullptr) {
+                        desktopSurface_->InvalidateIconCache(
+                            changes.paths);
+                    }
+                    for (auto& widget : widgetWindows_) {
+                        if (widget != nullptr && widget->IsOpen()) {
+                            widget->InvalidateIconCache(changes.paths);
+                        }
+                    }
+                }
+                if (!changes.requiresRescan) {
+                    InvalidateRect(hwnd_, nullptr, FALSE);
+                    return 0;
+                }
                 if (desktopSurface_ != nullptr) {
                     std::wstring ignored;
                     desktopSurface_->Refresh(ignored);
@@ -1503,7 +1551,6 @@ LRESULT MainWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
                     autoOrganizePreview_->MarkDesktopChanged();
                 }
                 InvalidateRect(hwnd_, nullptr, FALSE);
-                UpdateWindow(hwnd_);
                 return 0;
             }
             break;
@@ -1522,9 +1569,11 @@ LRESULT MainWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
                 dragVisualActive_ ||
                 !draggingItemId_.empty()) {
                 refreshPending_ = true;
+                organizerRefreshPending_ = true;
                 return 0;
             }
             refreshPending_ = false;
+            organizerRefreshPending_ = false;
             LoadOrganizerConfig();
             windowConfig_ = organizerConfig_.window;
             LoadDesktopItems();
@@ -2036,6 +2085,48 @@ void MainWindow::ScheduleDesktopRefresh() {
     if (hwnd_ != nullptr) {
         SetTimer(hwnd_, kDesktopRefreshTimerId, 650, nullptr);
     }
+}
+
+void MainWindow::QueueDesktopChanges(DesktopChangeBatch changes) {
+    if (changes.Empty()) {
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(desktopChangesMutex_);
+        pendingDesktopChanges_.requiresRescan |=
+            changes.requiresRescan;
+        for (std::wstring& path : changes.paths) {
+            const bool present = std::any_of(
+                pendingDesktopChanges_.paths.begin(),
+                pendingDesktopChanges_.paths.end(),
+                [&](const std::wstring& current) {
+                    return CompareStringOrdinal(
+                               current.c_str(), -1,
+                               path.c_str(), -1,
+                               TRUE) == CSTR_EQUAL;
+                });
+            if (!present) {
+                pendingDesktopChanges_.paths.push_back(
+                    std::move(path));
+            }
+        }
+    }
+    const HWND window = hwnd_;
+    if (window != nullptr && IsWindow(window) != FALSE) {
+        PostMessageW(window, kDesktopChangedMessage, 0, 0);
+    }
+}
+
+DesktopChangeBatch MainWindow::TakePendingDesktopChanges() {
+    std::lock_guard<std::mutex> lock(desktopChangesMutex_);
+    DesktopChangeBatch changes = std::move(pendingDesktopChanges_);
+    pendingDesktopChanges_ = {};
+    return changes;
+}
+
+bool MainWindow::HasPendingDesktopChanges() {
+    std::lock_guard<std::mutex> lock(desktopChangesMutex_);
+    return !pendingDesktopChanges_.Empty();
 }
 
 void MainWindow::RefreshSearchQuery() {
@@ -2609,6 +2700,7 @@ bool MainWindow::PublishReloadedOrganizerState(
             instance_, hwnd_, categoryId,
             static_cast<int>(widgetWindows_.size() +
                 preparedWidgets.size()) * 36);
+        ConfigureWidgetShellDrop(*widget);
         if (!widget->Create()) {
             for (auto& prepared : preparedWidgets) prepared->Close();
             return false;
@@ -3861,6 +3953,7 @@ void MainWindow::OpenCurrentCategoryWidget() {
 
     const int spawnOffset = static_cast<int>(widgetWindows_.size()) * 36;
     auto widget = std::make_unique<WidgetWindow>(instance_, hwnd_, categoryId, spawnOffset);
+    ConfigureWidgetShellDrop(*widget);
     if (!widget->Create()) {
         return;
     }
@@ -3899,6 +3992,7 @@ void MainWindow::OpenAllCategoryWidgets() {
             hwnd_,
             categoryId,
             static_cast<int>(index) * 36);
+        ConfigureWidgetShellDrop(*widget);
         if (widget->Create()) {
             widget->Show(SW_SHOWNOACTIVATE);
             widgetWindows_.push_back(std::move(widget));
@@ -4158,6 +4252,9 @@ void MainWindow::RenameItemDisplayName(const std::wstring& itemId) {
 
 void MainWindow::RefreshIconCache() {
     iconCache_.Clear();
+    if (desktopSurface_ != nullptr) {
+        desktopSurface_->RefreshIconCache();
+    }
     for (auto& widget : widgetWindows_) {
         if (widget != nullptr && widget->IsOpen()) {
             widget->RefreshIconCache();

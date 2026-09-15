@@ -5,6 +5,7 @@
 #include <wrl/client.h>
 
 #include <functional>
+#include <optional>
 #include <set>
 #include <string>
 #include <vector>
@@ -44,6 +45,9 @@ public:
     bool Refresh(
         std::wstring& errorMessage,
         bool refreshWallpaper = true);
+    void InvalidateIconCache(
+        const std::vector<std::wstring>& paths);
+    void RefreshIconCache();
     void UpdateAssignedIdentities(
         const std::vector<std::wstring>& assignedIdentities);
     void UpdateDisplayPositions(
@@ -57,6 +61,9 @@ public:
     void ConfirmUnassignedItemAt(
         const std::wstring& identity,
         POINT screenPoint);
+    std::optional<bool> DropShellItemsOnTargetAtScreenPoint(
+        const std::vector<std::wstring>& sourcePaths,
+        POINT screenPoint) const;
 
     HWND Window() const noexcept { return hwnd_; }
     const DesktopViewSnapshot& Snapshot() const noexcept { return snapshot_; }
@@ -97,6 +104,7 @@ private:
         CoordinateRejected,
         CommitRejected,
         Applied,
+        ShellTargetDropped,
     };
 #endif
 
@@ -197,6 +205,13 @@ private:
     bool BeginInternalDragSession(POINT sourceClientPoint);
     void EndInternalDragSession() noexcept;
     bool CommitInternalDesktopDrop(POINT dropScreenPoint);
+    bool TryInternalShellDropTargetAtScreenPoint(
+        POINT screenPoint,
+        ShellItemReference& targetItem) const;
+    bool TryShellDropTargetAtScreenPoint(
+        POINT screenPoint,
+        const std::vector<ShellItemReference>& excludedItems,
+        ShellItemReference& targetItem) const;
     static std::vector<DesktopPosition> OffsetDragPositions(
         const std::vector<DesktopPosition>& originalPositions,
         POINT sourceScreenPoint,

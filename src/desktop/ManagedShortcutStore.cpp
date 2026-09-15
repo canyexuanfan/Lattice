@@ -204,9 +204,13 @@ std::wstring SafeFolderName(const std::wstring& value) {
     return result.empty() ? L"uncategorized" : result;
 }
 
-std::wstring AvailableDestination(const std::wstring& directory, const std::wstring& fileName) {
+std::wstring AvailableDestination(
+    const std::wstring& directory,
+    const std::wstring& fileName,
+    const std::function<bool(const std::wstring&)>& isReserved = {}) {
     const std::wstring direct = JoinPath(directory, fileName);
-    if (GetFileAttributesW(direct.c_str()) == INVALID_FILE_ATTRIBUTES) {
+    if (GetFileAttributesW(direct.c_str()) == INVALID_FILE_ATTRIBUTES &&
+        (!isReserved || !isReserved(direct))) {
         return direct;
     }
 
@@ -218,7 +222,8 @@ std::wstring AvailableDestination(const std::wstring& directory, const std::wstr
         const std::wstring candidate = JoinPath(
             directory,
             stem + L" (" + std::to_wstring(suffix) + L")" + extension);
-        if (GetFileAttributesW(candidate.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        if (GetFileAttributesW(candidate.c_str()) == INVALID_FILE_ATTRIBUTES &&
+            (!isReserved || !isReserved(candidate))) {
             return candidate;
         }
     }
@@ -836,7 +841,8 @@ bool ManagedShortcutStore::MoveToOriginalDesktopBatch(
     const std::function<bool(const std::vector<std::pair<std::wstring, std::wstring>>&)>& persistDestinations,
     std::vector<std::pair<std::wstring, std::wstring>>& destinations,
     std::wstring& errorMessage,
-    HWND ownerWindow) {
+    HWND ownerWindow,
+    bool allowUniqueConflictDestinations) {
     destinations.clear();
     errorMessage.clear();
     if (requests.empty()) {
@@ -866,14 +872,34 @@ bool ManagedShortcutStore::MoveToOriginalDesktopBatch(
             errorMessage = L"历史桌面批量迁移包含无效路径；本次未移动任何项目。";
             return false;
         }
-        if (GetFileAttributesW(journal.destinationPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
-            errorMessage =
-                (IsPublicDesktopPath(journal.destinationPath)
-                    ? std::wstring(L"Public Desktop")
-                    : std::wstring(L"User Desktop")) +
-                L" 的原位置已被不同项目占用，已保留两端且未覆盖：" +
-                journal.destinationPath;
-            return false;
+        const auto destinationReserved = [&](const std::wstring& candidate) {
+            return std::any_of(
+                journals.begin(), journals.end(),
+                [&](const JournalEntry& value) {
+                    return PathsEqual(value.destinationPath, candidate);
+                });
+        };
+        if (GetFileAttributesW(journal.destinationPath.c_str()) != INVALID_FILE_ATTRIBUTES ||
+            destinationReserved(journal.destinationPath)) {
+            if (allowUniqueConflictDestinations) {
+                journal.destinationPath = AvailableDestination(
+                    destinationDirectory,
+                    FileNameFromPath(journal.destinationPath),
+                    destinationReserved);
+                if (journal.destinationPath.empty()) {
+                    errorMessage =
+                        L"历史桌面迁移无法生成安全的唯一文件名；本次未移动任何项目。";
+                    return false;
+                }
+            } else {
+                errorMessage =
+                    (IsPublicDesktopPath(journal.destinationPath)
+                        ? std::wstring(L"Public Desktop")
+                        : std::wstring(L"User Desktop")) +
+                    L" 的原位置已被不同项目占用，已保留两端且未覆盖：" +
+                    journal.destinationPath;
+                return false;
+            }
         }
         if (std::any_of(journals.begin(), journals.end(), [&](const JournalEntry& value) {
                 return PathsEqual(value.destinationPath, journal.destinationPath) || value.itemId == journal.itemId;

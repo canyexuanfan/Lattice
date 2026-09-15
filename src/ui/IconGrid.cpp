@@ -1,6 +1,7 @@
 #include "ui/IconGrid.h"
 
 #include <algorithm>
+#include <cmath>
 
 namespace {
 
@@ -241,6 +242,19 @@ int IconGrid::HitTest(POINT point) const {
     return -1;
 }
 
+int IconGrid::PaintedIconHitTest(POINT point) const {
+    for (size_t index = 0; index < cells_.size(); ++index) {
+        const D2D1_RECT_F icon = PaintedIconRect(index);
+        if (static_cast<FLOAT>(point.x) >= icon.left &&
+            static_cast<FLOAT>(point.x) < icon.right &&
+            static_cast<FLOAT>(point.y) >= icon.top &&
+            static_cast<FLOAT>(point.y) < icon.bottom) {
+            return static_cast<int>(index);
+        }
+    }
+    return -1;
+}
+
 int IconGrid::SlotIndexForPoint(POINT point) const {
     if (cells_.empty()) {
         return -1;
@@ -394,16 +408,11 @@ void IconGrid::Draw(D2DContext& d2d, IconCache& iconCache) {
         if (cell.bottom < bounds_.top || cell.top > bounds_.bottom) {
             continue;
         }
-        const int iconInset = 0;
-        const int paintedIconSize = listMode_ ? 24 : std::max(32, iconSize_ - iconInset * 2);
-        const FLOAT iconLeft = listMode_
-            ? static_cast<FLOAT>(cell.left + 6)
-            : static_cast<FLOAT>(cell.left + (cellWidth_ - paintedIconSize) / 2) +
-                (widgetStyle_ ? -1.0f / 3.0f : 0.0f);
-        const FLOAT iconTop = listMode_
-            ? static_cast<FLOAT>(cell.top + (32 - paintedIconSize) / 2)
-            : static_cast<FLOAT>(cell.top + (widgetStyle_ ? 0 : (compactStyle_ ? 8 : 4))) +
-                (widgetStyle_ ? 6.0f : 0.0f);
+        const D2D1_RECT_F iconRect = PaintedIconRect(index);
+        const FLOAT iconLeft = iconRect.left;
+        const FLOAT iconTop = iconRect.top;
+        const int paintedIconSize = static_cast<int>(
+            std::round(iconRect.right - iconRect.left));
         const FLOAT cellRadius = widgetStyle_ ? 1.0f : (compactStyle_ ? 4.0f : 8.0f);
         if (static_cast<int>(index) == hoverIndex_ && hoverBrush != nullptr) {
             const D2D1_ROUNDED_RECT hoverRect = D2D1::RoundedRect(ToD2DRect(cell), cellRadius, cellRadius);
@@ -429,12 +438,6 @@ void IconGrid::Draw(D2DContext& d2d, IconCache& iconCache) {
         if (static_cast<int>(index) == draggingIndex_) {
             continue;
         }
-        const D2D1_RECT_F iconRect = D2D1::RectF(
-            static_cast<FLOAT>(iconLeft),
-            iconTop + static_cast<FLOAT>(iconInset),
-            iconLeft + static_cast<FLOAT>(paintedIconSize),
-            iconTop + static_cast<FLOAT>(iconInset + paintedIconSize));
-
         bool usedPlaceholder = false;
         const IconPlaceholderKind placeholderKind =
             items_[index].kind == DesktopItemKind::Folder
@@ -524,6 +527,29 @@ void IconGrid::Draw(D2DContext& d2d, IconCache& iconCache) {
         target->FillRoundedRectangle(track, scrollTrackBrush.Get());
         target->FillRoundedRectangle(thumb, scrollThumbBrush.Get());
     }
+}
+
+D2D1_RECT_F IconGrid::PaintedIconRect(size_t index) const {
+    if (index >= cells_.size()) {
+        return D2D1::RectF();
+    }
+    const RECT& cell = cells_[index];
+    const int paintedIconSize = listMode_ ? 24 : std::max(32, iconSize_);
+    const FLOAT iconLeft = listMode_
+        ? static_cast<FLOAT>(cell.left + 6)
+        : static_cast<FLOAT>(cell.left +
+            (cellWidth_ - paintedIconSize) / 2) +
+            (widgetStyle_ ? -1.0f / 3.0f : 0.0f);
+    const FLOAT iconTop = listMode_
+        ? static_cast<FLOAT>(cell.top + (32 - paintedIconSize) / 2)
+        : static_cast<FLOAT>(cell.top +
+            (widgetStyle_ ? 0 : (compactStyle_ ? 8 : 4))) +
+            (widgetStyle_ ? 6.0f : 0.0f);
+    return D2D1::RectF(
+        iconLeft,
+        iconTop,
+        iconLeft + static_cast<FLOAT>(paintedIconSize),
+        iconTop + static_cast<FLOAT>(paintedIconSize));
 }
 
 void IconGrid::RecalculateLayout() {

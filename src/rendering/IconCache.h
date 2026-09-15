@@ -53,6 +53,7 @@ public:
         int desiredPixelSize = 0,
         const std::vector<BYTE>* shellChildPidl = nullptr,
         int shellImageLogicalSize = 0);
+    void Invalidate(const std::vector<std::wstring>& paths);
     void Clear();
     size_t Size() const noexcept;
     size_t Capacity() const noexcept;

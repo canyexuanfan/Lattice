@@ -2,6 +2,7 @@
 
 #include <algorithm>
 
+#include "desktop/DesktopLayout.h"
 #include "rendering/IconCache.h"
 #include "ui/MessageDialog.h"
 
@@ -47,6 +48,27 @@ bool App::InitializeInternal(int showCommand, bool enableDesktopTakeover) {
     }
 
     if (enableDesktopTakeover) {
+        AppConfig startupConfig = configStore_.LoadAppConfig();
+        const bool isolatedDesktop = GetEnvironmentVariableW(
+            L"DESKTOP_ORGANIZER_DESKTOP_DIR", nullptr, 0) != 0;
+        if (!isolatedDesktop &&
+            !startupConfig.settings.desktopGridAlignmentInitialized) {
+            DesktopLayout layout;
+            std::wstring gridError;
+            if (layout.EnsureSnapToGrid(gridError)) {
+                startupConfig.settings.desktopGridAlignmentInitialized = true;
+                if (configStore_.SaveAppConfig(startupConfig)) {
+                    mainWindow_->ReloadPersistedState();
+                } else {
+                    OutputDebugStringW(
+                        L"Lattice enabled Explorer snap-to-grid but could not persist the one-time marker.\n");
+                }
+            } else {
+                OutputDebugStringW(
+                    (L"Lattice deferred the one-time Explorer snap-to-grid repair: " +
+                     gridError + L"\n").c_str());
+            }
+        }
         const LegacyStorageMigrator::StartupAttempt migration =
             legacyStorageMigrator_.AttemptForStartup(
                 configStore_, shortcutStore_, mainWindow_->Window());

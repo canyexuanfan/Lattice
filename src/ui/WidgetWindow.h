@@ -1,9 +1,13 @@
 #pragma once
 
 #include <Windows.h>
+#include <ObjIdl.h>
 
 #include <cstdint>
+#include <functional>
+#include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "config/ConfigStore.h"
@@ -13,6 +17,7 @@
 #include "rendering/IconCache.h"
 #include "rendering/WallpaperBackdrop.h"
 #include "shell/ShellLauncher.h"
+#include "shell/ShellItemReference.h"
 #include "ui/IconGrid.h"
 
 constexpr UINT kOrganizerConfigChangedMessage = WM_APP + 12;
@@ -47,6 +52,10 @@ enum class WidgetHostCommand : UINT {
 
 class WidgetWindow {
 public:
+    using DesktopShellDropHandler = std::function<std::optional<bool>(
+        const std::vector<std::wstring>&,
+        POINT)>;
+
     WidgetWindow(HINSTANCE instance, HWND owner, std::wstring categoryId, int spawnOffset);
     ~WidgetWindow();
 
@@ -57,11 +66,17 @@ public:
     void Close();
     void RefreshFromConfig();
     void RefreshIconCache();
+    void InvalidateIconCache(
+        const std::vector<std::wstring>& paths);
     bool IsOpen() const noexcept { return hwnd_ != nullptr && IsWindow(hwnd_) != FALSE; }
     bool IsVisible() const noexcept { return IsOpen() && IsWindowVisible(hwnd_) != FALSE; }
     bool IsForCategory(const std::wstring& categoryId) const noexcept { return categoryId_ == categoryId; }
     bool HasShellDropTarget() const noexcept { return shellDropTargetRegistered_; }
     bool FlushPendingStateForExit() { return FlushPendingInteractionSave(); }
+    void SetDesktopShellDropHandler(
+        DesktopShellDropHandler handler) {
+        desktopShellDropHandler_ = std::move(handler);
+    }
 
 private:
     friend struct WidgetWindowSmokeAccess;
@@ -187,6 +202,22 @@ private:
     std::vector<std::wstring> SelectedItemIdsInVisibleOrder() const;
     std::vector<std::wstring> SelectedPathsInVisibleOrder() const;
     std::vector<ShellItemReference> SelectedDesktopShellItems() const;
+    std::vector<ShellItemReference> DesktopShellItemsForIds(
+        const std::vector<std::wstring>& itemIds) const;
+    std::optional<bool> DropShellItemsOnTargetAtScreenPoint(
+        const std::vector<std::wstring>& sourcePaths,
+        POINT screenPoint) const;
+    std::optional<bool> DropShellDataObjectOnTargetAtScreenPoint(
+        IDataObject* dataObject,
+        const std::vector<std::wstring>& sourcePaths,
+        POINT screenPoint,
+        DWORD keyState,
+        DWORD allowedEffects,
+        DWORD* performedEffect) const;
+    const DesktopItem* ShellDropTargetItemAtScreenPoint(
+        const std::vector<std::wstring>& sourcePaths,
+        POINT screenPoint,
+        int* targetIndex = nullptr) const;
     void BeginItemSelection(int iconIndex, bool controlPressed);
     void BeginMarqueeSelection(POINT point, bool controlPressed);
     void UpdateMarqueeSelection(POINT point);
@@ -274,4 +305,5 @@ private:
     bool pendingOrderValid_ = false;
     WindowConfig pendingLayout_{};
     std::vector<std::wstring> pendingOrderIds_;
+    DesktopShellDropHandler desktopShellDropHandler_;
 };

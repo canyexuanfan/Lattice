@@ -14,7 +14,13 @@ enum class ShellDropPreviewEvent {
 };
 
 using ShellDropHandler =
-    std::function<bool(const std::vector<std::wstring>&, POINT)>;
+    std::function<bool(
+        IDataObject*,
+        const std::vector<std::wstring>&,
+        POINT,
+        DWORD,
+        DWORD,
+        DWORD*)>;
 using ShellDropEnabledHandler = std::function<bool()>;
 using ShellDropPreviewHandler = std::function<void(
     ShellDropPreviewEvent,

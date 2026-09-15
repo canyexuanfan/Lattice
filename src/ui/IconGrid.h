@@ -31,6 +31,7 @@ public:
     void SetScrollOffset(int scrollOffset);
     bool EnsureItemVisible(size_t index);
     int HitTest(POINT point) const;
+    int PaintedIconHitTest(POINT point) const;
     int SlotIndexForPoint(POINT point) const;
     int InsertionIndexForPoint(POINT point) const;
     int ReorderInsertionIndexForPoint(POINT point) const;
@@ -50,6 +51,7 @@ public:
     bool UsesLightTheme() const noexcept { return lightTheme_; }
 
 private:
+    D2D1_RECT_F PaintedIconRect(size_t index) const;
     void RecalculateLayout();
     int ContentHeight() const;
     int MaxScrollOffset() const;

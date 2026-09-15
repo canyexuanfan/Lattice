@@ -35,6 +35,7 @@ struct DesktopViewSnapshot {
 
 class DesktopLayout {
 public:
+    static DWORD FlagsWithSnapToGrid(DWORD flags) noexcept;
     bool AcquireFolderViewOnce(
         IFolderView** folderView,
         IShellView** shellView,
@@ -44,6 +45,7 @@ public:
         DesktopViewSnapshot& snapshot,
         std::wstring& errorMessage) const;
     bool CaptureViewFlags(DWORD& flags, std::wstring& errorMessage) const;
+    bool EnsureSnapToGrid(std::wstring& errorMessage) const;
     bool CaptureAllPositions(std::vector<DesktopPosition>& positions, std::wstring& errorMessage) const;
     bool CapturePosition(const std::wstring& path, POINT& point, std::wstring& errorMessage) const;
     bool CaptureScreenPosition(const std::wstring& path, POINT& point, std::wstring& errorMessage) const;

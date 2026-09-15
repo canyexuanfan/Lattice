@@ -82,7 +82,8 @@ public:
         const std::function<bool(const std::vector<std::pair<std::wstring, std::wstring>>&)>& persistDestinations,
         std::vector<std::pair<std::wstring, std::wstring>>& destinations,
         std::wstring& errorMessage,
-        HWND ownerWindow);
+        HWND ownerWindow,
+        bool allowUniqueConflictDestinations = false);
 
     bool RemoveRedundantDesktopCopy(
         const std::wstring& managedPath,

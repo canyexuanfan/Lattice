@@ -3,11 +3,21 @@
 #include <Windows.h>
 
 #include <functional>
+#include <string>
 #include <vector>
+
+struct DesktopChangeBatch {
+    std::vector<std::wstring> paths;
+    bool requiresRescan = false;
+
+    bool Empty() const noexcept {
+        return paths.empty() && !requiresRescan;
+    }
+};
 
 class DesktopWatcher {
 public:
-    using Callback = std::function<void()>;
+    using Callback = std::function<void(DesktopChangeBatch)>;
 
     ~DesktopWatcher();
 
@@ -17,6 +27,7 @@ public:
 
 private:
     struct DirectoryWatch {
+        std::wstring path;
         HANDLE directory = INVALID_HANDLE_VALUE;
         HANDLE event = nullptr;
         OVERLAPPED overlapped{};

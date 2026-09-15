@@ -626,6 +626,10 @@ struct DesktopSnapshotState {
 
 }  // namespace
 
+DWORD DesktopLayout::FlagsWithSnapToGrid(DWORD flags) noexcept {
+    return flags | static_cast<DWORD>(FWF_SNAPTOGRID);
+}
+
 bool DesktopLayout::AcquireFolderViewOnce(
     IFolderView** folderView,
     IShellView** shellView,
@@ -736,6 +740,41 @@ bool DesktopLayout::CaptureViewFlags(DWORD& flags, std::wstring& errorMessage) c
     if (FAILED(view.As(&view2)) || view2 == nullptr ||
         FAILED(view2->GetCurrentFolderFlags(&flags))) {
         errorMessage = L"Explorer 桌面视图不支持读取对齐设置。";
+        return false;
+    }
+    return true;
+}
+
+bool DesktopLayout::EnsureSnapToGrid(std::wstring& errorMessage) const {
+    errorMessage.clear();
+    ComPtr<IFolderView> view;
+    if (FAILED(GetDesktopFolderView(view))) {
+        errorMessage = L"无法连接 Explorer 桌面视图，未修复图标网格对齐。";
+        return false;
+    }
+    ComPtr<IFolderView2> view2;
+    DWORD flagsBefore = 0;
+    if (FAILED(view.As(&view2)) || view2 == nullptr ||
+        FAILED(view2->GetCurrentFolderFlags(&flagsBefore))) {
+        errorMessage = L"Explorer 桌面视图不支持修复图标网格对齐。";
+        return false;
+    }
+    if ((flagsBefore & FWF_SNAPTOGRID) != 0) {
+        return true;
+    }
+    const DWORD requestedFlags = FlagsWithSnapToGrid(flagsBefore);
+    const HRESULT setResult = view2->SetCurrentFolderFlags(
+        FWF_SNAPTOGRID,
+        static_cast<FOLDERFLAGS>(
+            requestedFlags & static_cast<DWORD>(FWF_SNAPTOGRID)));
+    DWORD flagsAfter = 0;
+    if (FAILED(setResult) ||
+        FAILED(view2->GetCurrentFolderFlags(&flagsAfter)) ||
+        (flagsAfter & FWF_SNAPTOGRID) == 0 ||
+        (flagsAfter & ~static_cast<DWORD>(FWF_SNAPTOGRID)) !=
+            (flagsBefore & ~static_cast<DWORD>(FWF_SNAPTOGRID))) {
+        errorMessage =
+            L"Explorer 未确认仅开启图标与网格对齐；未记录修复完成。";
         return false;
     }
     return true;

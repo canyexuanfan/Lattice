@@ -34,6 +34,17 @@ bool IdentitiesEqual(const std::wstring& left, const std::wstring& right) {
                left.c_str(), -1, right.c_str(), -1, TRUE) == CSTR_EQUAL;
 }
 
+DWORD CurrentDropKeyState() noexcept {
+    DWORD result = 0;
+    if ((GetKeyState(VK_CONTROL) & 0x8000) != 0) {
+        result |= MK_CONTROL;
+    }
+    if ((GetKeyState(VK_SHIFT) & 0x8000) != 0) {
+        result |= MK_SHIFT;
+    }
+    return result;
+}
+
 struct DesktopLabelStyle {
     std::wstring faceName = L"Microsoft YaHei UI";
     FLOAT size = 12.0f;
@@ -117,6 +128,8 @@ public:
         if (effect == nullptr) {
             return E_POINTER;
         }
+        ResetInternalItemTarget(true);
+        internalDataObject_.Reset();
         internalDrag_ = owner_ != nullptr && owner_->internalDragActive_;
 #ifndef NDEBUG
         if (internalDrag_) {
@@ -126,9 +139,11 @@ public:
 #endif
         HRESULT routedResult = S_OK;
         if (internalDrag_) {
-            *effect = (*effect & DROPEFFECT_MOVE) != 0
-                ? DROPEFFECT_MOVE
-                : DROPEFFECT_NONE;
+            internalAllowedEffects_ = *effect &
+                (DROPEFFECT_COPY | DROPEFFECT_MOVE | DROPEFFECT_LINK);
+            internalDataObject_ = dataObject;
+            routedResult = RouteInternalDrag(
+                dataObject, keyState, point, effect);
         } else if (explorerTarget_ != nullptr) {
             routedResult = explorerTarget_->DragEnter(
                 dataObject, keyState, point, effect);
@@ -157,9 +172,8 @@ public:
         }
         HRESULT routedResult = S_OK;
         if (internalDrag_) {
-            *effect = owner_ != nullptr && owner_->internalDragActive_
-                ? DROPEFFECT_MOVE
-                : DROPEFFECT_NONE;
+            routedResult = RouteInternalDrag(
+                internalDataObject_.Get(), keyState, point, effect);
         } else if (explorerTarget_ != nullptr) {
             routedResult = explorerTarget_->DragOver(
                 keyState, point, effect);
@@ -178,6 +192,11 @@ public:
     HRESULT STDMETHODCALLTYPE DragLeave() override {
         const bool wasInternal = internalDrag_;
         internalDrag_ = false;
+        if (wasInternal) {
+            ResetInternalItemTarget(true);
+            internalDataObject_.Reset();
+            internalAllowedEffects_ = DROPEFFECT_NONE;
+        }
         if (dragImageHelper_ != nullptr) {
             dragImageHelper_->DragLeave();
         }
@@ -199,16 +218,46 @@ public:
         }
         POINT screenPoint{point.x, point.y};
         GetPhysicalCursorPos(&screenPoint);
-        if (dragImageHelper_ != nullptr) {
-            dragImageHelper_->Drop(
-                dataObject, &screenPoint, *effect);
-        }
         if (!internalDrag_) {
+            if (dragImageHelper_ != nullptr) {
+                dragImageHelper_->Drop(
+                    dataObject, &screenPoint, *effect);
+            }
             return explorerTarget_ != nullptr
                 ? explorerTarget_->Drop(dataObject, keyState, point, effect)
                 : E_FAIL;
         }
+        HRESULT routedResult = RouteInternalDrag(
+            dataObject, keyState, point, effect);
         internalDrag_ = false;
+        if (dragImageHelper_ != nullptr) {
+            dragImageHelper_->Drop(
+                dataObject, &screenPoint, *effect);
+        }
+        if (internalItemHit_) {
+            DWORD targetEffect = internalItemEffect_;
+            if (SUCCEEDED(routedResult) &&
+                internalItemTarget_ != nullptr &&
+                targetEffect != DROPEFFECT_NONE) {
+                routedResult = internalItemTarget_->Drop(
+                    dataObject, keyState, point, &targetEffect);
+                if (FAILED(routedResult)) {
+                    targetEffect = DROPEFFECT_NONE;
+                }
+            }
+            *effect = targetEffect;
+#ifndef NDEBUG
+            if (owner_ != nullptr) {
+                owner_->internalDropStage_ =
+                    DesktopSurfaceWindow::InternalDropStage::
+                        ShellTargetDropped;
+            }
+#endif
+            ResetInternalItemTarget(false);
+            internalDataObject_.Reset();
+            internalAllowedEffects_ = DROPEFFECT_NONE;
+            return SUCCEEDED(routedResult) ? S_OK : routedResult;
+        }
 #ifndef NDEBUG
         if (owner_ != nullptr) {
             owner_->internalDropStage_ =
@@ -218,15 +267,107 @@ public:
         const bool positioned = owner_ != nullptr &&
             owner_->CommitInternalDesktopDrop(screenPoint);
         *effect = positioned ? DROPEFFECT_MOVE : DROPEFFECT_NONE;
+        ResetInternalItemTarget(false);
+        internalDataObject_.Reset();
+        internalAllowedEffects_ = DROPEFFECT_NONE;
         return S_OK;
     }
 
 private:
+    HRESULT RouteInternalDrag(
+        IDataObject* dataObject,
+        DWORD keyState,
+        POINTL point,
+        DWORD* effect) {
+        if (effect == nullptr) {
+            return E_POINTER;
+        }
+        if (owner_ == nullptr || !owner_->internalDragActive_ ||
+            dataObject == nullptr) {
+            *effect = DROPEFFECT_NONE;
+            return E_FAIL;
+        }
+
+        ShellItemReference targetItem;
+        const bool targetHit =
+            owner_->TryInternalShellDropTargetAtScreenPoint(
+                POINT{point.x, point.y}, targetItem);
+        if (!targetHit) {
+            ResetInternalItemTarget(true);
+            *effect = (internalAllowedEffects_ & DROPEFFECT_MOVE) != 0
+                ? DROPEFFECT_MOVE
+                : DROPEFFECT_NONE;
+            return S_OK;
+        }
+
+        internalItemHit_ = true;
+        if (!IdentitiesEqual(
+                internalItemTargetIdentity_, targetItem.path)) {
+            ResetInternalItemTarget(true);
+            internalItemHit_ = true;
+            internalItemTargetIdentity_ = targetItem.path;
+            HRESULT result = CreateDesktopShellSelectionObject(
+                owner_->Window(),
+                std::vector<ShellItemReference>{targetItem},
+                IID_IDropTarget,
+                reinterpret_cast<void**>(
+                    internalItemTarget_.GetAddressOf()));
+            if (FAILED(result) || internalItemTarget_ == nullptr) {
+                internalItemEffect_ = DROPEFFECT_NONE;
+                *effect = DROPEFFECT_NONE;
+                return S_OK;
+            }
+            DWORD targetEffect = internalAllowedEffects_;
+            result = internalItemTarget_->DragEnter(
+                dataObject, keyState, point, &targetEffect);
+            if (FAILED(result)) {
+                ResetInternalItemTarget(true);
+                internalItemHit_ = true;
+                internalItemTargetIdentity_ = targetItem.path;
+                internalItemEffect_ = DROPEFFECT_NONE;
+                *effect = DROPEFFECT_NONE;
+                return S_OK;
+            }
+            internalItemEffect_ = targetEffect;
+            *effect = targetEffect;
+            return S_OK;
+        }
+
+        if (internalItemTarget_ == nullptr) {
+            *effect = DROPEFFECT_NONE;
+            return S_OK;
+        }
+        DWORD targetEffect = internalAllowedEffects_;
+        const HRESULT result = internalItemTarget_->DragOver(
+            keyState, point, &targetEffect);
+        internalItemEffect_ = SUCCEEDED(result)
+            ? targetEffect
+            : DROPEFFECT_NONE;
+        *effect = internalItemEffect_;
+        return S_OK;
+    }
+
+    void ResetInternalItemTarget(bool notifyLeave) noexcept {
+        if (notifyLeave && internalItemTarget_ != nullptr) {
+            internalItemTarget_->DragLeave();
+        }
+        internalItemTarget_.Reset();
+        internalItemTargetIdentity_.clear();
+        internalItemEffect_ = DROPEFFECT_NONE;
+        internalItemHit_ = false;
+    }
+
     std::atomic<ULONG> references_{1};
     DesktopSurfaceWindow* owner_ = nullptr;
     Microsoft::WRL::ComPtr<IDropTarget> explorerTarget_;
     Microsoft::WRL::ComPtr<IDropTargetHelper> dragImageHelper_;
+    Microsoft::WRL::ComPtr<IDataObject> internalDataObject_;
+    Microsoft::WRL::ComPtr<IDropTarget> internalItemTarget_;
+    std::wstring internalItemTargetIdentity_;
+    DWORD internalAllowedEffects_ = DROPEFFECT_NONE;
+    DWORD internalItemEffect_ = DROPEFFECT_NONE;
     bool internalDrag_ = false;
+    bool internalItemHit_ = false;
 };
 
 DesktopSurfaceWindow::DesktopSurfaceWindow(HINSTANCE instance)
@@ -709,6 +850,21 @@ bool DesktopSurfaceWindow::Refresh(
     InvalidateRect(hwnd_, nullptr, FALSE);
     MaintainDesktopLayer();
     return true;
+}
+
+void DesktopSurfaceWindow::InvalidateIconCache(
+    const std::vector<std::wstring>& paths) {
+    iconCache_.Invalidate(paths);
+    if (hwnd_ != nullptr && IsWindow(hwnd_) != FALSE) {
+        InvalidateRect(hwnd_, nullptr, FALSE);
+    }
+}
+
+void DesktopSurfaceWindow::RefreshIconCache() {
+    iconCache_.Clear();
+    if (hwnd_ != nullptr && IsWindow(hwnd_) != FALSE) {
+        InvalidateRect(hwnd_, nullptr, FALSE);
+    }
 }
 
 bool DesktopSurfaceWindow::IsDesktopHosted() const noexcept {
@@ -1934,6 +2090,81 @@ DesktopSurfaceWindow::SelectedShellItemsInVisibleOrder() const {
         }
     }
     return result;
+}
+
+bool DesktopSurfaceWindow::TryShellDropTargetAtScreenPoint(
+    POINT screenPoint,
+    const std::vector<ShellItemReference>& excludedItems,
+    ShellItemReference& targetItem) const {
+    targetItem = {};
+    if (hwnd_ == nullptr || IsWindow(hwnd_) == FALSE) {
+        return false;
+    }
+    POINT clientPoint = screenPoint;
+    if (ScreenToClient(hwnd_, &clientPoint) == FALSE) {
+        return false;
+    }
+    const int targetIndex = HitTest(clientPoint);
+    if (targetIndex < 0 ||
+        targetIndex >= static_cast<int>(visibleItems_.size())) {
+        return false;
+    }
+    const DesktopViewItem& target =
+        visibleItems_[static_cast<size_t>(targetIndex)];
+    if (std::any_of(
+            excludedItems.begin(), excludedItems.end(),
+            [&](const ShellItemReference& source) {
+                return IdentitiesEqual(source.path, target.path);
+            })) {
+        return false;
+    }
+    targetItem = ShellItemReference{target.path, target.shellChildPidl};
+    return true;
+}
+
+bool DesktopSurfaceWindow::TryInternalShellDropTargetAtScreenPoint(
+    POINT screenPoint,
+    ShellItemReference& targetItem) const {
+    return TryShellDropTargetAtScreenPoint(
+        screenPoint,
+        SelectedShellItemsInVisibleOrder(),
+        targetItem);
+}
+
+std::optional<bool>
+DesktopSurfaceWindow::DropShellItemsOnTargetAtScreenPoint(
+    const std::vector<std::wstring>& sourcePaths,
+    POINT screenPoint) const {
+    std::vector<ShellItemReference> excludedItems;
+    excludedItems.reserve(sourcePaths.size());
+    for (const std::wstring& path : sourcePaths) {
+        excludedItems.push_back(ShellItemReference{path, {}});
+    }
+    ShellItemReference targetItem;
+    if (!TryShellDropTargetAtScreenPoint(
+            screenPoint, excludedItems, targetItem)) {
+        return std::nullopt;
+    }
+    std::vector<ShellItemReference> sourceItems;
+    sourceItems.reserve(sourcePaths.size());
+    for (const std::wstring& path : sourcePaths) {
+        ShellItemReference sourceItem;
+        if (FAILED(CreateDesktopShellItemReference(
+                path, sourceItem))) {
+            return false;
+        }
+        sourceItems.push_back(std::move(sourceItem));
+    }
+    DWORD effect = DROPEFFECT_NONE;
+    const HRESULT result = DropShellItemsOnDesktopItem(
+        hwnd_,
+        sourceItems,
+        targetItem,
+        screenPoint,
+        CurrentDropKeyState(),
+        DROPEFFECT_COPY | DROPEFFECT_MOVE | DROPEFFECT_LINK,
+        &effect);
+    return SUCCEEDED(result) && effect != DROPEFFECT_NONE;
 }
 
 void DesktopSurfaceWindow::BeginPointerGesture(

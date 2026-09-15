@@ -20,6 +20,21 @@ HRESULT CreateShellDragDataObject(
     HWND ownerWindow,
     const std::vector<ShellItemReference>& items,
     IDataObject** dataObject);
+HRESULT DropShellItemsOnDesktopItem(
+    HWND ownerWindow,
+    const std::vector<ShellItemReference>& sourceItems,
+    const ShellItemReference& targetItem,
+    POINT screenPoint,
+    DWORD keyState,
+    DWORD allowedEffects,
+    DWORD* performedEffect);
+HRESULT DropShellDataObjectOnTarget(
+    IDataObject* dataObject,
+    IDropTarget* dropTarget,
+    POINT screenPoint,
+    DWORD keyState,
+    DWORD allowedEffects,
+    DWORD* performedEffect);
 HRESULT LastShellDragImageInitializationResultForTesting();
 bool StartShellDrag(const std::wstring& path);
 bool StartShellDrag(HWND ownerWindow, const std::wstring& path);

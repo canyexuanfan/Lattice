@@ -27,6 +27,7 @@
 #include <iterator>
 #include <filesystem>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <tuple>
@@ -39,6 +40,7 @@
 #include "app/UpdateService.h"
 #include "config/ConfigStore.h"
 #include "desktop/DesktopScanner.h"
+#include "desktop/DesktopWatcher.h"
 #include "desktop/DesktopLayout.h"
 #include "desktop/LegacyStorageMigrator.h"
 #include "desktop/DesktopPlacementCoordinator.h"
@@ -65,6 +67,71 @@
 #pragma comment(lib, "dwmapi.lib")
 
 namespace {
+
+class RecordingDropTarget final : public IDropTarget {
+public:
+    explicit RecordingDropTarget(
+        DWORD acceptedEffect,
+        bool failDuringOver = false)
+        : acceptedEffect_(acceptedEffect),
+          failDuringOver_(failDuringOver) {}
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(
+        REFIID iid,
+        void** object) override {
+        if (object == nullptr) return E_POINTER;
+        *object = nullptr;
+        if (iid == IID_IUnknown || iid == IID_IDropTarget) {
+            *object = static_cast<IDropTarget*>(this);
+            AddRef();
+            return S_OK;
+        }
+        return E_NOINTERFACE;
+    }
+
+    ULONG STDMETHODCALLTYPE AddRef() override { return ++references_; }
+    ULONG STDMETHODCALLTYPE Release() override { return --references_; }
+
+    HRESULT STDMETHODCALLTYPE DragEnter(
+        IDataObject*, DWORD, POINTL, DWORD* effect) override {
+        ++enterCount;
+        if (effect == nullptr) return E_POINTER;
+        *effect &= acceptedEffect_;
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE DragOver(
+        DWORD, POINTL, DWORD* effect) override {
+        ++overCount;
+        if (effect == nullptr) return E_POINTER;
+        if (failDuringOver_) return E_FAIL;
+        *effect &= acceptedEffect_;
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE DragLeave() override {
+        ++leaveCount;
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE Drop(
+        IDataObject*, DWORD, POINTL, DWORD* effect) override {
+        ++dropCount;
+        if (effect == nullptr) return E_POINTER;
+        *effect &= acceptedEffect_;
+        return S_OK;
+    }
+
+    int enterCount = 0;
+    int overCount = 0;
+    int leaveCount = 0;
+    int dropCount = 0;
+
+private:
+    std::atomic<ULONG> references_{1};
+    DWORD acceptedEffect_ = DROPEFFECT_NONE;
+    bool failDuringOver_ = false;
+};
 
 std::string Utf8Text(const std::wstring& value) {
     const int required = WideCharToMultiByte(
@@ -296,6 +363,104 @@ struct AutoOrganizePreviewWindowSmokeAccess {
             });
     }
 
+    static bool GroupFocusGeometryMatchesVisual(
+        const AutoOrganizePreviewWindow& window) {
+        if (window.d2d_.Target() == nullptr) return false;
+        const D2D1_SIZE_F size = window.d2d_.Target()->GetSize();
+        bool foundGroup = false;
+        for (const auto& hit : window.hitTargets_) {
+            if (hit.kind != AutoOrganizePreviewWindow::HitKind::Group) continue;
+            foundGroup = true;
+            const D2D1_RECT_F visual =
+                window.GroupCardBounds(size, hit.index);
+            if (hit.bounds.left != visual.left ||
+                hit.bounds.top != visual.top ||
+                hit.bounds.right != visual.right ||
+                hit.bounds.bottom != visual.bottom) {
+                return false;
+            }
+        }
+        return foundGroup;
+    }
+
+    static bool WindowActionsAreCentered(
+        const AutoOrganizePreviewWindow& window) {
+        return window.windowActionFormat_ != nullptr &&
+            window.windowActionFormat_->GetTextAlignment() ==
+                DWRITE_TEXT_ALIGNMENT_CENTER &&
+            window.windowActionFormat_->GetParagraphAlignment() ==
+                DWRITE_PARAGRAPH_ALIGNMENT_CENTER;
+    }
+
+    static bool HasExplicitGroupNavigation(
+        const AutoOrganizePreviewWindow& window) {
+        const bool hasNext = std::any_of(
+            window.hitTargets_.begin(), window.hitTargets_.end(),
+            [](const auto& hit) {
+                return hit.kind ==
+                    AutoOrganizePreviewWindow::HitKind::NextGroups;
+            });
+        const bool hasCreate = std::any_of(
+            window.hitTargets_.begin(), window.hitTargets_.end(),
+            [](const auto& hit) {
+                return hit.kind ==
+                    AutoOrganizePreviewWindow::HitKind::CreateGroup;
+            });
+        return hasNext && hasCreate;
+    }
+
+    static bool CreateManualGroup(
+        AutoOrganizePreviewWindow& window,
+        const std::wstring& name) {
+        window.CreateManualGroup(name);
+        const auto found = std::find_if(
+            window.plan_.groups.begin(), window.plan_.groups.end(),
+            [&](const auto& group) {
+                return group.name == name && group.createNewCategory &&
+                    group.userCreated;
+            });
+        return found != window.plan_.groups.end() &&
+            window.DecisionsForGroup(*found).empty() &&
+            std::none_of(
+                window.layoutPlan_.placements.begin(),
+                window.layoutPlan_.placements.end(),
+                [&](const auto& placement) {
+                    return placement.groupId == found->id;
+                });
+    }
+
+    static bool DragFirstVisibleItemWithGhost(
+        AutoOrganizePreviewWindow& window) {
+        const auto found = std::find_if(
+            window.hitTargets_.begin(), window.hitTargets_.end(),
+            [](const auto& hit) {
+                return hit.kind == AutoOrganizePreviewWindow::HitKind::Item;
+            });
+        if (found == window.hitTargets_.end()) return false;
+        const POINT start{
+            MulDiv(static_cast<int>((found->bounds.left + found->bounds.right) / 2),
+                   static_cast<int>(window.dpi_), 96),
+            MulDiv(static_cast<int>((found->bounds.top + found->bounds.bottom) / 2),
+                   static_cast<int>(window.dpi_), 96)};
+        SendMessageW(window.hwnd_, WM_LBUTTONDOWN, MK_LBUTTON,
+            MAKELPARAM(start.x, start.y));
+        POINT moved{start.x + GetSystemMetrics(SM_CXDRAG) + 12,
+                    start.y + GetSystemMetrics(SM_CYDRAG) + 12};
+        SendMessageW(window.hwnd_, WM_MOUSEMOVE, MK_LBUTTON,
+            MAKELPARAM(moved.x, moved.y));
+        const bool visible = DragGhostWindow::Instance().IsVisible();
+        const POINT first = DragGhostWindow::Instance().TopLeftScreenPoint();
+        moved.x += 18;
+        moved.y += 9;
+        SendMessageW(window.hwnd_, WM_MOUSEMOVE, MK_LBUTTON,
+            MAKELPARAM(moved.x, moved.y));
+        const POINT second = DragGhostWindow::Instance().TopLeftScreenPoint();
+        SendMessageW(window.hwnd_, WM_LBUTTONUP, 0,
+            MAKELPARAM(moved.x, moved.y));
+        return visible && (first.x != second.x || first.y != second.y) &&
+            !DragGhostWindow::Instance().IsVisible();
+    }
+
     static bool MoveDecisionToNamedGroup(
         AutoOrganizePreviewWindow& window,
         int decisionIndex,
@@ -331,6 +496,10 @@ struct AutoOrganizePreviewWindowSmokeAccess {
 
     static void ScrollGroups(AutoOrganizePreviewWindow& window) {
         window.ScrollPreview(POINT{700, 700}, -WHEEL_DELTA);
+    }
+
+    static void NextGroups(AutoOrganizePreviewWindow& window) {
+        window.ShiftGroupPage(1);
     }
 
     static int GroupScrollOffset(const AutoOrganizePreviewWindow& window) {
@@ -541,8 +710,8 @@ struct WidgetWindowSmokeAccess {
     static POINT InsertionScreenPoint(WidgetWindow& widget, size_t index) {
         const RECT cell = widget.iconGrid_.InsertionCellAt(index);
         POINT point{
-            widget.DipToPixels((cell.left + cell.right) / 2),
-            widget.DipToPixels((cell.top + cell.bottom) / 2),
+            widget.DipToPixels(cell.left + 2),
+            widget.DipToPixels(cell.top + 2),
         };
         ClientToScreen(widget.hwnd_, &point);
         return point;
@@ -566,10 +735,24 @@ struct WidgetWindowSmokeAccess {
         return widget.dragInsertionIndex_;
     }
 
+    static bool DragVisualActive(const WidgetWindow& widget) {
+        return widget.dragVisualActive_;
+    }
+
+    static std::uint64_t DragGhostGeneration(const WidgetWindow& widget) {
+        return widget.dragGhostGeneration_;
+    }
+
     static int ReorderInsertionIndexForPoint(
         const WidgetWindow& widget,
         POINT point) {
         return widget.iconGrid_.ReorderInsertionIndexForPoint(point);
+    }
+
+    static int PaintedIconHitTest(
+        const WidgetWindow& widget,
+        POINT point) {
+        return widget.iconGrid_.PaintedIconHitTest(point);
     }
 
     static int Theme(const WidgetWindow& widget) {
@@ -690,6 +873,24 @@ struct DesktopSurfaceWindowSmokeAccess {
 
     static IDropTarget* DropTarget(DesktopSurfaceWindow& surface) {
         return surface.desktopDropTarget_.Get();
+    }
+
+    static void SelectOnlyIdentity(
+        DesktopSurfaceWindow& surface,
+        const std::wstring& identity) {
+        surface.SelectOnly(identity);
+    }
+
+    static void ClearSelection(DesktopSurfaceWindow& surface) {
+        surface.selectedIdentities_.clear();
+    }
+
+    static bool TryInternalShellDropTarget(
+        const DesktopSurfaceWindow& surface,
+        POINT screenPoint,
+        ShellItemReference& targetItem) {
+        return surface.TryInternalShellDropTargetAtScreenPoint(
+            screenPoint, targetItem);
     }
 
     static int CellWidth(const DesktopSurfaceWindow& surface) {
@@ -1595,6 +1796,33 @@ HWND FindCurrentProcessMainWindow() {
     return state.result;
 }
 
+struct ClassWindowSearchState {
+    DWORD processId = 0;
+    const wchar_t* className = nullptr;
+    HWND result = nullptr;
+};
+
+BOOL CALLBACK FindClassWindowForProcess(HWND candidate, LPARAM parameter) {
+    auto* state = reinterpret_cast<ClassWindowSearchState*>(parameter);
+    DWORD candidateProcessId = 0;
+    GetWindowThreadProcessId(candidate, &candidateProcessId);
+    wchar_t className[64]{};
+    if (candidateProcessId == state->processId &&
+        state->className != nullptr &&
+        GetClassNameW(candidate, className, ARRAYSIZE(className)) != 0 &&
+        wcscmp(className, state->className) == 0) {
+        state->result = candidate;
+        return FALSE;
+    }
+    return TRUE;
+}
+
+HWND FindCurrentProcessWindowByClass(const wchar_t* className) {
+    ClassWindowSearchState state{GetCurrentProcessId(), className};
+    EnumWindows(FindClassWindowForProcess, reinterpret_cast<LPARAM>(&state));
+    return state.result;
+}
+
 struct WidgetWindowSearchState {
     DWORD processId = 0;
     const wchar_t* title = nullptr;
@@ -2306,6 +2534,17 @@ bool VerifyLegacyBrandMigration() {
 
 int RunSmokeConfig() {
     AttachParentConsole();
+    const DWORD baseFolderFlags = FWF_ALIGNLEFT;
+    const DWORD upgradedFolderFlags =
+        DesktopLayout::FlagsWithSnapToGrid(baseFolderFlags);
+    if ((upgradedFolderFlags & FWF_SNAPTOGRID) == 0 ||
+        (upgradedFolderFlags & FWF_AUTOARRANGE) !=
+            (baseFolderFlags & FWF_AUTOARRANGE) ||
+        (upgradedFolderFlags & ~static_cast<DWORD>(FWF_SNAPTOGRID)) !=
+            baseFolderFlags) {
+        std::wcerr << L"One-time snap-to-grid flag decision changed unrelated flags\n";
+        return 1;
+    }
     wchar_t executablePath[MAX_PATH]{};
     if (GetModuleFileNameW(
             nullptr, executablePath, ARRAYSIZE(executablePath)) == 0) {
@@ -2356,6 +2595,7 @@ int RunSmokeConfig() {
                << loaded.width << L"x" << loaded.height << L"\n";
     AppConfig appConfig = store.LoadAppConfig();
     appConfig.uncategorizedName = L"待整理";
+    appConfig.settings.desktopGridAlignmentInitialized = true;
     ItemConfig layoutItem;
     layoutItem.id = L"layout-smoke";
     layoutItem.path = L"C:\\Desktop\\layout-smoke.lnk";
@@ -2433,7 +2673,9 @@ int RunSmokeConfig() {
     const auto loadedLayoutItem = std::find_if(loadedAppConfig.items.begin(), loadedAppConfig.items.end(), [&](const ItemConfig& item) {
         return item.id == layoutItem.id;
     });
-    if (loadedAppConfig.uncategorizedName != appConfig.uncategorizedName || loadedLayoutItem == loadedAppConfig.items.end() ||
+    if (loadedAppConfig.uncategorizedName != appConfig.uncategorizedName ||
+        !loadedAppConfig.settings.desktopGridAlignmentInitialized ||
+        loadedLayoutItem == loadedAppConfig.items.end() ||
         loadedLayoutItem->originalDesktopPath != layoutItem.originalDesktopPath || !loadedLayoutItem->hasDesktopPosition ||
         loadedLayoutItem->desktopX != layoutItem.desktopX || loadedLayoutItem->desktopY != layoutItem.desktopY ||
         loadedLayoutItem->desktopVisibilityMode != layoutItem.desktopVisibilityMode ||
@@ -2870,10 +3112,17 @@ int RunSmokeConfig() {
         GetModuleHandleW(nullptr), {}, false);
     MainWindowSmokeAccess::LoadDesktopItems(consistencyWindow);
     const AppConfig afterStartupRefresh = store.LoadAppConfig();
+    const auto reconciledCategory = std::find_if(
+        afterStartupRefresh.categories.begin(),
+        afterStartupRefresh.categories.end(),
+        [&](const CategoryConfig& candidate) {
+            return candidate.id == consistencyCategory.id;
+        });
     if (!verifyRemoved(
             afterStartupRefresh,
             kDeletedBeforeStartId,
             deletedBeforeStartPath) ||
+        reconciledCategory == afterStartupRefresh.categories.end() ||
         MainWindowSmokeAccess::HasRegisteredItem(
             consistencyWindow, kDeletedBeforeStartId) ||
         MainWindowSmokeAccess::HasDesktopPath(
@@ -2910,7 +3159,7 @@ int RunSmokeConfig() {
     if (!store.SaveInteractionStateAsync(
             consistencyCategory.id,
             consistencyCategory.layout,
-            consistencyCategory.itemIds,
+            reconciledCategory->itemIds,
             true) ||
         !store.SaveDesktopDisplayPositionsAsync(
             {DesktopPlacementConfig{
@@ -4119,12 +4368,178 @@ int RunSmokeImageThumbnail() {
         return fail(L"Widget or desktop image result did not match the Windows Shell thumbnail", 5);
     }
 
+    const std::filesystem::path publicRoot = testRoot / L"Public";
+    std::filesystem::create_directories(publicRoot, fileError);
+    if (fileError ||
+        SetEnvironmentVariableW(
+            L"DESKTOP_ORGANIZER_DESKTOP_DIR",
+            testRoot.c_str()) == FALSE ||
+        SetEnvironmentVariableW(
+            L"DESKTOP_ORGANIZER_PUBLIC_DESKTOP_DIR",
+            publicRoot.c_str()) == FALSE) {
+        return fail(L"Image thumbnail watcher fixture setup failed", 6);
+    }
+    std::mutex changesMutex;
+    std::vector<DesktopChangeBatch> observedChanges;
+    DesktopWatcher watcher;
+    if (!watcher.Start([&](DesktopChangeBatch changes) {
+            std::lock_guard<std::mutex> lock(changesMutex);
+            observedChanges.push_back(std::move(changes));
+        })) {
+        SetEnvironmentVariableW(
+            L"DESKTOP_ORGANIZER_DESKTOP_DIR", nullptr);
+        SetEnvironmentVariableW(
+            L"DESKTOP_ORGANIZER_PUBLIC_DESKTOP_DIR", nullptr);
+        return fail(L"Image thumbnail watcher did not start", 7);
+    }
+    Sleep(100);
+    for (std::uint32_t& pixel : fixturePixels) {
+        pixel ^= 0x00FFFFFFU;
+    }
+    if (!SaveCapturedPixelsBmp(
+            RECT{0, 0, width, height}, fixturePixels, imagePath)) {
+        watcher.Stop();
+        return fail(L"Image thumbnail replacement failed", 8);
+    }
+    bool contentChangeObserved = false;
+    const ULONGLONG contentDeadline = GetTickCount64() + 3000;
+    while (!contentChangeObserved && GetTickCount64() < contentDeadline) {
+        {
+            std::lock_guard<std::mutex> lock(changesMutex);
+            contentChangeObserved = std::any_of(
+                observedChanges.begin(), observedChanges.end(),
+                [&](const DesktopChangeBatch& batch) {
+                    return !batch.requiresRescan && std::any_of(
+                        batch.paths.begin(), batch.paths.end(),
+                        [&](const std::wstring& path) {
+                            return CompareStringOrdinal(
+                                       path.c_str(), -1,
+                                       imagePath.c_str(), -1,
+                                       TRUE) == CSTR_EQUAL;
+                        });
+                });
+        }
+        if (!contentChangeObserved) {
+            Sleep(10);
+        }
+    }
+    watcher.Stop();
+    if (!contentChangeObserved) {
+        return fail(
+            L"Desktop watcher did not preserve a content-only image change",
+            9);
+    }
+
+    widgetCache.Invalidate({imagePath.wstring()});
+    desktopCache.Invalidate({imagePath.wstring()});
+    HICON refreshedExpected = LoadSmokeShellItemImage(
+        imagePath.wstring(), 72, false);
+    widgetCache.Preload(imagePath.wstring());
+    desktopCache.PreloadShellIcon(
+        imagePath.wstring(), -1, 0, 72, nullptr, 48);
+    HICON refreshedWidget = nullptr;
+    HICON refreshedDesktop = nullptr;
+    const ULONGLONG refreshDeadline = GetTickCount64() + 3000;
+    while ((refreshedWidget == nullptr || refreshedDesktop == nullptr) &&
+           GetTickCount64() < refreshDeadline) {
+        Sleep(10);
+        if (refreshedWidget == nullptr) {
+            refreshedWidget = widgetCache.CopyReadyIconForDrag(
+                imagePath.wstring());
+        }
+        if (refreshedDesktop == nullptr) {
+            refreshedDesktop = desktopCache.CopyReadyIconForDrag(
+                imagePath.wstring());
+        }
+    }
+    std::vector<std::uint32_t> refreshedExpectedPixels;
+    std::vector<std::uint32_t> refreshedWidgetPixels;
+    std::vector<std::uint32_t> refreshedDesktopPixels;
+    const bool refreshedCaptured =
+        CaptureIconPixels(refreshedExpected, refreshedExpectedPixels) &&
+        CaptureIconPixels(refreshedWidget, refreshedWidgetPixels) &&
+        CaptureIconPixels(refreshedDesktop, refreshedDesktopPixels);
+    if (refreshedExpected != nullptr) DestroyIcon(refreshedExpected);
+    if (refreshedWidget != nullptr) DestroyIcon(refreshedWidget);
+    if (refreshedDesktop != nullptr) DestroyIcon(refreshedDesktop);
+    if (!refreshedCaptured || refreshedExpectedPixels == expectedPixels ||
+        refreshedWidgetPixels != refreshedExpectedPixels ||
+        refreshedDesktopPixels != refreshedExpectedPixels) {
+        return fail(
+            L"Same-path image replacement did not refresh both cache consumers",
+            10);
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(changesMutex);
+        observedChanges.clear();
+    }
+    if (!watcher.Start([&](DesktopChangeBatch changes) {
+            std::lock_guard<std::mutex> lock(changesMutex);
+            observedChanges.push_back(std::move(changes));
+        })) {
+        return fail(L"Structural desktop watcher did not start", 11);
+    }
+    Sleep(100);
+    const std::filesystem::path addedPath = testRoot / L"新增.txt";
+    const std::filesystem::path renamedPath = testRoot / L"已重命名.txt";
+    {
+        std::ofstream added(addedPath, std::ios::binary);
+        added << "new desktop item";
+    }
+    if (MoveFileW(addedPath.c_str(), renamedPath.c_str()) == FALSE ||
+        DeleteFileW(renamedPath.c_str()) == FALSE) {
+        watcher.Stop();
+        return fail(
+            L"Structural desktop watcher fixture mutation failed",
+            12);
+    }
+    bool structuralChangeObserved = false;
+    const ULONGLONG structureDeadline = GetTickCount64() + 3000;
+    while (!structuralChangeObserved &&
+           GetTickCount64() < structureDeadline) {
+        {
+            std::lock_guard<std::mutex> lock(changesMutex);
+            bool requiresRescan = false;
+            bool sawOriginalPath = false;
+            bool sawRenamedPath = false;
+            for (const DesktopChangeBatch& batch : observedChanges) {
+                requiresRescan |= batch.requiresRescan;
+                for (const std::wstring& path : batch.paths) {
+                    sawOriginalPath |= CompareStringOrdinal(
+                        path.c_str(), -1,
+                        addedPath.c_str(), -1,
+                        TRUE) == CSTR_EQUAL;
+                    sawRenamedPath |= CompareStringOrdinal(
+                        path.c_str(), -1,
+                        renamedPath.c_str(), -1,
+                        TRUE) == CSTR_EQUAL;
+                }
+            }
+            structuralChangeObserved =
+                requiresRescan && sawOriginalPath && sawRenamedPath;
+        }
+        if (!structuralChangeObserved) {
+            Sleep(10);
+        }
+    }
+    watcher.Stop();
+    SetEnvironmentVariableW(
+        L"DESKTOP_ORGANIZER_DESKTOP_DIR", nullptr);
+    SetEnvironmentVariableW(
+        L"DESKTOP_ORGANIZER_PUBLIC_DESKTOP_DIR", nullptr);
+    if (!structuralChangeObserved) {
+        return fail(
+            L"Desktop watcher did not request a structural rescan for a new item",
+            12);
+    }
+
     std::filesystem::remove_all(testRoot, fileError);
     if (fileError) {
         std::wcerr << L"Unable to clean image thumbnail smoke fixture\n";
-        return 6;
+        return 13;
     }
-    std::wcout << L"Widget and desktop image Shell thumbnails: PASS\n";
+    std::wcout << L"Widget and desktop image Shell thumbnails, same-path refresh, and watcher routing: PASS\n";
     return 0;
 }
 
@@ -7148,6 +7563,34 @@ int RunSmokeDesktopInternalDrag(HINSTANCE instance) {
         result << "MARKER_PARTITION_FAILED=1\nSTATUS=FAIL\n";
         return 205;
     }
+    DesktopSurfaceWindowSmokeAccess::SelectOnlyIdentity(
+        surface, markerA);
+    POINT sourceIconPoint{
+        (rectA->left + rectA->right) / 2,
+        (rectA->top + rectA->bottom) / 2};
+    POINT targetIconPoint{
+        (rectB->left + rectB->right) / 2,
+        (rectB->top + rectB->bottom) / 2};
+    ClientToScreen(surfaceWindow, &sourceIconPoint);
+    ClientToScreen(surfaceWindow, &targetIconPoint);
+    ShellItemReference routedTarget;
+    const bool targetRouted =
+        DesktopSurfaceWindowSmokeAccess::TryInternalShellDropTarget(
+            surface, targetIconPoint, routedTarget);
+    ShellItemReference sourceTarget;
+    const bool sourceRouted =
+        DesktopSurfaceWindowSmokeAccess::TryInternalShellDropTarget(
+            surface, sourceIconPoint, sourceTarget);
+    if (!targetRouted || sourceRouted ||
+        CompareStringOrdinal(
+            routedTarget.path.c_str(), -1,
+            markerB.c_str(), -1, TRUE) != CSTR_EQUAL ||
+        routedTarget.desktopChildPidl.empty()) {
+        surface.Close();
+        result << "SHELL_TARGET_ROUTE_FAILED=1\nSTATUS=FAIL\n";
+        return 205;
+    }
+    DesktopSurfaceWindowSmokeAccess::ClearSelection(surface);
     if (((GetAsyncKeyState(VK_LBUTTON) | GetAsyncKeyState(VK_RBUTTON) |
           GetAsyncKeyState(VK_CONTROL) | GetAsyncKeyState(VK_SHIFT) |
           GetAsyncKeyState(VK_MENU)) & 0x8000) != 0) {
@@ -8817,6 +9260,69 @@ int RunSmokeWidgetInteraction(HINSTANCE instance) {
         std::ofstream file(fourthPath, std::ios::binary);
         file << "fourth";
     }
+    Microsoft::WRL::ComPtr<IDataObject> shellDropProbeData;
+    if (FAILED(CreateFileDropDataObject(
+            {firstPath.wstring()},
+            shellDropProbeData.GetAddressOf())) ||
+        shellDropProbeData == nullptr) {
+        std::wcerr << L"Widget Shell DropTarget probe data failed\n";
+        std::filesystem::remove_all(testRoot, fileError);
+        return 77;
+    }
+    RecordingDropTarget acceptingTarget(DROPEFFECT_LINK);
+    DWORD shellDropEffect = DROPEFFECT_NONE;
+    if (FAILED(DropShellDataObjectOnTarget(
+            shellDropProbeData.Get(),
+            &acceptingTarget,
+            POINT{120, 160},
+            0,
+            DROPEFFECT_COPY | DROPEFFECT_MOVE | DROPEFFECT_LINK,
+            &shellDropEffect)) ||
+        shellDropEffect != DROPEFFECT_LINK ||
+        acceptingTarget.enterCount != 1 ||
+        acceptingTarget.overCount != 1 ||
+        acceptingTarget.dropCount != 1 ||
+        acceptingTarget.leaveCount != 0) {
+        std::wcerr << L"Accepted Shell DropTarget lifecycle failed\n";
+        std::filesystem::remove_all(testRoot, fileError);
+        return 77;
+    }
+    RecordingDropTarget rejectingTarget(DROPEFFECT_COPY, true);
+    shellDropEffect = DROPEFFECT_LINK;
+    if (SUCCEEDED(DropShellDataObjectOnTarget(
+            shellDropProbeData.Get(),
+            &rejectingTarget,
+            POINT{120, 160},
+            0,
+            DROPEFFECT_COPY | DROPEFFECT_MOVE | DROPEFFECT_LINK,
+            &shellDropEffect)) ||
+        shellDropEffect != DROPEFFECT_NONE ||
+        rejectingTarget.enterCount != 1 ||
+        rejectingTarget.overCount != 1 ||
+        rejectingTarget.dropCount != 0 ||
+        rejectingTarget.leaveCount != 1) {
+        std::wcerr << L"Rejected Shell DropTarget lifecycle failed\n";
+        std::filesystem::remove_all(testRoot, fileError);
+        return 77;
+    }
+    RecordingDropTarget refusingTarget(DROPEFFECT_NONE);
+    shellDropEffect = DROPEFFECT_LINK;
+    if (FAILED(DropShellDataObjectOnTarget(
+            shellDropProbeData.Get(),
+            &refusingTarget,
+            POINT{120, 160},
+            0,
+            DROPEFFECT_COPY | DROPEFFECT_MOVE | DROPEFFECT_LINK,
+            &shellDropEffect)) ||
+        shellDropEffect != DROPEFFECT_NONE ||
+        refusingTarget.enterCount != 1 ||
+        refusingTarget.overCount != 1 ||
+        refusingTarget.dropCount != 0 ||
+        refusingTarget.leaveCount != 1) {
+        std::wcerr << L"Refused Shell DropTarget lifecycle failed\n";
+        std::filesystem::remove_all(testRoot, fileError);
+        return 77;
+    }
     SetEnvironmentVariableW(L"DESKTOP_ORGANIZER_DATA_DIR", dataRoot.c_str());
     SetEnvironmentVariableW(L"DESKTOP_ORGANIZER_DESKTOP_DIR", desktopRoot.c_str());
 
@@ -9483,6 +9989,21 @@ int RunSmokeWidgetInteraction(HINSTANCE instance) {
     const POINT sourceDipPoint{
         (reorderFirstCell.left + reorderFirstCell.right) / 2,
         (reorderFirstCell.top + reorderFirstCell.bottom) / 2};
+    const POINT sourceGapDipPoint{
+        reorderFirstCell.left + 2,
+        reorderFirstCell.top + 2};
+    if (WidgetWindowSmokeAccess::PaintedIconHitTest(
+            *categoryWidget, sourceDipPoint) != 0 ||
+        WidgetWindowSmokeAccess::PaintedIconHitTest(
+            *categoryWidget, sourceGapDipPoint) != -1 ||
+        WidgetWindowSmokeAccess::ReorderInsertionIndexForPoint(
+            *categoryWidget, sourceGapDipPoint) < 0) {
+        DestroyWindow(mainWindow);
+        app.Run();
+        return fail(
+            L"Widget painted-icon target and reorder-gap hit regions overlap",
+            77);
+    }
     const POINT blankAppendDipPoint{
         (reorderLastCell.left + reorderLastCell.right) / 2,
         std::min(
@@ -9553,9 +10074,39 @@ int RunSmokeWidgetInteraction(HINSTANCE instance) {
             L"Widget single-item blank-area append preview was not normalized",
             72);
     }
-    HWND ghostWindow = FindWindowW(L"Lattice.DragGhostWindow", nullptr);
+    HWND ghostWindow = FindCurrentProcessWindowByClass(
+        L"Lattice.DragGhostWindow");
     if (ghostWindow == nullptr || !IsWindowVisible(ghostWindow) ||
         (GetWindowLongPtrW(ghostWindow, GWL_EXSTYLE) & WS_EX_TOPMOST) == 0) {
+        DWORD ghostProcessId = 0;
+        if (ghostWindow != nullptr) {
+            GetWindowThreadProcessId(ghostWindow, &ghostProcessId);
+        }
+        const POINT ghostTopLeft =
+            DragGhostWindow::Instance().TopLeftScreenPoint();
+        std::ofstream diagnostic(
+            std::filesystem::path(baseValue) /
+                L"widget-drag-ghost-diagnostic.txt",
+            std::ios::binary | std::ios::trunc);
+        diagnostic << "window="
+                   << reinterpret_cast<std::uintptr_t>(ghostWindow)
+                   << "\nwindowProcess=" << ghostProcessId
+                   << "\ncurrentProcess=" << GetCurrentProcessId()
+                   << "\nwindowVisible="
+                   << (ghostWindow != nullptr && IsWindowVisible(ghostWindow))
+                   << "\nwindowExStyle="
+                   << (ghostWindow == nullptr ? 0 :
+                       GetWindowLongPtrW(ghostWindow, GWL_EXSTYLE))
+                   << "\nsingletonVisible="
+                   << DragGhostWindow::Instance().IsVisible()
+                   << "\nsingletonGeneration="
+                   << DragGhostWindow::Instance().CurrentGeneration()
+                   << "\nwidgetDragVisual="
+                   << WidgetWindowSmokeAccess::DragVisualActive(*categoryWidget)
+                   << "\nwidgetDragGeneration="
+                   << WidgetWindowSmokeAccess::DragGhostGeneration(*categoryWidget)
+                   << "\nghostTopLeft=" << ghostTopLeft.x << ","
+                   << ghostTopLeft.y << "\n";
         SendMessageW(categoryWindow, WM_LBUTTONUP, 0, targetPoint);
         DestroyWindow(mainWindow);
         app.Run();
@@ -9597,7 +10148,8 @@ int RunSmokeWidgetInteraction(HINSTANCE instance) {
             L"Widget multi-select blank-area append preview was not normalized",
             74);
     }
-    ghostWindow = FindWindowW(L"Lattice.DragGhostWindow", nullptr);
+    ghostWindow = FindCurrentProcessWindowByClass(
+        L"Lattice.DragGhostWindow");
     if (ghostWindow == nullptr || !IsWindowVisible(ghostWindow)) {
         SendMessageW(categoryWindow, WM_LBUTTONUP, 0, targetPoint);
         DestroyWindow(mainWindow);
@@ -11468,7 +12020,7 @@ int RunSmokeUpdatePackages() {
             fixed == nullptr || fixedSize < sizeof(VS_FIXEDFILEINFO) ||
             HIWORD(fixed->dwFileVersionMS) != 0 ||
             LOWORD(fixed->dwFileVersionMS) != 4 ||
-            HIWORD(fixed->dwFileVersionLS) != 58) {
+            HIWORD(fixed->dwFileVersionLS) != 62) {
             return false;
         }
         struct Translation {
@@ -11553,7 +12105,7 @@ int RunSmokeUpdatePackages() {
             return 3;
         }
         UpdateReleaseAsset asset;
-        asset.version = L"0.4.59";
+        asset.version = L"0.4.62";
         asset.name = source.filename().wstring();
         asset.downloadUrl = L"https://example.invalid/" + asset.name;
         asset.size = std::filesystem::file_size(source, error);
@@ -11635,7 +12187,7 @@ int RunSmokeUpdatePackages() {
         return 12;
     }
     UpdateReleaseAsset wrongVersion = standardAsset;
-    wrongVersion.version = L"0.4.60";
+    wrongVersion.version = L"0.4.61";
     if (UpdateService::ValidateDownloadedInstaller(
             standardPath,
             wrongVersion) != UpdateInstallerValidationFailure::VersionMismatch) {
@@ -11649,7 +12201,7 @@ int RunSmokeUpdatePackages() {
         if (!stream) return 14;
     }
     UpdateReleaseAsset nonPeAsset;
-    nonPeAsset.version = L"0.4.59";
+    nonPeAsset.version = L"0.4.62";
     nonPeAsset.size = 3;
     if (!parseDigest(
             L"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
@@ -12594,6 +13146,8 @@ int RunSmokeLegacyStorageMigration() {
     const std::filesystem::path hiddenTarget = desktopRoot / L"旧隐藏.txt";
     const std::filesystem::path conflictManaged = managedRoot / L"冲突.txt";
     const std::filesystem::path conflictTarget = desktopRoot / conflictManaged.filename();
+    const std::filesystem::path conflictUniqueTarget =
+        desktopRoot / L"冲突 (2).txt";
     const std::filesystem::path rollbackManaged =
         dataRoot / L"ManagedShortcuts" / L"rollback" / L"回滚.txt";
     const std::filesystem::path rollbackTarget = desktopRoot / rollbackManaged.filename();
@@ -12706,36 +13260,9 @@ int RunSmokeLegacyStorageMigration() {
             configStore, managedStore, owner);
     errorMessage = conflictAttempt.warning;
     const std::wstring conflictNotice = conflictAttempt.Notice();
-    const bool conflictRejected =
-        conflictAttempt.required && !conflictAttempt.completed;
-    const std::optional<std::string> configAfterConflict =
-        ReadFileBytes(configStore.ConfigPath());
-    if (!conflictRejected ||
-        !configBeforeConflict.has_value() ||
-        conflictAttempt.warning.empty() ||
-        conflictNotice.find(conflictAttempt.warning) == std::wstring::npos ||
-        conflictNotice.find(conflictTarget.wstring()) == std::wstring::npos ||
-        configAfterConflict != configBeforeConflict ||
-        ReadFileBytes(conflictManaged.wstring()) != conflictSourceBytes ||
-        ReadFileBytes(conflictTarget.wstring()) != conflictTargetBytes ||
-        !std::filesystem::exists(managedUser) ||
-        !std::filesystem::exists(managedPublic) ||
-        std::filesystem::exists(userTarget) ||
-        std::filesystem::exists(publicTarget) ||
-        std::filesystem::exists(
-            dataRoot / L"ManagedShortcuts" / L"move-journal.bin")) {
-        DestroyWindow(owner);
-        return fail(
-            L"Legacy migration conflict preflight changed an endpoint or config",
-            126);
-    }
-    std::filesystem::remove(conflictTarget, fileError);
-    if (fileError) {
-        DestroyWindow(owner);
-        return fail(L"Legacy migration conflict cleanup failed", 127);
-    }
-    const bool migrated = migrator.Migrate(
-        configStore, managedStore, owner, errorMessage);
+    const bool migrated =
+        conflictAttempt.required && conflictAttempt.completed &&
+        conflictAttempt.warning.empty() && conflictNotice.empty();
     const AppConfig after = configStore.LoadAppConfig();
     const std::optional<std::string> firstConfigBytes =
         ReadFileBytes(configStore.ConfigPath());
@@ -12772,7 +13299,7 @@ int RunSmokeLegacyStorageMigration() {
         migratedHidden->path == hiddenTarget.wstring() &&
         migratedHidden->desktopVisibilityMode == 0 &&
         migratedConflict != after.items.end() &&
-        migratedConflict->path == conflictTarget.wstring();
+        migratedConflict->path == conflictUniqueTarget.wstring();
     const bool endpointsStable =
         !std::filesystem::exists(managedUser) &&
         !std::filesystem::exists(managedPublic) &&
@@ -12783,7 +13310,8 @@ int RunSmokeLegacyStorageMigration() {
             std::optional<std::string>("legacy user bytes") &&
         ReadFileBytes((publicTarget / L"内容.md").wstring()) ==
             std::optional<std::string>("legacy public folder bytes") &&
-        ReadFileBytes(conflictTarget.wstring()) == conflictSourceBytes &&
+        ReadFileBytes(conflictTarget.wstring()) == conflictTargetBytes &&
+        ReadFileBytes(conflictUniqueTarget.wstring()) == conflictSourceBytes &&
         hiddenAfter != INVALID_FILE_ATTRIBUTES &&
         (hiddenAfter & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM)) ==
             (hiddenOriginal & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM)) &&
@@ -12792,7 +13320,8 @@ int RunSmokeLegacyStorageMigration() {
     const bool stableSecondRun = idempotent &&
         firstConfigBytes.has_value() && secondConfigBytes.has_value() &&
         *firstConfigBytes == *secondConfigBytes;
-    if (!migrated || !configStable || !endpointsStable ||
+    if (!configBeforeConflict.has_value() || !migrated ||
+        !configStable || !endpointsStable ||
         !stableSecondRun) {
         DestroyWindow(owner);
         return fail(
@@ -12850,6 +13379,8 @@ int RunSmokeLegacyStorageMigration() {
         ReadFileBytes(conflictManaged.wstring());
     const std::optional<std::string> startupTargetBefore =
         ReadFileBytes(conflictTarget.wstring());
+    const std::filesystem::path startupUniqueTarget =
+        desktopRoot / L"冲突 (3).txt";
     bool appInitialized = false;
     bool mainWindowCreated = false;
     {
@@ -12861,12 +13392,21 @@ int RunSmokeLegacyStorageMigration() {
             DestroyWindow(testMainWindow);
         }
     }
+    const AppConfig startupAfter = configStore.LoadAppConfig();
+    const auto startupItemAfter = std::find_if(
+        startupAfter.items.begin(), startupAfter.items.end(),
+        [&](const ItemConfig& item) {
+            return item.id == conflictItem.id;
+        });
     const bool applicationConflictSafe =
         startupConfigSaved && appInitialized && mainWindowCreated &&
         FindCurrentProcessMainWindow() == nullptr &&
-        ReadFileBytes(configStore.ConfigPath()) == startupConfigBefore &&
-        ReadFileBytes(conflictManaged.wstring()) == startupSourceBefore &&
+        ReadFileBytes(configStore.ConfigPath()) != startupConfigBefore &&
+        startupItemAfter != startupAfter.items.end() &&
+        startupItemAfter->path == startupUniqueTarget.wstring() &&
+        !std::filesystem::exists(conflictManaged) &&
         ReadFileBytes(conflictTarget.wstring()) == startupTargetBefore &&
+        ReadFileBytes(startupUniqueTarget.wstring()) == startupSourceBefore &&
         !std::filesystem::exists(
             dataRoot / L"ManagedShortcuts" / L"move-journal.bin");
     if (!applicationConflictSafe) {
@@ -12880,24 +13420,26 @@ int RunSmokeLegacyStorageMigration() {
             << "MAIN_WINDOW_CREATED=" << (mainWindowCreated ? 1 : 0) << "\n"
             << "MAIN_WINDOW_DESTROYED="
             << (FindCurrentProcessMainWindow() == nullptr ? 1 : 0) << "\n"
-            << "CONFIG_UNCHANGED="
-            << (ReadFileBytes(configStore.ConfigPath()) == startupConfigBefore ? 1 : 0) << "\n"
-            << "SOURCE_UNCHANGED="
-            << (ReadFileBytes(conflictManaged.wstring()) == startupSourceBefore ? 1 : 0) << "\n"
+            << "CONFIG_CONVERGED="
+            << (ReadFileBytes(configStore.ConfigPath()) != startupConfigBefore ? 1 : 0) << "\n"
+            << "SOURCE_MOVED="
+            << (!std::filesystem::exists(conflictManaged) ? 1 : 0) << "\n"
             << "TARGET_UNCHANGED="
             << (ReadFileBytes(conflictTarget.wstring()) == startupTargetBefore ? 1 : 0) << "\n"
+            << "UNIQUE_TARGET_CREATED="
+            << (ReadFileBytes(startupUniqueTarget.wstring()) == startupSourceBefore ? 1 : 0) << "\n"
             << "JOURNAL_ABSENT="
             << (!std::filesystem::exists(
                     dataRoot / L"ManagedShortcuts" / L"move-journal.bin")
                     ? 1 : 0)
             << "\n";
         return fail(
-            L"Legacy migration conflict still blocked full application startup or changed an endpoint",
+            L"Legacy migration conflict did not silently converge through a safe unique name",
             129);
     }
     cleanup();
     std::wcout
-        << L"Legacy ManagedShortcuts conflict preflight, full application startup, endpoint contents, migration, idempotent restart, and persistence rollback passed\n";
+        << L"Legacy ManagedShortcuts unique-name convergence, full application startup, endpoint contents, idempotent restart, and persistence rollback passed\n";
     return 0;
 }
 
@@ -14248,6 +14790,54 @@ int RunSmokeAutoOrganizeLayout() {
         occupied.push_back(placement.bounds);
     }
 
+    LayoutContext firstRunContext;
+    firstRunContext.gap = 12;
+    firstRunContext.defaultWidth = 390;
+    firstRunContext.monitors = {
+        MonitorLayout{L"first-run", RectI{0, 0, 1920, 1040}, 96},
+    };
+    std::vector<CandidateWidgetLayout> firstRunCandidates;
+    for (int index = 0; index < 10; ++index) {
+        CandidateWidgetLayout candidate;
+        candidate.groupId = L"first-run-" + std::to_wstring(index);
+        candidate.name = L"候选 " + std::to_wstring(index);
+        candidate.monitorId = L"first-run";
+        candidate.desiredHeight = 700;
+        candidate.itemCount = 8;
+        firstRunCandidates.push_back(std::move(candidate));
+    }
+    const LayoutPlan firstRunPlan = lattice::organize::PlanWidgetLayout(
+        firstRunContext, firstRunCandidates);
+    if (firstRunPlan.placements.size() != firstRunCandidates.size() ||
+        std::any_of(
+            firstRunPlan.placements.begin(), firstRunPlan.placements.end(),
+            [](const WidgetPlacement& placement) {
+                return !placement.placed ||
+                    !placement.internalScrollRequired ||
+                    placement.bounds.Height() < 120;
+            })) {
+        std::wcerr << L"First-run candidate density produced a false unplaced result\n";
+        return 265;
+    }
+    for (std::size_t index = 0; index < firstRunPlan.placements.size(); ++index) {
+        const auto& placement = firstRunPlan.placements[index];
+        if (!lattice::organize::ContainsRectangle(
+                firstRunContext.monitors.front().workArea,
+                placement.bounds)) {
+            std::wcerr << L"First-run candidate escaped the work area\n";
+            return 266;
+        }
+        for (std::size_t other = index + 1;
+             other < firstRunPlan.placements.size(); ++other) {
+            if (lattice::organize::RectanglesOverlap(
+                    placement.bounds,
+                    firstRunPlan.placements[other].bounds)) {
+                std::wcerr << L"First-run adaptive candidates overlap\n";
+                return 267;
+            }
+        }
+    }
+
     std::vector<MonitorLayout> reordered = context.monitors;
     std::reverse(reordered.begin(), reordered.end());
     if (!lattice::organize::IsMonitorContextCurrent(
@@ -14590,6 +15180,9 @@ int RunSmokeAutoOrganizePreview(HINSTANCE instance) {
         AutoOrganizePreviewWindowSmokeAccess::PlacementCount(window) != 1 ||
         AutoOrganizePreviewWindowSmokeAccess::HitCount(window) < 15 ||
         !AutoOrganizePreviewWindowSmokeAccess::HasFullCardDropTarget(window) ||
+        !AutoOrganizePreviewWindowSmokeAccess::GroupFocusGeometryMatchesVisual(window) ||
+        !AutoOrganizePreviewWindowSmokeAccess::WindowActionsAreCentered(window) ||
+        !AutoOrganizePreviewWindowSmokeAccess::HasExplicitGroupNavigation(window) ||
         (extendedStyle & WS_EX_TOPMOST) != 0 || applyInvoked) {
         std::wcerr << L"Auto-organize preview state, controls, or window layer failed\n";
         window.Close();
@@ -14685,6 +15278,12 @@ int RunSmokeAutoOrganizePreview(HINSTANCE instance) {
     SetWindowPos(
         window.Window(), HWND_NOTOPMOST, 0, 0, 0, 0,
         SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+    if (!AutoOrganizePreviewWindowSmokeAccess::DragFirstVisibleItemWithGhost(
+            window)) {
+        std::wcerr << L"Auto-organize item drag ghost did not follow or clean up\n";
+        window.Close();
+        return 262;
+    }
     if (!AutoOrganizePreviewWindowSmokeAccess::MoveDecisionToNamedGroup(
             window, 0, L"开发与运维") ||
         AutoOrganizePreviewWindowSmokeAccess::TargetCategory(window, 0) !=
@@ -14704,6 +15303,25 @@ int RunSmokeAutoOrganizePreview(HINSTANCE instance) {
         std::wcerr << L"Auto-organize item could not return to candidate group\n";
         window.Close();
         return 240;
+    }
+    if (!AutoOrganizePreviewWindowSmokeAccess::CreateManualGroup(
+            window, L"人工候选") ||
+        !AutoOrganizePreviewWindowSmokeAccess::MoveDecisionToNamedGroup(
+            window, 1, L"人工候选") ||
+        AutoOrganizePreviewWindowSmokeAccess::TargetCategory(window, 1) !=
+            L"人工候选") {
+        std::wcerr << L"Auto-organize manual preview group did not remain empty or accept an item\n";
+        window.Close();
+        return 263;
+    }
+    const int pageOffsetBefore =
+        AutoOrganizePreviewWindowSmokeAccess::GroupScrollOffset(window);
+    AutoOrganizePreviewWindowSmokeAccess::NextGroups(window);
+    if (AutoOrganizePreviewWindowSmokeAccess::GroupScrollOffset(window) <
+        pageOffsetBefore) {
+        std::wcerr << L"Auto-organize explicit candidate navigation regressed\n";
+        window.Close();
+        return 264;
     }
     AutoOrganizePreviewWindowSmokeAccess::ScrollGroups(window);
     if (AutoOrganizePreviewWindowSmokeAccess::GroupScrollOffset(window) <= 0) {

@@ -39,6 +39,7 @@ struct AppSettings {
     int backupCount = 3;
     int iconCacheSize = 256;
     int theme = 0;
+    bool desktopGridAlignmentInitialized = false;
 };
 
 struct ItemConfig {

@@ -8,6 +8,7 @@
 #include <utility>
 
 #include "app/resource.h"
+#include "ui/DragGhostWindow.h"
 #include "ui/InputDialog.h"
 
 namespace {
@@ -148,6 +149,7 @@ void AutoOrganizePreviewWindow::ShowOrActivate() {
 void AutoOrganizePreviewWindow::Close() {
     cancelRequested_.store(true);
     if (scanThread_.joinable()) scanThread_.join();
+    EndDecisionDragVisual();
     if (IsOpen()) DestroyWindow(hwnd_);
     hwnd_ = nullptr;
 }
@@ -306,10 +308,12 @@ LRESULT AutoOrganizePreviewWindow::HandleMessage(
             return 0;
         case WM_CLOSE:
             CancelScan(false);
+            EndDecisionDragVisual();
             ShowWindow(hwnd_, SW_HIDE);
             return 0;
         case WM_DESTROY:
             KillTimer(hwnd_, kTooltipTimer);
+            EndDecisionDragVisual();
             iconCache_.SetInvalidateCallback(nullptr);
             cancelRequested_.store(true);
             hwnd_ = nullptr;
@@ -350,6 +354,7 @@ LRESULT AutoOrganizePreviewWindow::HandleMessage(
             d2d_.RecreateTarget(hwnd_);
             textFormat_.Reset(); smallFormat_.Reset(); tinyFormat_.Reset();
             titleFormat_.Reset(); headingFormat_.Reset();
+            windowActionFormat_.Reset();
             EnsureTextFormats();
             return 0;
         }
@@ -370,6 +375,33 @@ LRESULT AutoOrganizePreviewWindow::HandleMessage(
                 draggingDecisionMoved_ = draggingDecisionMoved_ ||
                     std::abs(point.x - dragOriginPixels_.x) >= GetSystemMetrics(SM_CXDRAG) ||
                     std::abs(point.y - dragOriginPixels_.y) >= GetSystemMetrics(SM_CYDRAG);
+                if (draggingDecisionMoved_ && !dragVisualActive_ &&
+                    draggingDecision_ < static_cast<int>(plan_.decisions.size())) {
+                    const auto& decision = plan_.decisions[
+                        static_cast<std::size_t>(draggingDecision_)];
+                    const auto item = std::find_if(
+                        input_.snapshot.items.begin(), input_.snapshot.items.end(),
+                        [&](const auto& value) { return value.id == decision.itemId; });
+                    if (item != input_.snapshot.items.end()) {
+                        POINT screenPoint = point;
+                        ClientToScreen(hwnd_, &screenPoint);
+                        const bool shortcut =
+                            item->kind == DesktopItemKind::Shortcut ||
+                            item->kind == DesktopItemKind::UrlShortcut;
+                        dragGhostGeneration_ = DragGhostWindow::Instance().Begin(
+                            instance_, hwnd_, item->path, item->displayName,
+                            shortcut, 32, SIZE{108, 68},
+                            dragGhostGrabOffsetDips_, screenPoint);
+                        dragVisualActive_ =
+                            DragGhostWindow::Instance().IsVisible();
+                        if (!dragVisualActive_) dragGhostGeneration_ = 0;
+                    }
+                }
+                if (dragVisualActive_) {
+                    POINT screenPoint = point;
+                    ClientToScreen(hwnd_, &screenPoint);
+                    DragGhostWindow::Instance().Update(screenPoint);
+                }
             }
             if (draggingPosition_ >= 0 && GetCapture() == hwnd_ &&
                 draggingPosition_ < static_cast<int>(layoutPlan_.placements.size())) {
@@ -445,6 +477,33 @@ LRESULT AutoOrganizePreviewWindow::HandleMessage(
             } else if (hit != nullptr && hit->kind == HitKind::Item) {
                 draggingDecision_ = hit->index;
                 draggingDecisionMoved_ = false;
+                dragVisualActive_ = false;
+                dragGhostGeneration_ = 0;
+                const D2D1_POINT_2F dip = PointInDips(point);
+                dragGhostGrabOffsetDips_ = POINT{
+                    std::clamp(
+                        static_cast<int>(std::lround(dip.x - hit->bounds.left)),
+                        0, 107),
+                    std::clamp(
+                        static_cast<int>(std::lround(dip.y - hit->bounds.top)),
+                        0, 67)};
+                if (hit->index >= 0 &&
+                    hit->index < static_cast<int>(plan_.decisions.size())) {
+                    const auto& decision = plan_.decisions[
+                        static_cast<std::size_t>(hit->index)];
+                    const auto item = std::find_if(
+                        input_.snapshot.items.begin(), input_.snapshot.items.end(),
+                        [&](const auto& value) { return value.id == decision.itemId; });
+                    if (item != input_.snapshot.items.end()) {
+                        const bool shortcut =
+                            item->kind == DesktopItemKind::Shortcut ||
+                            item->kind == DesktopItemKind::UrlShortcut;
+                        DragGhostWindow::Instance().Stage(
+                            instance_, hwnd_, item->path,
+                            iconCache_.CopyReadyIconForDrag(item->path),
+                            item->displayName, shortcut, 32, SIZE{108, 68});
+                    }
+                }
                 SetCapture(hwnd_);
             }
             InvalidateRect(hwnd_, nullptr, FALSE);
@@ -459,8 +518,13 @@ LRESULT AutoOrganizePreviewWindow::HandleMessage(
                 if (GetCapture() == hwnd_) ReleaseCapture();
             } else if (draggingDecision_ >= 0) {
                 const int decisionIndex = draggingDecision_;
+                const std::uint64_t dragGhostGeneration = dragGhostGeneration_;
                 draggingDecision_ = -1;
+                dragGhostGeneration_ = 0;
+                dragVisualActive_ = false;
                 if (GetCapture() == hwnd_) ReleaseCapture();
+                DragGhostWindow::Instance().EndIfGeneration(
+                    dragGhostGeneration);
                 if (hit != nullptr && hit->kind == HitKind::Group) {
                     MoveDecisionToGroup(decisionIndex, hit->index);
                 } else if (hit != nullptr && hit->kind == HitKind::Navigation &&
@@ -482,6 +546,7 @@ LRESULT AutoOrganizePreviewWindow::HandleMessage(
             draggingPosition_ = -1;
             draggingDecision_ = -1;
             draggingDecisionMoved_ = false;
+            EndDecisionDragVisual();
             pressedHit_ = -1;
             return 0;
         case WM_RBUTTONUP: {
@@ -503,8 +568,18 @@ LRESULT AutoOrganizePreviewWindow::HandleMessage(
         }
         case WM_KEYDOWN:
             if (wParam == VK_ESCAPE) {
-                if (state_ == ViewState::Scanning) CancelScan(true);
-                else ShowWindow(hwnd_, SW_HIDE);
+                if (draggingDecision_ >= 0 || draggingPosition_ >= 0) {
+                    draggingDecision_ = -1;
+                    draggingPosition_ = -1;
+                    draggingDecisionMoved_ = false;
+                    EndDecisionDragVisual();
+                    if (GetCapture() == hwnd_) ReleaseCapture();
+                } else if (state_ == ViewState::Scanning) {
+                    CancelScan(true);
+                } else {
+                    EndDecisionDragVisual();
+                    ShowWindow(hwnd_, SW_HIDE);
+                }
                 return 0;
             }
             if (wParam == VK_TAB) {
@@ -538,6 +613,7 @@ LRESULT AutoOrganizePreviewWindow::HandleMessage(
 
 void AutoOrganizePreviewWindow::StartScan() {
     CancelScan(false);
+    EndDecisionDragVisual();
     if (!inputProvider_) {
         state_ = ViewState::ScanError;
         stateMessage_ = L"无法读取当前桌面与格子快照。";
@@ -554,6 +630,9 @@ void AutoOrganizePreviewWindow::StartScan() {
     desktopChangeBlocksApply_ = false;
     stateMessage_ = L"正在本机分析桌面项目、已有归属和显示器布局…";
     plan_ = {}; layoutPlan_ = {}; selectedDecision_ = -1; hoverHit_ = -1;
+    groupScrollOffset_ = 0;
+    groupRowOffsets_.clear();
+    manualGroupSequence_ = 0;
     cancelRequested_.store(false);
     const unsigned int generation = ++scanGeneration_;
     const HWND notificationWindow = hwnd_;
@@ -654,12 +733,54 @@ void AutoOrganizePreviewWindow::EnsureTextFormats() {
     factory->CreateTextFormat(font, nullptr, DWRITE_FONT_WEIGHT_SEMI_BOLD,
         DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
         21.0f, L"zh-CN", headingFormat_.GetAddressOf());
+    factory->CreateTextFormat(font, nullptr, DWRITE_FONT_WEIGHT_NORMAL,
+        DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
+        16.0f, L"zh-CN", windowActionFormat_.GetAddressOf());
+    if (windowActionFormat_ != nullptr) {
+        windowActionFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+        windowActionFormat_->SetParagraphAlignment(
+            DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    }
     D2D1_STROKE_STYLE_PROPERTIES properties{};
     properties.dashStyle = D2D1_DASH_STYLE_DASH;
     if (d2d_.Factory() != nullptr) {
         d2d_.Factory()->CreateStrokeStyle(
             properties, nullptr, 0, dashedStroke_.GetAddressOf());
     }
+}
+
+D2D1_RECT_F AutoOrganizePreviewWindow::GroupCardBounds(
+    const D2D1_SIZE_F& size,
+    int visibleGroupIndex) const {
+    const float footerTop = size.height - kFooterHeight;
+    const float detailLeft = size.width - kDetailWidth;
+    const float contentTop =
+        state_ == ViewState::Changed || state_ == ViewState::Unplaced
+            ? 232.0f : 186.0f;
+    const float cardWidth =
+        (detailLeft - kSidebarWidth - 64.0f) / 3.0f;
+    const float left = kSidebarWidth + 20.0f +
+        visibleGroupIndex * (cardWidth + 12.0f);
+    const float bottom =
+        (std::min)(footerTop - 20.0f, contentTop + 360.0f);
+    return D2D1::RectF(left, contentTop, left + cardWidth, bottom);
+}
+
+D2D1_RECT_F AutoOrganizePreviewWindow::WindowActionBounds(
+    const D2D1_SIZE_F& size,
+    HitKind kind) const {
+    if (kind == HitKind::Minimize) {
+        return D2D1::RectF(size.width - 88.0f, 6.0f,
+                           size.width - 48.0f, 42.0f);
+    }
+    return D2D1::RectF(size.width - 48.0f, 6.0f,
+                       size.width - 4.0f, 42.0f);
+}
+
+void AutoOrganizePreviewWindow::EndDecisionDragVisual() {
+    DragGhostWindow::Instance().EndIfGeneration(dragGhostGeneration_);
+    dragGhostGeneration_ = 0;
+    dragVisualActive_ = false;
 }
 
 void AutoOrganizePreviewWindow::DrawText(
@@ -739,11 +860,13 @@ AutoOrganizePreviewWindow::VisibleGroups() const {
         const auto decisions = DecisionsForGroup(group);
         bool visible = false;
         if (navigationFilter_ == 0) {
-            visible = group.id != kKeepDesktopGroupId && !decisions.empty();
+            visible = group.id != kKeepDesktopGroupId &&
+                (!decisions.empty() || group.userCreated);
         } else if (navigationFilter_ == 3) {
             visible = group.existingCategory;
         } else if (navigationFilter_ == 4) {
-            visible = group.createNewCategory && !decisions.empty();
+            visible = group.createNewCategory &&
+                (!decisions.empty() || group.userCreated);
         } else if (navigationFilter_ == 2 &&
                    group.id == kKeepDesktopGroupId) {
             visible = true;
@@ -827,12 +950,54 @@ void AutoOrganizePreviewWindow::KeepDecisionOnDesktop(int decisionIndex) {
     ReplanCandidateLayouts();
 }
 
+void AutoOrganizePreviewWindow::CreateManualGroup(
+    const std::wstring& name) {
+    if (name.empty() || input_.layoutContext.monitors.empty()) return;
+    std::wstring monitorId;
+    if (monitorFilter_ > 0 &&
+        static_cast<std::size_t>(monitorFilter_ - 1) <
+            input_.layoutContext.monitors.size()) {
+        monitorId = input_.layoutContext.monitors[
+            static_cast<std::size_t>(monitorFilter_ - 1)].id;
+    } else if (const auto* selected = SelectedDecision(); selected != nullptr) {
+        monitorId = selected->monitorId;
+    }
+    if (monitorId.empty()) {
+        monitorId = input_.layoutContext.monitors.front().id;
+    }
+
+    lattice::organize::GroupPlan group;
+    do {
+        group.id = L"manual-" + plan_.id + L"-" +
+            std::to_wstring(++manualGroupSequence_);
+    } while (std::any_of(
+        plan_.groups.begin(), plan_.groups.end(),
+        [&](const auto& existing) { return existing.id == group.id; }));
+    group.name = name;
+    group.monitorId = monitorId;
+    group.createNewCategory = true;
+    group.userCreated = true;
+    plan_.groups.push_back(std::move(group));
+    navigationFilter_ = 0;
+    ReplanCandidateLayouts();
+    groupScrollOffset_ = (std::max)(
+        0, static_cast<int>(VisibleGroups().size()) - 3);
+    focusedHit_ = -1;
+}
+
+void AutoOrganizePreviewWindow::ShiftGroupPage(int direction) {
+    const auto groups = VisibleGroups();
+    groupScrollOffset_ = std::clamp(
+        groupScrollOffset_ + direction, 0,
+        (std::max)(0, static_cast<int>(groups.size()) - 3));
+}
+
 void AutoOrganizePreviewWindow::ReplanCandidateLayouts() {
     plan_.groups.erase(
         std::remove_if(
             plan_.groups.begin(), plan_.groups.end(),
             [&](const lattice::organize::GroupPlan& group) {
-                return group.createNewCategory &&
+                return group.createNewCategory && !group.userCreated &&
                     std::none_of(
                         plan_.decisions.begin(), plan_.decisions.end(),
                         [&](const lattice::organize::Decision& decision) {
@@ -884,6 +1049,7 @@ void AutoOrganizePreviewWindow::ShowGroupMenu(
     if (actual < 0 || actual >= static_cast<int>(groups.size())) return;
     const lattice::organize::GroupPlan* selectedGroup =
         groups[static_cast<std::size_t>(actual)];
+    const bool selectedGroupIsCandidate = selectedGroup->createNewCategory;
     HMENU menu = CreatePopupMenu();
     HMENU mergeMenu = CreatePopupMenu();
     if (menu == nullptr || mergeMenu == nullptr) {
@@ -950,7 +1116,7 @@ void AutoOrganizePreviewWindow::ShowGroupMenu(
             decision.selected = decision.sourceCategoryId != selectedId;
         }
     } else if (command == static_cast<int>(kCancel) &&
-               selectedGroup->createNewCategory) {
+               selectedGroupIsCandidate) {
         for (auto& decision : plan_.decisions) {
             if (decision.targetCategoryId == selectedId) {
                 decision.targetCategoryId.clear();
@@ -959,6 +1125,11 @@ void AutoOrganizePreviewWindow::ShowGroupMenu(
                 decision.selected = false;
             }
         }
+        plan_.groups.erase(
+            std::remove_if(
+                plan_.groups.begin(), plan_.groups.end(),
+                [&](const auto& group) { return group.id == selectedId; }),
+            plan_.groups.end());
     } else if (command == static_cast<int>(kSplit) && canSplit) {
         auto& decision = plan_.decisions[static_cast<std::size_t>(selectedDecision_)];
         lattice::organize::GroupPlan split;
@@ -995,6 +1166,15 @@ void AutoOrganizePreviewWindow::ShowGroupMenu(
                     decision.targetIsExistingCategory = target.existingCategory;
                     decision.selected = decision.sourceCategoryId != target.id;
                 }
+            }
+            if (selectedGroupIsCandidate) {
+                plan_.groups.erase(
+                    std::remove_if(
+                        plan_.groups.begin(), plan_.groups.end(),
+                        [&](const auto& group) {
+                            return group.id == selectedId;
+                        }),
+                    plan_.groups.end());
             }
         }
     }
@@ -1057,16 +1237,20 @@ void AutoOrganizePreviewWindow::RenderBase() {
     DrawText(L"本地离线分析", D2D1::RectF(238, 17, 340, 37), smallFormat_.Get(), Color(0x82AAB5));
     const bool minimizeHovered = IsHovered(HitKind::Minimize);
     const bool closeHovered = IsHovered(HitKind::Close);
+    const D2D1_RECT_F minimizeBounds =
+        WindowActionBounds(size, HitKind::Minimize);
+    const D2D1_RECT_F closeBounds =
+        WindowActionBounds(size, HitKind::Close);
     if (minimizeHovered) {
-        FillRounded(D2D1::RectF(size.width - 88, 6, size.width - 48, 42), 3,
-            Color(0x174654));
+        FillRounded(minimizeBounds, 3, Color(0x174654));
     }
     if (closeHovered) {
-        FillRounded(D2D1::RectF(size.width - 48, 6, size.width - 4, 42), 3,
-            Color(0xC42B3A));
+        FillRounded(closeBounds, 3, Color(0xC42B3A));
     }
-    DrawText(L"—", D2D1::RectF(size.width - 82, 8, size.width - 48, 39), titleFormat_.Get(), Color(minimizeHovered ? 0xFFFFFF : 0xB9D5DC));
-    DrawText(L"×", D2D1::RectF(size.width - 40, 8, size.width - 8, 39), titleFormat_.Get(), Color(closeHovered ? 0xFFFFFF : 0xB9D5DC));
+    DrawText(L"—", minimizeBounds, windowActionFormat_.Get(),
+        Color(minimizeHovered ? 0xFFFFFF : 0xB9D5DC));
+    DrawText(L"×", closeBounds, windowActionFormat_.Get(),
+        Color(closeHovered ? 0xFFFFFF : 0xB9D5DC));
 
     DrawText(L"整理范围", D2D1::RectF(22, 67, 180, 89), smallFormat_.Get(), Color(0x7EA8B4));
     static const wchar_t* navNames[] = {L"全部建议", L"需要确认", L"保持桌面", L"已有格子", L"将新建格子"};
@@ -1120,7 +1304,7 @@ void AutoOrganizePreviewWindow::RenderBase() {
         }));
     const int keepCount = static_cast<int>(plan_.decisions.size()) - selectedCount;
     DrawText(L"桌面整理建议", D2D1::RectF(kSidebarWidth + 20, 65, detailLeft - 250, 96), headingFormat_.Get(), Color(0xF4FBFD));
-    DrawText(L"先审阅分类与位置，再一次性应用。真实文件始终留在原路径。", D2D1::RectF(kSidebarWidth + 20, 95, detailLeft - 290, 116), smallFormat_.Get(), Color(0x9FC0C9));
+    DrawText(L"审阅 Lattice 显示归属与新格子摆放；真实文件路径始终不变。", D2D1::RectF(kSidebarWidth + 20, 95, detailLeft - 290, 116), smallFormat_.Get(), Color(0x9FC0C9));
     DrawText(std::to_wstring(plan_.decisions.size()), D2D1::RectF(detailLeft - 220, 64, detailLeft - 170, 94), headingFormat_.Get(), Color(0xFFFFFF));
     DrawText(L"扫描项目", D2D1::RectF(detailLeft - 235, 93, detailLeft - 160, 111), tinyFormat_.Get(), Color(0x8FB3BE));
     DrawText(std::to_wstring(selectedCount), D2D1::RectF(detailLeft - 135, 64, detailLeft - 85, 94), headingFormat_.Get(), Color(0xFFFFFF));
@@ -1144,7 +1328,54 @@ void AutoOrganizePreviewWindow::RenderBase() {
         DrawText(index == 0 ? L"全部屏幕" : MonitorLabel(index - 1), D2D1::RectF(bounds.left + 10, bounds.top + 7, bounds.right - 6, bounds.bottom - 4), smallFormat_.Get(), Color(monitorFilter_ == index || hovered ? 0xEAFBFF : 0x8FB5BF));
         monitorLeft += width + 5.0f;
     }
-    DrawText(L"默认不跨屏", D2D1::RectF(detailLeft - 115, 134, detailLeft - 20, 154), tinyFormat_.Get(), Color(0x7FA6B0));
+    DrawText(L"默认不跨屏", D2D1::RectF(monitorLeft + 4, 134, monitorLeft + 88, 154), tinyFormat_.Get(), Color(0x7FA6B0));
+    const auto groups = VisibleGroups();
+    const int maximumGroupOffset = (std::max)(
+        0, static_cast<int>(groups.size()) - 3);
+    groupScrollOffset_ = std::clamp(
+        groupScrollOffset_, 0, maximumGroupOffset);
+    if (groups.size() > 3) {
+        const D2D1_RECT_F previous = D2D1::RectF(
+            detailLeft - 273, 126, detailLeft - 242, 157);
+        const D2D1_RECT_F next = D2D1::RectF(
+            detailLeft - 179, 126, detailLeft - 148, 157);
+        const bool previousEnabled = groupScrollOffset_ > 0;
+        const bool nextEnabled = groupScrollOffset_ < maximumGroupOffset;
+        const bool previousHovered = previousEnabled &&
+            IsHovered(HitKind::PreviousGroups);
+        const bool nextHovered = nextEnabled &&
+            IsHovered(HitKind::NextGroups);
+        FillRounded(previous, 3, Color(previousHovered ? 0x123D49 : 0x0A3340,
+            previousEnabled ? 1.0f : .45f));
+        StrokeRounded(previous, 3, Color(previousHovered ? 0x55A9BF : 0x397586,
+            previousEnabled ? 1.0f : .45f));
+        FillRounded(next, 3, Color(nextHovered ? 0x123D49 : 0x0A3340,
+            nextEnabled ? 1.0f : .45f));
+        StrokeRounded(next, 3, Color(nextHovered ? 0x55A9BF : 0x397586,
+            nextEnabled ? 1.0f : .45f));
+        DrawText(L"‹", previous, windowActionFormat_.Get(),
+            Color(previousEnabled ? 0xEAFBFF : 0x66838A));
+        DrawText(L"›", next, windowActionFormat_.Get(),
+            Color(nextEnabled ? 0xEAFBFF : 0x66838A));
+        DrawText(
+            std::to_wstring(groupScrollOffset_ + 1) + L"–" +
+                std::to_wstring((std::min)(groupScrollOffset_ + 3,
+                    static_cast<int>(groups.size()))) + L" / " +
+                std::to_wstring(groups.size()),
+            D2D1::RectF(detailLeft - 239, 134, detailLeft - 182, 154),
+            tinyFormat_.Get(), Color(0x9FC0C9));
+    }
+    const D2D1_RECT_F createGroup = D2D1::RectF(
+        detailLeft - 136, 126, detailLeft - 20, 157);
+    const bool createGroupHovered = IsHovered(HitKind::CreateGroup);
+    FillRounded(createGroup, 3,
+        Color(createGroupHovered ? 0x124A58 : 0x0D3E4C));
+    StrokeRounded(createGroup, 3,
+        Color(createGroupHovered ? 0x6DDDF7 : 0x408294));
+    DrawText(L"＋ 新建格子", D2D1::RectF(
+        createGroup.left + 16, createGroup.top + 7,
+        createGroup.right - 5, createGroup.bottom - 3),
+        smallFormat_.Get(), Color(0xDFFAFF));
     StrokeRect(D2D1::RectF(kSidebarWidth, 169.5f, detailLeft, 170.5f), Color(0x285969));
     if (state_ == ViewState::Changed || state_ == ViewState::Unplaced) {
         const bool nonBlockingChange = state_ == ViewState::Changed &&
@@ -1160,22 +1391,13 @@ void AutoOrganizePreviewWindow::RenderBase() {
     }
 
     const float contentTop = state_ == ViewState::Changed || state_ == ViewState::Unplaced ? 232.0f : 186.0f;
-    const float cardWidth = (detailLeft - kSidebarWidth - 64.0f) / 3.0f;
-    const auto groups = VisibleGroups();
-    const int maximumGroupOffset = (std::max)(
-        0, static_cast<int>(groups.size()) - 3);
-    groupScrollOffset_ = std::clamp(
-        groupScrollOffset_, 0, maximumGroupOffset);
     for (int visibleGroupIndex = 0;
          visibleGroupIndex < 3 &&
          groupScrollOffset_ + visibleGroupIndex < static_cast<int>(groups.size());
          ++visibleGroupIndex) {
         const auto& group = *groups[static_cast<std::size_t>(
             groupScrollOffset_ + visibleGroupIndex)];
-        const float left = kSidebarWidth + 20.0f +
-            visibleGroupIndex * (cardWidth + 12.0f);
-        const float bottom = (std::min)(footerTop - 20.0f, contentTop + 360.0f);
-        const D2D1_RECT_F card = D2D1::RectF(left, contentTop, left + cardWidth, bottom);
+        const D2D1_RECT_F card = GroupCardBounds(size, visibleGroupIndex);
         const bool groupHovered = IsHovered(HitKind::Group, visibleGroupIndex);
         FillRounded(card, 5, Color(groupHovered ? 0x10404E : group.createNewCategory ? 0x102F40 : 0x092F3B));
         StrokeRounded(card, 5, Color(groupHovered ? 0x55B9D4 : group.createNewCategory ? 0xA78BFA : 0x356B7A), groupHovered ? 1.5f : 1.0f, group.createNewCategory ? dashedStroke_.Get() : nullptr);
@@ -1233,16 +1455,6 @@ void AutoOrganizePreviewWindow::RenderBase() {
             DrawText(L"拖到这里加入此格子", D2D1::RectF(card.left + 28, emptyTop + 15, card.right - 10, emptyTop + 37), smallFormat_.Get(), Color(0x6F98A2));
         }
     }
-    if (groups.size() > 3) {
-        DrawText(
-            L"滚轮查看更多格子  " +
-                std::to_wstring(groupScrollOffset_ + 1) + L"–" +
-                std::to_wstring((std::min)(groupScrollOffset_ + 3,
-                    static_cast<int>(groups.size()))) + L" / " +
-                std::to_wstring(groups.size()),
-            D2D1::RectF(detailLeft - 250, 173, detailLeft - 20, 190),
-            tinyFormat_.Get(), Color(0x7FA6B0));
-    }
     if (groups.empty() && state_ == ViewState::Ready) {
         StrokeRounded(D2D1::RectF(kSidebarWidth + 20, contentTop, detailLeft - 20, contentTop + 160), 4, Color(0x315E69), 1, dashedStroke_.Get());
         DrawText(L"此筛选条件下没有项目", D2D1::RectF(kSidebarWidth + 55, contentTop + 67, detailLeft - 45, contentTop + 96), textFormat_.Get(), Color(0x6F98A2));
@@ -1256,18 +1468,18 @@ void AutoOrganizePreviewWindow::RenderBase() {
         selectedName = found == input_.snapshot.items.end() ? selected->itemId : found->displayName;
     }
     DrawText(selectedName, D2D1::RectF(detailLeft + 17, 91, size.width - 18, 119), titleFormat_.Get(), Color(0xF4FBFD));
-    DrawText(selected == nullptr ? L"查看分类依据与最终位置" : ConfidenceText(*selected), D2D1::RectF(detailLeft + 17, 120, size.width - 18, 142), smallFormat_.Get(), Color(0x90B5BF));
+    DrawText(selected == nullptr ? L"查看分类依据与显示归属" : ConfidenceText(*selected), D2D1::RectF(detailLeft + 17, 120, size.width - 18, 142), smallFormat_.Get(), Color(0x90B5BF));
     StrokeRect(D2D1::RectF(detailLeft, 153.5f, size.width, 154.5f), Color(0x285969));
     if (selected != nullptr) {
-        DrawText(L"调整路径", D2D1::RectF(detailLeft + 17, 172, size.width - 20, 193), smallFormat_.Get(), Color(0x8FB5BF));
+        DrawText(L"显示归属调整", D2D1::RectF(detailLeft + 17, 172, size.width - 20, 193), smallFormat_.Get(), Color(0x8FB5BF));
         const D2D1_RECT_F source = D2D1::RectF(detailLeft + 17, 201, detailLeft + 145, 253);
         const D2D1_RECT_F destination = D2D1::RectF(detailLeft + 192, 201, size.width - 17, 253);
         FillRounded(source, 4, Color(0x0C3743)); StrokeRounded(source, 4, Color(0x386D7B));
         FillRounded(destination, 4, Color(0x0C3743)); StrokeRounded(destination, 4, Color(0x386D7B));
-        DrawText(L"当前位置", D2D1::RectF(source.left + 9, source.top + 6, source.right - 5, source.top + 22), tinyFormat_.Get(), Color(0x82A9B3));
+        DrawText(L"当前显示归属", D2D1::RectF(source.left + 9, source.top + 6, source.right - 5, source.top + 22), tinyFormat_.Get(), Color(0x82A9B3));
         DrawText(SourceName(*selected), D2D1::RectF(source.left + 9, source.top + 26, source.right - 5, source.bottom - 3), smallFormat_.Get(), Color(0xF4FBFD));
         DrawText(L"→", D2D1::RectF(detailLeft + 154, 216, detailLeft + 186, 242), titleFormat_.Get(), Color(0x55C6E7));
-        DrawText(L"建议位置", D2D1::RectF(destination.left + 9, destination.top + 6, destination.right - 5, destination.top + 22), tinyFormat_.Get(), Color(0x82A9B3));
+        DrawText(L"建议显示归属", D2D1::RectF(destination.left + 9, destination.top + 6, destination.right - 5, destination.top + 22), tinyFormat_.Get(), Color(0x82A9B3));
         DrawText(selected->targetCategoryName.empty() ? L"保持桌面" : selected->targetCategoryName, D2D1::RectF(destination.left + 9, destination.top + 26, destination.right - 5, destination.bottom - 3), smallFormat_.Get(), Color(0xF4FBFD));
         DrawText(L"分类依据", D2D1::RectF(detailLeft + 17, 277, size.width - 20, 299), smallFormat_.Get(), Color(0x8FB5BF));
         FillRounded(D2D1::RectF(detailLeft + 17, 307, size.width - 17, 385), 4, Color(0x0E3842));
@@ -1277,8 +1489,8 @@ void AutoOrganizePreviewWindow::RenderBase() {
 
     const float previewTop = footerTop - 178.0f;
     StrokeRect(D2D1::RectF(detailLeft, previewTop - .5f, size.width, previewTop + .5f), Color(0x285969));
-    DrawText(L"桌面位置预览", D2D1::RectF(detailLeft + 17, previewTop + 14, size.width - 130, previewTop + 34), smallFormat_.Get(), Color(0xF4FBFD));
-    DrawText(L"拖动虚线格子", D2D1::RectF(size.width - 115, previewTop + 14, size.width - 17, previewTop + 34), tinyFormat_.Get(), Color(0x7DA5AF));
+    DrawText(L"新格子摆放预览", D2D1::RectF(detailLeft + 17, previewTop + 14, size.width - 150, previewTop + 34), smallFormat_.Get(), Color(0xF4FBFD));
+    DrawText(L"仅拖动候选格子窗口", D2D1::RectF(size.width - 145, previewTop + 14, size.width - 17, previewTop + 34), tinyFormat_.Get(), Color(0x7DA5AF));
     const D2D1_RECT_F map = D2D1::RectF(detailLeft + 17, previewTop + 42, size.width - 17, footerTop - 17);
     FillRounded(map, 4, Color(0x103F50)); StrokeRounded(map, 4, Color(0x3C7280));
     DrawText(monitorFilter_ == 0 ? L"全部屏幕" : L"当前屏幕", D2D1::RectF(map.left + 7, map.top + 5, map.left + 90, map.top + 22), tinyFormat_.Get(), Color(0x6D9AA5));
@@ -1302,7 +1514,7 @@ void AutoOrganizePreviewWindow::RenderBase() {
     }
 
     DrawText(L"✓", D2D1::RectF(18, footerTop + 24, 39, footerTop + 48), textFormat_.Get(), Color(0x66D2A2));
-    DrawText(L"不移动真实文件 · 原子应用 · 完成后可撤销", D2D1::RectF(43, footerTop + 25, 410, footerTop + 49), smallFormat_.Get(), Color(0x8FB4BD));
+    DrawText(L"真实文件路径不变 · 原子应用 · 完成后可撤销", D2D1::RectF(43, footerTop + 25, 430, footerTop + 49), smallFormat_.Get(), Color(0x8FB4BD));
     const D2D1_RECT_F regenerate = D2D1::RectF(size.width - 392, footerTop + 17, size.width - 270, footerTop + 55);
     const D2D1_RECT_F cancel = D2D1::RectF(size.width - 260, footerTop + 17, size.width - 160, footerTop + 55);
     const D2D1_RECT_F apply = D2D1::RectF(size.width - 150, footerTop + 17, size.width - 18, footerTop + 55);
@@ -1375,8 +1587,10 @@ void AutoOrganizePreviewWindow::RebuildHitTargets() {
     const D2D1_SIZE_F size = target->GetSize();
     const float footerTop = size.height - kFooterHeight;
     const float detailLeft = size.width - kDetailWidth;
-    hitTargets_.push_back({HitKind::Minimize, 0, D2D1::RectF(size.width - 88, 6, size.width - 48, 42), L"最小化预览窗口"});
-    hitTargets_.push_back({HitKind::Close, 0, D2D1::RectF(size.width - 48, 6, size.width - 4, 42), L"关闭预览，不应用任何调整"});
+    hitTargets_.push_back({HitKind::Minimize, 0,
+        WindowActionBounds(size, HitKind::Minimize), L"最小化预览窗口"});
+    hitTargets_.push_back({HitKind::Close, 0,
+        WindowActionBounds(size, HitKind::Close), L"关闭预览，不应用任何调整"});
     if (state_ != ViewState::Ready && state_ != ViewState::Changed &&
         state_ != ViewState::Unplaced) {
         hitTargets_.push_back({
@@ -1396,19 +1610,31 @@ void AutoOrganizePreviewWindow::RebuildHitTargets() {
         hitTargets_.push_back({HitKind::Monitor, index, D2D1::RectF(monitorLeft, 126, monitorLeft + width, 157), index == 0 ? L"查看全部显示器的独立建议" : L"只查看该显示器，不会自动跨屏"});
         monitorLeft += width + 5;
     }
-    const float contentTop = state_ == ViewState::Changed || state_ == ViewState::Unplaced ? 232.0f : 186.0f;
-    const float cardWidth = (detailLeft - kSidebarWidth - 64.0f) / 3.0f;
     const auto groups = VisibleGroups();
+    const int maximumGroupOffset = (std::max)(
+        0, static_cast<int>(groups.size()) - 3);
+    if (groups.size() > 3 && groupScrollOffset_ > 0) {
+        hitTargets_.push_back({HitKind::PreviousGroups, 0,
+            D2D1::RectF(detailLeft - 273, 126, detailLeft - 242, 157),
+            L"查看前一组候选格子"});
+    }
+    if (groups.size() > 3 && groupScrollOffset_ < maximumGroupOffset) {
+        hitTargets_.push_back({HitKind::NextGroups, 0,
+            D2D1::RectF(detailLeft - 179, 126, detailLeft - 148, 157),
+            L"查看后一组候选格子"});
+    }
+    hitTargets_.push_back({HitKind::CreateGroup, 0,
+        D2D1::RectF(detailLeft - 136, 126, detailLeft - 20, 157),
+        L"在当前预览中新建空格子；拖入项目后才会应用"});
     for (int visibleGroupIndex = 0;
          visibleGroupIndex < 3 &&
          groupScrollOffset_ + visibleGroupIndex < static_cast<int>(groups.size());
          ++visibleGroupIndex) {
         const auto* group = groups[static_cast<std::size_t>(
             groupScrollOffset_ + visibleGroupIndex)];
-        const float left = kSidebarWidth + 20 +
-            visibleGroupIndex * (cardWidth + 12);
+        const D2D1_RECT_F card = GroupCardBounds(size, visibleGroupIndex);
         hitTargets_.push_back({HitKind::Group, visibleGroupIndex,
-            D2D1::RectF(left, contentTop, left + cardWidth, footerTop - 12),
+            card,
             L"拖入此格子；右键可重命名、合并、拆分或取消候选格子"});
         const auto decisions = DecisionsForGroup(*group);
         const int firstRow = groupRowOffsets_[group->id];
@@ -1418,9 +1644,9 @@ void AutoOrganizePreviewWindow::RebuildHitTargets() {
             const int decisionIndex = static_cast<int>(
                 decisions[static_cast<std::size_t>(firstRow + visibleRow)] -
                 plan_.decisions.data());
-            const float top = contentTop + 61 + visibleRow * 62;
-            hitTargets_.push_back({HitKind::ItemCheck, decisionIndex, D2D1::RectF(left + 10, top + 12, left + 39, top + 46), L"勾选或取消本项调整"});
-            hitTargets_.push_back({HitKind::Item, decisionIndex, D2D1::RectF(left + 39, top, left + cardWidth - 7, top + 58), L"查看分类依据；拖到其他格子或左侧保持桌面"});
+            const float top = card.top + 61 + visibleRow * 62;
+            hitTargets_.push_back({HitKind::ItemCheck, decisionIndex, D2D1::RectF(card.left + 10, top + 12, card.left + 39, top + 46), L"勾选或取消本项调整"});
+            hitTargets_.push_back({HitKind::Item, decisionIndex, D2D1::RectF(card.left + 39, top, card.right - 7, top + 58), L"查看分类依据；拖到其他格子或左侧保持桌面"});
         }
     }
     const float previewTop = footerTop - 178;
@@ -1522,10 +1748,26 @@ void AutoOrganizePreviewWindow::ActivateHit(const HitTarget& hit) {
             break;
         case HitKind::Navigation:
             navigationFilter_ = hit.index;
+            groupScrollOffset_ = 0;
             break;
         case HitKind::Monitor:
             monitorFilter_ = hit.index;
+            groupScrollOffset_ = 0;
             break;
+        case HitKind::PreviousGroups:
+            ShiftGroupPage(-1);
+            break;
+        case HitKind::NextGroups:
+            ShiftGroupPage(1);
+            break;
+        case HitKind::CreateGroup: {
+            const auto name = InputDialog::Prompt(
+                instance_, hwnd_, L"新建候选格子", L"格子名称", L"新格子");
+            if (name.has_value() && !name->empty()) {
+                CreateManualGroup(*name);
+            }
+            break;
+        }
         case HitKind::Item:
             selectedDecision_ = hit.index;
             break;

@@ -241,7 +241,8 @@ bool DragGhostWindow::EnsureWindow(HINSTANCE instance) {
         }
     }
     hwnd_ = CreateWindowExW(
-        WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+        WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW |
+            WS_EX_NOACTIVATE | WS_EX_TOPMOST,
         kDragGhostClassName,
         L"",
         WS_POPUP,
@@ -388,7 +389,8 @@ bool DragGhostWindow::Present(POINT topLeftScreen, BYTE alpha) {
         0,
         0,
         0,
-        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOSENDCHANGING | SWP_SHOWWINDOW);
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOSENDCHANGING |
+            SWP_SHOWWINDOW);
     return true;
 }
 

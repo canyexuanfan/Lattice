@@ -75,6 +75,7 @@ struct GroupPlan {
     std::wstring monitorId;
     bool existingCategory = false;
     bool createNewCategory = false;
+    bool userCreated = false;
     std::vector<std::wstring> itemIds;
 };
 

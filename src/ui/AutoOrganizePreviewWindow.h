@@ -78,6 +78,9 @@ private:
         Item,
         ItemCheck,
         Group,
+        PreviousGroups,
+        NextGroups,
+        CreateGroup,
         Position,
         Regenerate,
         Cancel,
@@ -125,10 +128,19 @@ private:
     void SelectNextFocusable(int direction);
     void MoveDecisionToGroup(int decisionIndex, int visibleGroupIndex);
     void KeepDecisionOnDesktop(int decisionIndex);
+    void CreateManualGroup(const std::wstring& name);
+    void ShiftGroupPage(int direction);
+    void EndDecisionDragVisual();
     void ReplanCandidateLayouts();
     void ShowGroupMenu(int visibleGroupIndex, POINT screenPoint);
     void ScrollPreview(POINT clientPixels, int wheelDelta);
     void EnsureTextFormats();
+    D2D1_RECT_F GroupCardBounds(
+        const D2D1_SIZE_F& size,
+        int visibleGroupIndex) const;
+    D2D1_RECT_F WindowActionBounds(
+        const D2D1_SIZE_F& size,
+        HitKind kind) const;
     void DrawText(
         const std::wstring& text,
         const D2D1_RECT_F& bounds,
@@ -164,6 +176,7 @@ private:
     Microsoft::WRL::ComPtr<IDWriteTextFormat> tinyFormat_;
     Microsoft::WRL::ComPtr<IDWriteTextFormat> titleFormat_;
     Microsoft::WRL::ComPtr<IDWriteTextFormat> headingFormat_;
+    Microsoft::WRL::ComPtr<IDWriteTextFormat> windowActionFormat_;
     Microsoft::WRL::ComPtr<ID2D1StrokeStyle> dashedStroke_;
     AutoOrganizePreviewInput input_;
     lattice::organize::Plan plan_;
@@ -184,7 +197,11 @@ private:
     int draggingPosition_ = -1;
     int draggingDecision_ = -1;
     bool draggingDecisionMoved_ = false;
+    bool dragVisualActive_ = false;
+    std::uint64_t dragGhostGeneration_ = 0;
+    POINT dragGhostGrabOffsetDips_{};
     int groupScrollOffset_ = 0;
+    unsigned int manualGroupSequence_ = 0;
     std::map<std::wstring, int> groupRowOffsets_;
     bool desktopChangeBlocksApply_ = false;
     bool trackingMouse_ = false;

@@ -4,6 +4,7 @@
 
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -71,10 +72,14 @@ private:
     LRESULT HandleMessage(UINT message, WPARAM wParam, LPARAM lParam);
 
     void LoadDesktopItems();
+    void ConfigureWidgetShellDrop(WidgetWindow& widget);
     void ReconcileDeletedDesktopItems();
     std::vector<std::wstring> AssignedDesktopIdentities() const;
     void RefreshDesktopSurfaceAssignments();
     void ScheduleDesktopRefresh();
+    void QueueDesktopChanges(DesktopChangeBatch changes);
+    DesktopChangeBatch TakePendingDesktopChanges();
+    bool HasPendingDesktopChanges();
     void ToggleAllVisible();
     void ToggleAllLocked();
     void ToggleStartup();
@@ -208,6 +213,9 @@ private:
     std::wstring draggingItemId_;
     std::wstring draggingSourceCategoryId_;
     bool refreshPending_ = false;
+    bool organizerRefreshPending_ = false;
+    std::mutex desktopChangesMutex_;
+    DesktopChangeBatch pendingDesktopChanges_;
     std::wstring searchQuery_;
     int searchScope_ = 0;
     POINT lastMousePoint_{};

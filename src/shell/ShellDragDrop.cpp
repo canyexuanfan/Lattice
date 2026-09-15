@@ -407,6 +407,89 @@ HRESULT CreateShellDragDataObject(
         : (FAILED(result) ? result : E_FAIL);
 }
 
+HRESULT DropShellDataObjectOnTarget(
+    IDataObject* dataObject,
+    IDropTarget* dropTarget,
+    POINT screenPoint,
+    DWORD keyState,
+    DWORD allowedEffects,
+    DWORD* performedEffect) {
+    if (performedEffect == nullptr) {
+        return E_POINTER;
+    }
+    *performedEffect = DROPEFFECT_NONE;
+    if (dataObject == nullptr || dropTarget == nullptr) {
+        return E_INVALIDARG;
+    }
+
+    POINTL point{screenPoint.x, screenPoint.y};
+    DWORD effect = allowedEffects &
+        (DROPEFFECT_COPY | DROPEFFECT_MOVE | DROPEFFECT_LINK);
+    if (effect == DROPEFFECT_NONE) {
+        return E_INVALIDARG;
+    }
+    HRESULT result = dropTarget->DragEnter(
+        dataObject, keyState, point, &effect);
+    bool entered = SUCCEEDED(result);
+    if (entered) {
+        result = dropTarget->DragOver(keyState, point, &effect);
+    }
+    if (SUCCEEDED(result) && effect != DROPEFFECT_NONE) {
+        result = dropTarget->Drop(
+            dataObject, keyState, point, &effect);
+        entered = false;
+    }
+    if (entered) {
+        dropTarget->DragLeave();
+    }
+    *performedEffect = SUCCEEDED(result)
+        ? effect
+        : DROPEFFECT_NONE;
+    return result;
+}
+
+HRESULT DropShellItemsOnDesktopItem(
+    HWND ownerWindow,
+    const std::vector<ShellItemReference>& sourceItems,
+    const ShellItemReference& targetItem,
+    POINT screenPoint,
+    DWORD keyState,
+    DWORD allowedEffects,
+    DWORD* performedEffect) {
+    if (performedEffect == nullptr) {
+        return E_POINTER;
+    }
+    *performedEffect = DROPEFFECT_NONE;
+    if (sourceItems.empty() || targetItem.path.empty() ||
+        targetItem.desktopChildPidl.empty()) {
+        return E_INVALIDARG;
+    }
+
+    Microsoft::WRL::ComPtr<IDataObject> dataObject;
+    HRESULT result = CreateShellDragDataObject(
+        ownerWindow, sourceItems, dataObject.GetAddressOf());
+    if (FAILED(result) || dataObject == nullptr) {
+        return FAILED(result) ? result : E_FAIL;
+    }
+
+    Microsoft::WRL::ComPtr<IDropTarget> dropTarget;
+    result = CreateDesktopShellSelectionObject(
+        ownerWindow,
+        std::vector<ShellItemReference>{targetItem},
+        IID_IDropTarget,
+        reinterpret_cast<void**>(dropTarget.GetAddressOf()));
+    if (FAILED(result) || dropTarget == nullptr) {
+        return FAILED(result) ? result : E_FAIL;
+    }
+    return DropShellDataObjectOnTarget(
+        dataObject.Get(),
+        dropTarget.Get(),
+        screenPoint,
+        keyState,
+        allowedEffects,
+        performedEffect);
+}
+
 bool StartShellDrag(
     HWND ownerWindow,
     const std::vector<std::wstring>& paths) {

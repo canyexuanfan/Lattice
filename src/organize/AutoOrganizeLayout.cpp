@@ -155,6 +155,42 @@ LayoutPlan PlanWidgetLayout(
             return left.groupId < right.groupId;
         });
 
+    // A preview may contain more candidates than the three cards currently
+    // visible in its viewport.  Size automatic candidates for the whole
+    // monitor batch so a first-run desktop is not falsely rejected merely
+    // because every window independently claimed 60% of the work area.
+    std::map<std::wstring, int> densityHeightCaps;
+    for (const MonitorLayout& monitor : context.monitors) {
+        int candidateCount = 0;
+        int widestCandidate = 0;
+        for (const CandidateWidgetLayout& candidate : ordered) {
+            if (candidate.manuallyPositioned ||
+                candidate.monitorId != monitor.id) {
+                continue;
+            }
+            ++candidateCount;
+            widestCandidate = (std::max)(
+                widestCandidate,
+                candidate.width > 0
+                    ? candidate.width
+                    : RecommendedWidgetWidth(context, monitor.id));
+        }
+        if (candidateCount == 0 || widestCandidate <= 0 ||
+            !ValidRectangle(monitor.workArea)) {
+            continue;
+        }
+        const int columns = (std::max)(1,
+            (monitor.workArea.Width() - gap) /
+                ((std::max)(1, widestCandidate) + gap));
+        const int rows = (candidateCount + columns - 1) / columns;
+        const int availableHeight = monitor.workArea.Height() - gap * (rows + 1);
+        if (rows > 0 && availableHeight > 0) {
+            constexpr int kMinimumExpandedHeight = 120;
+            densityHeightCaps[monitor.id] = (std::max)(
+                kMinimumExpandedHeight, availableHeight / rows);
+        }
+    }
+
     for (const CandidateWidgetLayout& candidate : ordered) {
         const MonitorLayout* monitor = FindMonitor(context, candidate.monitorId);
         if (monitor == nullptr || !ValidRectangle(monitor->workArea)) {
@@ -195,8 +231,12 @@ LayoutPlan PlanWidgetLayout(
         const int width = candidate.width > 0
             ? candidate.width
             : RecommendedWidgetWidth(context, candidate.monitorId);
-        const int maximumHeight = static_cast<int>(std::floor(
+        int maximumHeight = static_cast<int>(std::floor(
             static_cast<double>(monitor->workArea.Height()) * 0.60));
+        const auto densityCap = densityHeightCaps.find(candidate.monitorId);
+        if (densityCap != densityHeightCaps.end()) {
+            maximumHeight = (std::min)(maximumHeight, densityCap->second);
+        }
         const int desiredHeight = candidate.desiredHeight;
         if (width <= 0 || desiredHeight <= 0 || maximumHeight <= 0 ||
             width + gap * 2 > monitor->workArea.Width()) {

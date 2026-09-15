@@ -178,7 +178,8 @@ public:
         }
         ResetDragState();
 
-        previewEffect_ = PreferredShellDropPreviewEffect(*effect);
+        allowedEffects_ = *effect;
+        previewEffect_ = PreferredShellDropPreviewEffect(allowedEffects_);
         const bool canInspect =
             previewEffect_ != DROPEFFECT_NONE &&
             (!enabledHandler_ || enabledHandler_());
@@ -237,7 +238,7 @@ public:
 
     HRESULT STDMETHODCALLTYPE Drop(
         IDataObject* dataObject,
-        DWORD,
+        DWORD keyState,
         POINTL point,
         DWORD* effect) override {
         if (effect == nullptr) {
@@ -261,7 +262,13 @@ public:
         DWORD resultEffect = DROPEFFECT_NONE;
         bool handlerAccepted = false;
         if (canDrop && dataObject != nullptr && dropHandler_) {
-            handlerAccepted = dropHandler_(dragPaths_, screenPoint);
+            handlerAccepted = dropHandler_(
+                dataObject,
+                dragPaths_,
+                screenPoint,
+                keyState,
+                allowedEffects_,
+                &resultEffect);
         }
         if (dropHelper_ != nullptr) {
             ScopedWindowDpiAwareness dpiAwareness(window_);
@@ -292,6 +299,7 @@ private:
         previewActive_ = false;
         dragPaths_.clear();
         dragDataIdentity_.Reset();
+        allowedEffects_ = DROPEFFECT_NONE;
         previewEffect_ = DROPEFFECT_NONE;
     }
 
@@ -304,6 +312,7 @@ private:
     Microsoft::WRL::ComPtr<IUnknown> dragDataIdentity_;
     std::vector<std::wstring> dragPaths_;
     POINT lastScreenPoint_{};
+    DWORD allowedEffects_ = DROPEFFECT_NONE;
     DWORD previewEffect_ = DROPEFFECT_NONE;
     bool accepted_ = false;
     bool previewActive_ = false;

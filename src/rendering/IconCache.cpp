@@ -12,6 +12,7 @@
 #include <array>
 #include <condition_variable>
 #include <cstdint>
+#include <iterator>
 #include <mutex>
 #include <queue>
 #include <thread>
@@ -1153,6 +1154,62 @@ void IconCache::Alias(
             desiredPixelSize,
             shellChildPidl,
             shellImageLogicalSize);
+    }
+}
+
+void IconCache::Invalidate(const std::vector<std::wstring>& paths) {
+    if (paths.empty()) {
+        return;
+    }
+    const auto matches = [&](const std::wstring& value) {
+        return std::any_of(
+            paths.begin(), paths.end(),
+            [&](const std::wstring& path) {
+                return CompareStringOrdinal(
+                           value.c_str(), -1,
+                           path.c_str(), -1,
+                           TRUE) == CSTR_EQUAL;
+            });
+    };
+
+    std::scoped_lock lock(cacheMutex_, asyncState_->mutex);
+    for (auto value = cache_.begin(); value != cache_.end();) {
+        value = matches(value->first) ? cache_.erase(value) : std::next(value);
+    }
+    for (auto value = dragIconCache_.begin();
+         value != dragIconCache_.end();) {
+        if (!matches(value->first)) {
+            ++value;
+            continue;
+        }
+        if (value->second != nullptr) {
+            DestroyIcon(value->second);
+        }
+        value = dragIconCache_.erase(value);
+    }
+    for (auto value = asyncState_->completed.begin();
+         value != asyncState_->completed.end();) {
+        value = matches(value->first)
+            ? asyncState_->completed.erase(value)
+            : std::next(value);
+    }
+    for (auto value = asyncState_->failedByPath.begin();
+         value != asyncState_->failedByPath.end();) {
+        value = matches(value->first)
+            ? asyncState_->failedByPath.erase(value)
+            : std::next(value);
+    }
+    for (auto value = asyncState_->pendingIdByPath.begin();
+         value != asyncState_->pendingIdByPath.end();) {
+        if (!matches(value->first)) {
+            ++value;
+            continue;
+        }
+        asyncState_->pendingById.erase(value->second);
+        value = asyncState_->pendingIdByPath.erase(value);
+    }
+    if (asyncState_->completed.empty()) {
+        asyncState_->invalidatePosted = false;
     }
 }
 

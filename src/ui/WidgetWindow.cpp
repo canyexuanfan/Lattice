@@ -50,9 +50,20 @@ constexpr UINT_PTR kShellMutationCleanupTimerId = 7;
 constexpr UINT kShellMutationCleanupDelayMilliseconds = 500;
 constexpr unsigned int kMaximumShellMutationCleanupAttempts = 20;
 constexpr wchar_t kAlignmentGuideClassName[] = L"Lattice.AlignmentGuide";
-constexpr wchar_t kCurrentVersion[] = L"0.4.59";
+constexpr wchar_t kCurrentVersion[] = L"0.4.62";
 constexpr UINT kShellNewCommandFirst = 0x5000;
 constexpr UINT kShellNewCommandLast = 0x5FFF;
+
+DWORD CurrentDropKeyState() noexcept {
+    DWORD result = 0;
+    if ((GetKeyState(VK_CONTROL) & 0x8000) != 0) {
+        result |= MK_CONTROL;
+    }
+    if ((GetKeyState(VK_SHIFT) & 0x8000) != 0) {
+        result |= MK_SHIFT;
+    }
+    return result;
+}
 
 thread_local IContextMenu2* gActiveShellMenu2 = nullptr;
 thread_local IContextMenu3* gActiveShellMenu3 = nullptr;
@@ -565,6 +576,12 @@ void WidgetWindow::RefreshIconCache() {
     InvalidateRect(hwnd_, nullptr, FALSE);
 }
 
+void WidgetWindow::InvalidateIconCache(
+    const std::vector<std::wstring>& paths) {
+    iconCache_.Invalidate(paths);
+    InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
 LRESULT CALLBACK WidgetWindow::WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
     WidgetWindow* window = nullptr;
     if (message == WM_NCCREATE) {
@@ -598,7 +615,25 @@ LRESULT WidgetWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) 
         case WM_CREATE:
             shellDropTargetRegistered_ = RegisterShellDropTarget(
                 hwnd_,
-                [this](const std::vector<std::wstring>& paths, POINT screenPoint) {
+                [this](
+                    IDataObject* dataObject,
+                    const std::vector<std::wstring>& paths,
+                    POINT screenPoint,
+                    DWORD keyState,
+                    DWORD allowedEffects,
+                    DWORD* performedEffect) {
+                    const std::optional<bool> shellTargetResult =
+                        DropShellDataObjectOnTargetAtScreenPoint(
+                            dataObject,
+                            paths,
+                            screenPoint,
+                            keyState,
+                            allowedEffects,
+                            performedEffect);
+                    if (shellTargetResult.has_value()) {
+                        ClearShellDropPreview(false);
+                        return true;
+                    }
                     return QueueDroppedPaths(paths, screenPoint);
                 },
                 [this]() {
@@ -1489,6 +1524,19 @@ void WidgetWindow::UpdateShellDropPreview(
     if (shellDropQueued_ || shellDropCommitActive_) {
         return;
     }
+    int targetIndex = -1;
+    if (ShellDropTargetItemAtScreenPoint(
+            paths, screenPoint, &targetIndex) != nullptr) {
+        hoverIconIndex_ = targetIndex;
+        iconGrid_.SetHoverIndex(targetIndex);
+        InvalidateRect(hwnd_, nullptr, FALSE);
+        return;
+    }
+    if (hoverIconIndex_ >= 0) {
+        hoverIconIndex_ = -1;
+        iconGrid_.SetHoverIndex(-1);
+        InvalidateRect(hwnd_, nullptr, FALSE);
+    }
     for (const std::wstring& path : paths) {
         if (preloadIcons) {
             iconCache_.Preload(path);
@@ -1588,6 +1636,11 @@ void WidgetWindow::ClearShellDropPreview(bool flushDeferredRefresh) {
     shellDropPreviewActive_ = false;
     shellDropPreviewPaths_.clear();
     shellDropInsertionIndex_ = -1;
+    if (hoverIconIndex_ >= 0) {
+        hoverIconIndex_ = -1;
+        iconGrid_.SetHoverIndex(-1);
+        changed = true;
+    }
     if (shellDropProjectionActive_ &&
         !shellDropCommitActive_ &&
         !shellDropQueued_) {
@@ -3284,6 +3337,30 @@ bool WidgetWindow::UpdateIconDrag(POINT pixelPoint) {
 
     const RECT gridBounds = GridBounds();
     if (PtInRect(&gridBounds, point) != FALSE) {
+        int shellTargetIndex = iconGrid_.PaintedIconHitTest(point);
+        if (shellTargetIndex >= 0) {
+            const DesktopItem* targetItem = iconGrid_.ItemAt(
+                static_cast<size_t>(shellTargetIndex));
+            const bool sourceTarget = targetItem == nullptr ||
+                targetItem->id == draggingItemId_ ||
+                std::find(
+                    draggingSelectionIds_.begin(),
+                    draggingSelectionIds_.end(),
+                    targetItem->id) != draggingSelectionIds_.end();
+            if (sourceTarget) {
+                shellTargetIndex = -1;
+            }
+        }
+        if (shellTargetIndex >= 0) {
+            const bool targetChanged = dragInsertionIndex_ != -1;
+            dragInsertionIndex_ = -1;
+            const bool hoverChanged =
+                iconGrid_.SetHoverIndex(shellTargetIndex);
+            if (targetChanged || hoverChanged) {
+                InvalidateRect(hwnd_, nullptr, FALSE);
+            }
+            return true;
+        }
         const int rawInsertionIndex =
             iconGrid_.ReorderInsertionIndexForPoint(point);
         const int nextInsertionIndex = static_cast<int>(
@@ -3346,6 +3423,14 @@ void WidgetWindow::FinishIconDrag(POINT pixelPoint) {
     WidgetWindow* targetWidget = droppedInside
         ? nullptr
         : DropTargetWidgetAtScreenPoint(cursorScreenPoint);
+    std::vector<std::wstring> movingPaths;
+    movingPaths.reserve(movingIds.size());
+    for (const DesktopItem& item : currentItems_) {
+        if (std::find(movingIds.begin(), movingIds.end(), item.id) !=
+            movingIds.end()) {
+            movingPaths.push_back(item.path);
+        }
+    }
     const int insertionIndex = droppedInside
         ? (dragInsertionIndex_ >= 0
             ? dragInsertionIndex_
@@ -3380,7 +3465,22 @@ void WidgetWindow::FinishIconDrag(POINT pixelPoint) {
         ReleaseCapture();
     }
     if (completedDrag) {
-        if (targetWidget != nullptr &&
+        std::optional<bool> shellDropResult;
+        WidgetWindow* shellTargetWidget = droppedInside
+            ? this
+            : targetWidget;
+        if (shellTargetWidget != nullptr) {
+            shellDropResult =
+                shellTargetWidget->DropShellItemsOnTargetAtScreenPoint(
+                    movingPaths, cursorScreenPoint);
+        } else if (desktopShellDropHandler_) {
+            shellDropResult = desktopShellDropHandler_(
+                movingPaths, cursorScreenPoint);
+        }
+        if (shellDropResult.has_value()) {
+            DragGhostWindow::Instance().EndIfGeneration(
+                dragGhostGeneration);
+        } else if (targetWidget != nullptr &&
             targetWidget->categoryId_ != categoryId_ &&
             !movingIds.empty()) {
             DragGhostWindow::Instance().EndIfGeneration(dragGhostGeneration);
@@ -3629,10 +3729,18 @@ WidgetWindow::SelectedPathsInVisibleOrder() const {
 
 std::vector<ShellItemReference>
 WidgetWindow::SelectedDesktopShellItems() const {
+    return DesktopShellItemsForIds(selectedItemIds_);
+}
+
+std::vector<ShellItemReference>
+WidgetWindow::DesktopShellItemsForIds(
+    const std::vector<std::wstring>& itemIds) const {
     std::vector<ShellItemReference> result;
-    result.reserve(selectedItemIds_.size());
+    result.reserve(itemIds.size());
     for (const DesktopItem& item : currentItems_) {
-        if (!IsItemSelected(item.id)) {
+        if (std::find(
+                itemIds.begin(), itemIds.end(), item.id) ==
+            itemIds.end()) {
             continue;
         }
         ShellItemReference reference;
@@ -3643,6 +3751,123 @@ WidgetWindow::SelectedDesktopShellItems() const {
         result.push_back(std::move(reference));
     }
     return result;
+}
+
+std::optional<bool>
+WidgetWindow::DropShellItemsOnTargetAtScreenPoint(
+    const std::vector<std::wstring>& sourcePaths,
+    POINT screenPoint) const {
+    const DesktopItem* targetItem =
+        ShellDropTargetItemAtScreenPoint(sourcePaths, screenPoint);
+    if (targetItem == nullptr) {
+        return std::nullopt;
+    }
+
+    ShellItemReference targetReference;
+    if (FAILED(CreateDesktopShellItemReference(
+            targetItem->path, targetReference))) {
+        return false;
+    }
+    std::vector<ShellItemReference> sourceItems;
+    sourceItems.reserve(sourcePaths.size());
+    for (const std::wstring& sourcePath : sourcePaths) {
+        ShellItemReference sourceReference;
+        if (FAILED(CreateDesktopShellItemReference(
+                sourcePath, sourceReference))) {
+            return false;
+        }
+        sourceItems.push_back(std::move(sourceReference));
+    }
+    DWORD effect = DROPEFFECT_NONE;
+    const HRESULT result = DropShellItemsOnDesktopItem(
+        hwnd_,
+        sourceItems,
+        targetReference,
+        screenPoint,
+        CurrentDropKeyState(),
+        DROPEFFECT_COPY | DROPEFFECT_MOVE | DROPEFFECT_LINK,
+        &effect);
+    return SUCCEEDED(result) && effect != DROPEFFECT_NONE;
+}
+
+std::optional<bool>
+WidgetWindow::DropShellDataObjectOnTargetAtScreenPoint(
+    IDataObject* dataObject,
+    const std::vector<std::wstring>& sourcePaths,
+    POINT screenPoint,
+    DWORD keyState,
+    DWORD allowedEffects,
+    DWORD* performedEffect) const {
+    if (performedEffect != nullptr) {
+        *performedEffect = DROPEFFECT_NONE;
+    }
+    const DesktopItem* targetItem =
+        ShellDropTargetItemAtScreenPoint(sourcePaths, screenPoint);
+    if (targetItem == nullptr) {
+        return std::nullopt;
+    }
+    if (dataObject == nullptr || performedEffect == nullptr) {
+        return false;
+    }
+
+    ShellItemReference targetReference;
+    if (FAILED(CreateDesktopShellItemReference(
+            targetItem->path, targetReference))) {
+        return false;
+    }
+    Microsoft::WRL::ComPtr<IDropTarget> target;
+    const HRESULT targetResult = CreateDesktopShellSelectionObject(
+        hwnd_,
+        std::vector<ShellItemReference>{targetReference},
+        IID_IDropTarget,
+        reinterpret_cast<void**>(target.GetAddressOf()));
+    if (FAILED(targetResult) || target == nullptr) {
+        return false;
+    }
+    const HRESULT result = DropShellDataObjectOnTarget(
+        dataObject,
+        target.Get(),
+        screenPoint,
+        keyState,
+        allowedEffects,
+        performedEffect);
+    return SUCCEEDED(result) && *performedEffect != DROPEFFECT_NONE;
+}
+
+const DesktopItem* WidgetWindow::ShellDropTargetItemAtScreenPoint(
+    const std::vector<std::wstring>& sourcePaths,
+    POINT screenPoint,
+    int* targetIndex) const {
+    if (targetIndex != nullptr) {
+        *targetIndex = -1;
+    }
+    if (hwnd_ == nullptr || IsWindow(hwnd_) == FALSE ||
+        windowConfig_.collapsed) {
+        return nullptr;
+    }
+    POINT clientPoint = screenPoint;
+    if (ScreenToClient(hwnd_, &clientPoint) == FALSE) {
+        return nullptr;
+    }
+    const int index = iconGrid_.PaintedIconHitTest(
+        ClientPixelsToDips(clientPoint));
+    const DesktopItem* targetItem = index < 0
+        ? nullptr
+        : iconGrid_.ItemAt(static_cast<size_t>(index));
+    if (targetItem == nullptr || std::any_of(
+            sourcePaths.begin(), sourcePaths.end(),
+            [&](const std::wstring& sourcePath) {
+                return CompareStringOrdinal(
+                           sourcePath.c_str(), -1,
+                           targetItem->path.c_str(), -1,
+                           TRUE) == CSTR_EQUAL;
+            })) {
+        return nullptr;
+    }
+    if (targetIndex != nullptr) {
+        *targetIndex = index;
+    }
+    return targetItem;
 }
 
 void WidgetWindow::BeginItemSelection(

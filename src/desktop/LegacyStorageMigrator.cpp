@@ -188,7 +188,8 @@ bool LegacyStorageMigrator::Migrate(
             },
             destinations,
             errorMessage,
-            ownerWindow)) {
+            ownerWindow,
+            true)) {
         return false;
     }
 
