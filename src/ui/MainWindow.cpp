@@ -1504,6 +1504,7 @@ LRESULT MainWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
         case WM_TIMER:
             if (wParam == kDesktopRefreshTimerId) {
                 KillTimer(hwnd_, kDesktopRefreshTimerId);
+                desktopRefreshScheduled_ = false;
                 if (draggingIconIndex_ >= 0 ||
                     draggingTileIndex_ >= 0 ||
                     dragVisualActive_ ||
@@ -2005,18 +2006,53 @@ void MainWindow::LoadDesktopItems() {
 }
 
 void MainWindow::ReconcileDeletedDesktopItems() {
+    std::vector<std::wstring> removedIdentities;
+    const auto confirmDeleted = [&](const std::wstring& path) {
+        if (path.empty() || !shortcutStore_.IsDesktopPath(path) ||
+            !IsConfirmedDeletedDesktopPath(path)) {
+            return false;
+        }
+        if (std::none_of(removedIdentities.begin(), removedIdentities.end(),
+                [&](const std::wstring& identity) {
+                    return CompareStringOrdinal(identity.c_str(), -1,
+                        path.c_str(), -1, TRUE) == CSTR_EQUAL;
+                })) {
+            removedIdentities.push_back(path);
+        }
+        return true;
+    };
     std::vector<std::wstring> removedItemIds;
     for (const RegisteredItem& item : organizerConfig_.items) {
-        if (item.id.empty() || item.path.empty() ||
-            !shortcutStore_.IsDesktopPath(item.path) ||
-            !IsConfirmedDeletedDesktopPath(item.path)) {
+        if (item.id.empty() || !confirmDeleted(item.path)) {
             continue;
         }
         removedItemIds.push_back(item.id);
     }
-    if (removedItemIds.empty() ||
-        !configStore_.RemoveItemsAsync(removedItemIds)) {
+    // Explorer's hidden view can retain a deleted, unregistered temporary item.
+    // Confirm against the same filesystem rules used for registered items.
+    if (desktopSurface_ != nullptr) {
+        for (const DesktopViewItem& item : desktopSurface_->Snapshot().items) {
+            confirmDeleted(item.path);
+        }
+    }
+    for (const DesktopItem& item : items_) {
+        confirmDeleted(item.path);
+    }
+    if (removedIdentities.empty() ||
+        (!removedItemIds.empty() && !configStore_.RemoveItemsAsync(removedItemIds))) {
         return;
+    }
+
+    items_.erase(std::remove_if(items_.begin(), items_.end(),
+        [&](const DesktopItem& item) {
+            return std::any_of(removedIdentities.begin(), removedIdentities.end(),
+                [&](const std::wstring& identity) {
+                    return CompareStringOrdinal(identity.c_str(), -1,
+                        item.path.c_str(), -1, TRUE) == CSTR_EQUAL;
+                });
+        }), items_.end());
+    if (desktopSurface_ != nullptr) {
+        desktopSurface_->RemoveDeletedIdentities(removedIdentities);
     }
 
     const auto isRemoved = [&](const std::wstring& itemId) {
@@ -2082,8 +2118,11 @@ void MainWindow::RefreshDesktopSurfaceAssignments() {
 }
 
 void MainWindow::ScheduleDesktopRefresh() {
-    if (hwnd_ != nullptr) {
-        SetTimer(hwnd_, kDesktopRefreshTimerId, 650, nullptr);
+    if (hwnd_ != nullptr && !desktopRefreshScheduled_) {
+        // Merge into the first event's bounded window instead of waiting for
+        // silence: autosave/content notifications must not starve deletions.
+        desktopRefreshScheduled_ =
+            SetTimer(hwnd_, kDesktopRefreshTimerId, 650, nullptr) != 0;
     }
 }
 

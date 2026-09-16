@@ -48,6 +48,8 @@ public:
     void InvalidateIconCache(
         const std::vector<std::wstring>& paths);
     void RefreshIconCache();
+    void RemoveDeletedIdentities(
+        const std::vector<std::wstring>& identities);
     void UpdateAssignedIdentities(
         const std::vector<std::wstring>& assignedIdentities);
     void UpdateDisplayPositions(

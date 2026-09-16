@@ -213,6 +213,7 @@ private:
     std::wstring draggingItemId_;
     std::wstring draggingSourceCategoryId_;
     bool refreshPending_ = false;
+    bool desktopRefreshScheduled_ = false;
     bool organizerRefreshPending_ = false;
     std::mutex desktopChangesMutex_;
     DesktopChangeBatch pendingDesktopChanges_;

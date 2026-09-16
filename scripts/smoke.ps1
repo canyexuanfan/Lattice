@@ -186,6 +186,12 @@ function Invoke-SmokeMode {
         Write-Output $standardError.TrimEnd()
     }
     Write-Output "SMOKE_MODE_EXIT=$Mode`:$($process.ExitCode)"
+    if ($Mode -eq '--smoke-config') {
+        $runtimeReceipt = Join-Path $managedItemsSmokeDir 'desktop-filesystem-consistency\runtime-convergence.txt'
+        if (Test-Path -LiteralPath $runtimeReceipt) {
+            Get-Content -LiteralPath $runtimeReceipt | Write-Output
+        }
+    }
     if ($process.ExitCode -ne 0) {
         throw "Smoke mode failed: $Mode (exit $($process.ExitCode))"
     }

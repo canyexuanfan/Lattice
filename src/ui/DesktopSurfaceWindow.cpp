@@ -852,6 +852,32 @@ bool DesktopSurfaceWindow::Refresh(
     return true;
 }
 
+void DesktopSurfaceWindow::RemoveDeletedIdentities(
+    const std::vector<std::wstring>& identities) {
+    const auto isRemoved = [&](const std::wstring& identity) {
+        return std::any_of(identities.begin(), identities.end(),
+            [&](const std::wstring& deleted) {
+                return IdentitiesEqual(identity, deleted);
+            });
+    };
+    if (isRemoved(renameIdentity_)) {
+        FinishRename(false);
+    }
+    if (isRemoved(pendingRenameIdentity_)) {
+        CancelPendingRename();
+    }
+    snapshot_.items.erase(std::remove_if(snapshot_.items.begin(), snapshot_.items.end(),
+        [&](const DesktopViewItem& item) { return isRemoved(item.path); }),
+        snapshot_.items.end());
+    positionOverrides_.erase(std::remove_if(positionOverrides_.begin(), positionOverrides_.end(),
+        [&](const PositionOverride& value) { return isRemoved(value.identity); }),
+        positionOverrides_.end());
+    RebuildVisibleItems();
+    if (hwnd_ != nullptr) {
+        InvalidateRect(hwnd_, nullptr, FALSE);
+    }
+}
+
 void DesktopSurfaceWindow::InvalidateIconCache(
     const std::vector<std::wstring>& paths) {
     iconCache_.Invalidate(paths);

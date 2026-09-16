@@ -418,7 +418,7 @@ bool RequestHttps(
     InternetHandle& connection,
     InternetHandle& request) {
     session.value = WinHttpOpen(
-        L"Lattice/0.4.62",
+        L"Lattice/0.4.63",
         WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
         WINHTTP_NO_PROXY_NAME,
         WINHTTP_NO_PROXY_BYPASS,

@@ -1563,6 +1563,30 @@ struct DesktopSurfaceWindowSmokeAccess {
 };
 
 struct MainWindowSmokeAccess {
+    static DesktopSurfaceWindow* AttachCachedDesktopFixture(
+        MainWindow& window,
+        const std::vector<DesktopViewItem>& items) {
+        window.desktopSurface_ = std::make_unique<DesktopSurfaceWindow>(
+            GetModuleHandleW(nullptr));
+        DesktopSurfaceWindowSmokeAccess::ConfigureSelectionFixture(
+            *window.desktopSurface_, items, {items.front().path});
+        DesktopSurfaceWindowSmokeAccess::ReconcileSelection(
+            *window.desktopSurface_, items, window.AssignedDesktopIdentities());
+        return window.desktopSurface_.get();
+    }
+
+    static WidgetWindow* AttachWidgetFixture(
+        MainWindow& window, const std::wstring& categoryId) {
+        auto widget = std::make_unique<WidgetWindow>(
+            GetModuleHandleW(nullptr), window.Window(), categoryId, 0);
+        if (!widget->Create()) {
+            return nullptr;
+        }
+        WidgetWindow* result = widget.get();
+        window.widgetWindows_.push_back(std::move(widget));
+        return result;
+    }
+
     static DesktopSurfaceWindow* DesktopSurface(MainWindow& window) {
         return window.desktopSurface_.get();
     }
@@ -3211,7 +3235,155 @@ int RunSmokeConfig() {
         std::wcerr << L"Desktop filesystem consistency persistence failed\n";
         return 1;
     }
-    std::wcout << L"Desktop filesystem additions and confirmed deletions converged\n";
+    // Exercise the real directory watcher, posted messages and refresh timer.
+    // A deliberately stale Explorer cache is independent of the filesystem scan.
+    const auto dwg = desktopRoot / L"drawing.dwg";
+    const auto dwl = desktopRoot / L"drawing.dwl";
+    const auto dwl2 = desktopRoot / L"drawing.dwl2";
+    const auto transient = publicRoot / L"autosave.tmp";
+    const auto folder = desktopRoot / L"transient-folder";
+    const auto oldName = desktopRoot / L"rename.old";
+    const auto newName = desktopRoot / L"rename.new";
+    const auto busy = desktopRoot / L"still-writing.log";
+    for (const auto& path : {dwg, dwl, dwl2, transient, oldName, busy}) {
+        std::ofstream file(path, std::ios::binary);
+        file << "transient-fixture";
+        if (!file) {
+            return 1;
+        }
+    }
+    std::filesystem::create_directory(folder, consistencyError);
+    AppConfig runtimeConfig = persistedConsistencyConfig;
+    runtimeConfig.items.push_back(makeItem(L"runtime-dwl2", dwl2, L"drawing.dwl2"));
+    runtimeConfig.items.push_back(makeItem(L"runtime-temp", transient, L"autosave.tmp"));
+    runtimeConfig.categories.front().itemIds.push_back(L"runtime-dwl2");
+    runtimeConfig.uncategorizedItemIds.push_back(L"runtime-temp");
+    runtimeConfig.desktopDisplayLayout.push_back({dwl2.wstring(), 100, 200});
+    runtimeConfig.desktopLayout.push_back({transient.wstring(), 100, 200});
+    if (consistencyError || !store.SaveAppConfig(runtimeConfig)) {
+        return 1;
+    }
+    MainWindow runtimeWindow(GetModuleHandleW(nullptr), {}, false);
+    if (!runtimeWindow.Create()) {
+        return 1;
+    }
+    struct RuntimeWindowCleanup {
+        HWND window;
+        ~RuntimeWindowCleanup() {
+            if (IsWindow(window)) {
+                DestroyWindow(window);
+            }
+        }
+    } runtimeCleanup{runtimeWindow.Window()};
+    std::vector<DesktopViewItem> cachedItems;
+    for (const auto& path : {dwl, dwl2, transient, folder, oldName, dwg,
+                            outsideMissingPath, unavailableParentPath, managedMissingPath}) {
+        DesktopViewItem item;
+        item.path = path.wstring();
+        item.displayName = path.filename().wstring();
+        cachedItems.push_back(std::move(item));
+    }
+    DesktopViewItem virtualItem;
+    virtualItem.path = L"::{645FF040-5081-101B-9F08-00AA002F954E}";
+    cachedItems.push_back(virtualItem);
+    auto* cachedSurface = MainWindowSmokeAccess::AttachCachedDesktopFixture(
+        runtimeWindow, cachedItems);
+    auto* categoryWidget = MainWindowSmokeAccess::AttachWidgetFixture(
+        runtimeWindow, runtimeConfig.categories.front().id);
+    auto* uncategorizedWidget = MainWindowSmokeAccess::AttachWidgetFixture(
+        runtimeWindow, kUncategorizedCategoryId);
+    if (!categoryWidget || !uncategorizedWidget) {
+        return 1;
+    }
+    const auto pump = [](DWORD duration) {
+        const ULONGLONG deadline = GetTickCount64() + duration;
+        do {
+            MSG message{};
+            while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+                TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
+            Sleep(5);
+        } while (GetTickCount64() < deadline);
+    };
+    pump(150); // Allow the watcher to arm its first overlapped read.
+    for (const auto& path : {dwl, dwl2, transient, folder}) {
+        if (!std::filesystem::remove(path, consistencyError) || consistencyError) {
+            return 1;
+        }
+    }
+    std::filesystem::rename(oldName, newName, consistencyError);
+    if (consistencyError) {
+        return 1;
+    }
+    const ULONGLONG started = GetTickCount64();
+    while (GetTickCount64() - started < 2200) {
+        std::ofstream writing(busy, std::ios::binary | std::ios::app);
+        writing << "x";
+        writing.close();
+        pump(50);
+    }
+    const bool bounded = verifyRemoved(store.LoadAppConfig(), L"runtime-dwl2", dwl2) &&
+        verifyRemoved(store.LoadAppConfig(), L"runtime-temp", transient) &&
+        !MainWindowSmokeAccess::HasDesktopPath(runtimeWindow, dwl.wstring()) &&
+        MainWindowSmokeAccess::HasDesktopPath(runtimeWindow, newName.wstring());
+    pump(900);
+    const auto cachedHas = [&](const std::filesystem::path& path) {
+        return std::any_of(cachedSurface->Snapshot().items.begin(),
+            cachedSurface->Snapshot().items.end(), [&](const DesktopViewItem& item) {
+                return item.path == path.wstring();
+            });
+    };
+    const bool cacheConverged = !cachedHas(dwl) && !cachedHas(dwl2) &&
+        !cachedHas(transient) && !cachedHas(folder) && !cachedHas(oldName) &&
+        !DesktopSurfaceWindowSmokeAccess::IsSelected(*cachedSurface, dwl.wstring());
+    const auto uncategorizedIds = WidgetWindowSmokeAccess::CurrentItemIds(*uncategorizedWidget);
+    const bool widgetDeletion =
+        WidgetWindowSmokeAccess::CurrentItemIds(*categoryWidget).empty() &&
+        std::find(uncategorizedIds.begin(), uncategorizedIds.end(), L"runtime-temp") ==
+            uncategorizedIds.end();
+    const bool preserved = cachedHas(dwg) && cachedHas(outsideMissingPath) &&
+        cachedHas(unavailableParentPath) && cachedHas(managedMissingPath) &&
+        std::any_of(cachedSurface->Snapshot().items.begin(), cachedSurface->Snapshot().items.end(),
+            [&](const DesktopViewItem& item) { return item.path == virtualItem.path; }) &&
+        std::filesystem::exists(dwg) && std::filesystem::exists(newName);
+    std::ofstream runtimeDiagnostics(consistencyRoot / L"runtime-convergence.txt");
+    runtimeDiagnostics << "RUNTIME_DELETE_BOUNDED=" << bounded
+        << "\nSTALE_EXPLORER_CACHE_PRUNED=" << cacheConverged
+        << "\nWIDGET_DELETE_CONVERGED=" << widgetDeletion
+        << "\nSAFE_REFERENCES_PRESERVED=" << preserved << "\n";
+    runtimeDiagnostics.flush();
+    std::wcout << L"RUNTIME_DELETE_BOUNDED=" << bounded
+        << L"\nSTALE_EXPLORER_CACHE_PRUNED=" << cacheConverged
+        << L"\nWIDGET_DELETE_CONVERGED=" << widgetDeletion
+        << L"\nSAFE_REFERENCES_PRESERVED=" << preserved << L"\n";
+    if (!bounded || !cacheConverged || !widgetDeletion || !preserved) {
+        std::wcerr << L"Runtime transient file convergence failed\n";
+        return 1;
+    }
+    // Reusing a deleted filename must not be permanently suppressed.
+    {
+        std::ofstream recreated(dwl, std::ios::binary);
+        recreated << "new-generation";
+    }
+    pump(900);
+    cachedItems.erase(std::remove_if(cachedItems.begin(), cachedItems.end(),
+        [&](const DesktopViewItem& item) {
+            return item.path != dwl.wstring() && item.path != dwg.wstring();
+        }), cachedItems.end());
+    DesktopSurfaceWindowSmokeAccess::ReconcileSelection(*cachedSurface, cachedItems, {});
+    if (!MainWindowSmokeAccess::HasDesktopPath(runtimeWindow, dwl.wstring()) ||
+        !cachedHas(dwl) || !std::filesystem::remove(dwl, consistencyError)) {
+        return 1;
+    }
+    pump(900);
+    if (cachedHas(dwl) || MainWindowSmokeAccess::HasDesktopPath(runtimeWindow, dwl.wstring()) ||
+        !ConfigStore::DrainPendingWrites(5000)) {
+        return 1;
+    }
+    runtimeDiagnostics << "SAME_PATH_RECREATION_AND_DELETE=1\n";
+    runtimeDiagnostics.flush();
+    std::wcout << L"Desktop runtime watcher/timer, temporary deletions, rename and recreation converged\n";
     return 0;
 }
 
@@ -12105,7 +12277,7 @@ int RunSmokeUpdatePackages() {
             return 3;
         }
         UpdateReleaseAsset asset;
-        asset.version = L"0.4.62";
+        asset.version = L"0.4.63";
         asset.name = source.filename().wstring();
         asset.downloadUrl = L"https://example.invalid/" + asset.name;
         asset.size = std::filesystem::file_size(source, error);
@@ -12201,7 +12373,7 @@ int RunSmokeUpdatePackages() {
         if (!stream) return 14;
     }
     UpdateReleaseAsset nonPeAsset;
-    nonPeAsset.version = L"0.4.62";
+    nonPeAsset.version = L"0.4.63";
     nonPeAsset.size = 3;
     if (!parseDigest(
             L"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
