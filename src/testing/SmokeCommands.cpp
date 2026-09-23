@@ -871,6 +871,37 @@ struct DesktopSurfaceWindowSmokeAccess {
         return DesktopSurfaceWindow::kWallpaperDrawMode;
     }
 
+    static bool WallpaperReady(
+        const DesktopSurfaceWindow& surface) {
+        return surface.wallpaperReadyForTarget_ &&
+            surface.wallpaper_.HasBitmap();
+    }
+
+    static unsigned long long WallpaperGeneration(
+        const DesktopSurfaceWindow& surface) {
+        return surface.wallpaper_.Generation();
+    }
+
+    static bool RefreshWallpaper(
+        DesktopSurfaceWindow& surface) {
+        return surface.RefreshWallpaperForCurrentTarget();
+    }
+
+    static void SimulateWallpaperRenderTargetLoss(
+        DesktopSurfaceWindow& surface) {
+        surface.RecoverWallpaperAfterRenderFailure();
+    }
+
+    static void RunWallpaperRecoveryTimer(
+        DesktopSurfaceWindow& surface) {
+        surface.HandleWallpaperRecoveryTimer();
+    }
+
+    static bool WallpaperRecoveryActive(
+        const DesktopSurfaceWindow& surface) {
+        return surface.wallpaperRecoveryActive_;
+    }
+
     static IDropTarget* DropTarget(DesktopSurfaceWindow& surface) {
         return surface.desktopDropTarget_.Get();
     }
@@ -6056,6 +6087,48 @@ int RunSmokeDesktopDisplayTakeover(HINSTANCE instance) {
                 0, nullptr, FALSE, 16, QS_ALLINPUT);
         }
     };
+    const unsigned long long wallpaperGeneration =
+        DesktopSurfaceWindowSmokeAccess::WallpaperGeneration(surface);
+    if (!DesktopSurfaceWindowSmokeAccess::WallpaperReady(surface) ||
+        wallpaperGeneration == 0 ||
+        !SetEnvironmentVariableW(
+            L"LATTICE_SMOKE_FAIL_WALLPAPER_REFRESH", L"1")) {
+        surface.Close();
+        std::wcerr << L"Desktop wallpaper recovery fixture could not be prepared\n";
+        return 233;
+    }
+    const bool rejectedRefresh =
+        !DesktopSurfaceWindowSmokeAccess::RefreshWallpaper(surface);
+    const bool retainedPreviousBitmap =
+        DesktopSurfaceWindowSmokeAccess::WallpaperReady(surface) &&
+        DesktopSurfaceWindowSmokeAccess::WallpaperGeneration(surface) ==
+            wallpaperGeneration &&
+        IsWindowVisible(surfaceWindow) != FALSE;
+    DesktopSurfaceWindowSmokeAccess::SimulateWallpaperRenderTargetLoss(
+        surface);
+    const bool failedClosed =
+        !DesktopSurfaceWindowSmokeAccess::WallpaperReady(surface) &&
+        DesktopSurfaceWindowSmokeAccess::WallpaperRecoveryActive(surface) &&
+        IsWindowVisible(surfaceWindow) == FALSE;
+    SetEnvironmentVariableW(
+        L"LATTICE_SMOKE_FAIL_WALLPAPER_REFRESH", nullptr);
+    DesktopSurfaceWindowSmokeAccess::RunWallpaperRecoveryTimer(surface);
+    const bool recovered =
+        DesktopSurfaceWindowSmokeAccess::WallpaperReady(surface) &&
+        !DesktopSurfaceWindowSmokeAccess::WallpaperRecoveryActive(surface) &&
+        DesktopSurfaceWindowSmokeAccess::WallpaperGeneration(surface) >
+            wallpaperGeneration &&
+        IsWindowVisible(surfaceWindow) != FALSE;
+    if (!rejectedRefresh || !retainedPreviousBitmap ||
+        !failedClosed || !recovered) {
+        SetEnvironmentVariableW(
+            L"LATTICE_SMOKE_FAIL_WALLPAPER_REFRESH", nullptr);
+        surface.Close();
+        std::wcerr
+            << L"Desktop wallpaper atomic refresh or fail-closed recovery regressed\n";
+        return 234;
+    }
+    pumpMessagesFor(80);
     const HWND originalForeground = GetForegroundWindow();
     struct ForegroundRestorer {
         HWND window = nullptr;
@@ -12277,7 +12350,7 @@ int RunSmokeUpdatePackages() {
             return 3;
         }
         UpdateReleaseAsset asset;
-        asset.version = L"0.4.63";
+        asset.version = L"0.4.64";
         asset.name = source.filename().wstring();
         asset.downloadUrl = L"https://example.invalid/" + asset.name;
         asset.size = std::filesystem::file_size(source, error);
@@ -12373,7 +12446,7 @@ int RunSmokeUpdatePackages() {
         if (!stream) return 14;
     }
     UpdateReleaseAsset nonPeAsset;
-    nonPeAsset.version = L"0.4.63";
+    nonPeAsset.version = L"0.4.64";
     nonPeAsset.size = 3;
     if (!parseDigest(
             L"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
@@ -13951,6 +14024,20 @@ int RunSmokeResourceIdle(HINSTANCE instance) {
 
 int RunSmokeCollapseSelectionLogic(HINSTANCE instance) {
     AttachParentConsole();
+    const HRESULT wallpaperComResult = CoInitializeEx(
+        nullptr, COINIT_APARTMENTTHREADED);
+    if (FAILED(wallpaperComResult) &&
+        wallpaperComResult != RPC_E_CHANGED_MODE) {
+        return 170;
+    }
+    struct WallpaperComScope {
+        bool uninitialize = false;
+        ~WallpaperComScope() {
+            if (uninitialize) {
+                CoUninitialize();
+            }
+        }
+    } wallpaperComScope{SUCCEEDED(wallpaperComResult)};
     if (WidgetWindowSmokeAccess::WallpaperDrawMode() !=
             WallpaperBackdropDrawMode::CropTopLeft ||
         DesktopSurfaceWindowSmokeAccess::WallpaperDrawMode() !=
@@ -14030,6 +14117,110 @@ int RunSmokeCollapseSelectionLogic(HINSTANCE instance) {
         stretchGeometry.destination.bottom != 45.0f) {
         std::wcerr << L"Desktop wallpaper stretch geometry regressed\n";
         return 175;
+    }
+
+    const RECT dualScreenBounds{-1920, 0, 1920, 1080};
+    const std::vector<RECT> dualScreenMonitors{
+        RECT{-1920, 0, 0, 1080},
+        RECT{0, 0, 1920, 1080}};
+    const RECT expectedLeft{0, 0, 1920, 1080};
+    const RECT expectedRight{1920, 0, 3840, 1080};
+    std::vector<WallpaperMonitorSlice> dualScreenSlices;
+    if (!BuildWallpaperMonitorSlices(
+            dualScreenBounds,
+            dualScreenMonitors,
+            dualScreenSlices) ||
+        dualScreenSlices.size() != 2 ||
+        dualScreenSlices[0].monitorIndex != 0 ||
+        !EqualRect(
+            &dualScreenSlices[0].destinationRect,
+            &expectedLeft) ||
+        dualScreenSlices[1].monitorIndex != 1 ||
+        !EqualRect(
+            &dualScreenSlices[1].destinationRect,
+            &expectedRight)) {
+        std::wcerr << L"Negative-coordinate dual-monitor wallpaper composition regressed\n";
+        return 231;
+    }
+    const RECT verticalBounds{-1280, -1024, 1920, 1080};
+    const std::vector<RECT> verticalMonitors{
+        RECT{-1280, -1024, 0, 0},
+        RECT{0, 0, 1920, 1080}};
+    std::vector<WallpaperMonitorSlice> verticalSlices;
+    const RECT expectedUpper{0, 0, 1280, 1024};
+    const RECT expectedLower{1280, 1024, 3200, 2104};
+    if (!BuildWallpaperMonitorSlices(
+            verticalBounds,
+            verticalMonitors,
+            verticalSlices) ||
+        verticalSlices.size() != 2 ||
+        !EqualRect(
+            &verticalSlices[0].destinationRect,
+            &expectedUpper) ||
+        !EqualRect(
+            &verticalSlices[1].destinationRect,
+            &expectedLower)) {
+        std::wcerr << L"Vertical multi-monitor wallpaper composition regressed\n";
+        return 232;
+    }
+
+    const HWND wallpaperProbe = CreateWindowExW(
+        WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+        L"STATIC",
+        L"Lattice wallpaper atomic refresh probe",
+        WS_POPUP,
+        16,
+        16,
+        64,
+        64,
+        nullptr,
+        nullptr,
+        instance,
+        nullptr);
+    D2DContext wallpaperContext;
+    WallpaperBackdrop wallpaperBackdrop;
+    const bool wallpaperContextReady = wallpaperProbe != nullptr &&
+        wallpaperContext.Initialize(wallpaperProbe);
+    const bool wallpaperSnapshotReady = wallpaperContextReady &&
+        wallpaperBackdrop.Refresh(
+            wallpaperProbe,
+            wallpaperContext.Target(),
+            64,
+            64,
+            false);
+    if (!wallpaperSnapshotReady) {
+        if (wallpaperProbe != nullptr) {
+            DestroyWindow(wallpaperProbe);
+        }
+        if (wallpaperProbe == nullptr) {
+            return 235;
+        }
+        if (!wallpaperContextReady) {
+            return 237;
+        }
+        return 238;
+    }
+    const unsigned long long initialWallpaperGeneration =
+        wallpaperBackdrop.Generation();
+    const bool failureEnabled = SetEnvironmentVariableW(
+        L"LATTICE_SMOKE_FAIL_WALLPAPER_REFRESH", L"1") != FALSE;
+    const bool refreshRejected = failureEnabled &&
+        !wallpaperBackdrop.Refresh(
+            wallpaperProbe,
+            wallpaperContext.Target(),
+            64,
+            64,
+            false);
+    SetEnvironmentVariableW(
+        L"LATTICE_SMOKE_FAIL_WALLPAPER_REFRESH", nullptr);
+    const bool previousWallpaperRetained =
+        wallpaperBackdrop.HasBitmap() &&
+        wallpaperBackdrop.CoversPixels(64, 64) &&
+        wallpaperBackdrop.Generation() == initialWallpaperGeneration;
+    DestroyWindow(wallpaperProbe);
+    if (!refreshRejected || !previousWallpaperRetained) {
+        std::wcerr << L"Wallpaper refresh failure discarded the last valid bitmap\n";
+        return 236;
     }
 
     const RECT bounds{0, 0, 200, 160};

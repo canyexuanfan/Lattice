@@ -198,6 +198,11 @@ private:
     void MaintainDesktopLayer();
     void UpdateViewMetrics();
     void ConfigurePixelRenderTarget();
+    bool RefreshWallpaperForCurrentTarget();
+    void RecoverWallpaperAfterRenderFailure();
+    void StartWallpaperRecovery(bool hideSurface);
+    void StopWallpaperRecovery() noexcept;
+    void HandleWallpaperRecoveryTimer();
     void SetItemScreenPoint(
         const std::wstring& identity,
         POINT screenPoint);
@@ -292,4 +297,8 @@ private:
     void* listViewQueryBuffer_ = nullptr;
     DWORD listViewProcessId_ = 0;
     bool listViewQueryReady_ = false;
+    bool wallpaperReadyForTarget_ = false;
+    bool wallpaperRecoveryActive_ = false;
+    bool wallpaperRecoveryHidden_ = false;
+    unsigned int wallpaperRecoveryAttempts_ = 0;
 };

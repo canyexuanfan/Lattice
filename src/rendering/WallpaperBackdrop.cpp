@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cwctype>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -36,6 +37,17 @@ struct WallpaperDescription {
     RECT layoutRect{};
     DESKTOP_WALLPAPER_POSITION position = DWPOS_FILL;
     COLORREF backgroundColor = RGB(0, 0, 0);
+    bool solidColor = false;
+};
+
+struct DesktopWallpaperMonitor {
+    std::wstring id;
+    RECT rect{};
+};
+
+struct MonitorEnumerationContext {
+    std::vector<RECT>* monitorRects = nullptr;
+    bool failed = false;
 };
 
 long long IntersectionArea(const RECT& first, const RECT& second) {
@@ -82,32 +94,103 @@ std::wstring ResolveCachedWallpaper(const WallpaperDescription& description) {
     return IsRegularFile(transcodedWallpaper) ? transcodedWallpaper : L"";
 }
 
-bool ResolveWallpaper(HWND hwnd, WallpaperDescription& description) {
-    const HMONITOR windowMonitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
-    MONITORINFO monitorInfo{};
-    monitorInfo.cbSize = sizeof(monitorInfo);
-    if (windowMonitor == nullptr || !GetMonitorInfoW(windowMonitor, &monitorInfo)) {
+BOOL CALLBACK CollectMonitorRect(
+    HMONITOR monitor,
+    HDC,
+    LPRECT,
+    LPARAM contextValue) {
+    auto* context = reinterpret_cast<MonitorEnumerationContext*>(contextValue);
+    if (context == nullptr || context->monitorRects == nullptr) {
+        return FALSE;
+    }
+    MONITORINFO info{};
+    info.cbSize = sizeof(info);
+    if (!GetMonitorInfoW(monitor, &info)) {
+        return TRUE;
+    }
+    try {
+        context->monitorRects->push_back(info.rcMonitor);
+    } catch (...) {
+        context->failed = true;
+        return FALSE;
+    }
+    return TRUE;
+}
+
+bool ReadWallpaperPath(
+    IDesktopWallpaper* desktopWallpaper,
+    const wchar_t* monitorId,
+    std::wstring& path,
+    bool& confirmedNoImage) {
+    path.clear();
+    confirmedNoImage = false;
+    if (desktopWallpaper == nullptr) {
         return false;
     }
-    description.monitorRect = monitorInfo.rcMonitor;
-    description.layoutRect = monitorInfo.rcMonitor;
+    LPWSTR rawPath = nullptr;
+    const HRESULT result = desktopWallpaper->GetWallpaper(
+        monitorId, &rawPath);
+    if (FAILED(result)) {
+        if (rawPath != nullptr) {
+            CoTaskMemFree(rawPath);
+        }
+        return false;
+    }
+    if (rawPath != nullptr) {
+        path = rawPath;
+        CoTaskMemFree(rawPath);
+    }
+    confirmedNoImage = path.empty();
+    return true;
+}
+
+bool ResolveWallpapers(
+    const RECT& outputScreenRect,
+    std::vector<WallpaperDescription>& descriptions) {
+    descriptions.clear();
+    std::vector<RECT> physicalMonitors;
+    physicalMonitors.reserve(8);
+    MonitorEnumerationContext enumeration{
+        &physicalMonitors, false};
+    if (!EnumDisplayMonitors(
+            nullptr,
+            nullptr,
+            CollectMonitorRect,
+            reinterpret_cast<LPARAM>(&enumeration)) ||
+        enumeration.failed || physicalMonitors.empty()) {
+        return false;
+    }
+    physicalMonitors.erase(
+        std::remove_if(
+            physicalMonitors.begin(),
+            physicalMonitors.end(),
+            [&](const RECT& monitorRect) {
+                return IntersectionArea(
+                           monitorRect, outputScreenRect) <= 0;
+            }),
+        physicalMonitors.end());
+    if (physicalMonitors.empty()) {
+        return false;
+    }
 
     Microsoft::WRL::ComPtr<IDesktopWallpaper> desktopWallpaper;
-    if (FAILED(CoCreateInstance(
+    const HRESULT createResult = CoCreateInstance(
             CLSID_DesktopWallpaper,
             nullptr,
             CLSCTX_ALL,
-            IID_PPV_ARGS(desktopWallpaper.GetAddressOf())))) {
+            IID_PPV_ARGS(desktopWallpaper.GetAddressOf()));
+    if (FAILED(createResult)) {
         return false;
     }
 
-    desktopWallpaper->GetPosition(&description.position);
-    desktopWallpaper->GetBackgroundColor(&description.backgroundColor);
+    DESKTOP_WALLPAPER_POSITION position = DWPOS_FILL;
+    COLORREF backgroundColor = RGB(0, 0, 0);
+    desktopWallpaper->GetPosition(&position);
+    desktopWallpaper->GetBackgroundColor(&backgroundColor);
 
-    std::wstring monitorId;
+    std::vector<DesktopWallpaperMonitor> desktopMonitors;
     UINT monitorCount = 0;
     if (SUCCEEDED(desktopWallpaper->GetMonitorDevicePathCount(&monitorCount))) {
-        long long bestArea = -1;
         for (UINT index = 0; index < monitorCount; ++index) {
             LPWSTR rawMonitorId = nullptr;
             if (FAILED(desktopWallpaper->GetMonitorDevicePathAt(index, &rawMonitorId)) || rawMonitorId == nullptr) {
@@ -115,48 +198,83 @@ bool ResolveWallpaper(HWND hwnd, WallpaperDescription& description) {
             }
             RECT candidateRect{};
             if (SUCCEEDED(desktopWallpaper->GetMonitorRECT(rawMonitorId, &candidateRect))) {
-                const long long area = IntersectionArea(candidateRect, monitorInfo.rcMonitor);
-                if (area > bestArea) {
-                    bestArea = area;
-                    monitorId = rawMonitorId;
-                }
+                desktopMonitors.push_back(
+                    DesktopWallpaperMonitor{rawMonitorId, candidateRect});
             }
             CoTaskMemFree(rawMonitorId);
         }
     }
 
-    LPWSTR rawWallpaperPath = nullptr;
-    HRESULT wallpaperResult = E_FAIL;
-    if (!monitorId.empty()) {
-        wallpaperResult = desktopWallpaper->GetWallpaper(monitorId.c_str(), &rawWallpaperPath);
-    }
-    if (FAILED(wallpaperResult) || rawWallpaperPath == nullptr || rawWallpaperPath[0] == L'\0') {
-        if (rawWallpaperPath != nullptr) {
-            CoTaskMemFree(rawWallpaperPath);
-            rawWallpaperPath = nullptr;
-        }
-        wallpaperResult = desktopWallpaper->GetWallpaper(nullptr, &rawWallpaperPath);
-    }
-    if (SUCCEEDED(wallpaperResult) && rawWallpaperPath != nullptr) {
-        description.path = rawWallpaperPath;
-    }
-    if (rawWallpaperPath != nullptr) {
-        CoTaskMemFree(rawWallpaperPath);
-    }
+    std::wstring globalPath;
+    bool globalNoImage = false;
+    const bool globalQuerySucceeded = ReadWallpaperPath(
+        desktopWallpaper.Get(), nullptr, globalPath, globalNoImage);
 
-    if (!IsRegularFile(description.path)) {
-        description.path = ResolveCachedWallpaper(description);
-    }
-    if (!IsRegularFile(description.path)) {
-        wchar_t fallbackPath[MAX_PATH]{};
-        if (SystemParametersInfoW(SPI_GETDESKWALLPAPER, MAX_PATH, fallbackPath, 0) && IsRegularFile(fallbackPath)) {
-            description.path = fallbackPath;
+    wchar_t spiPath[MAX_PATH]{};
+    const bool hasSpiPath =
+        SystemParametersInfoW(
+            SPI_GETDESKWALLPAPER,
+            ARRAYSIZE(spiPath),
+            spiPath,
+            0) != FALSE &&
+        IsRegularFile(spiPath);
+
+    descriptions.reserve(physicalMonitors.size());
+    for (const RECT& physicalMonitor : physicalMonitors) {
+        WallpaperDescription description;
+        description.monitorRect = physicalMonitor;
+        description.layoutRect = position == DWPOS_SPAN
+            ? VirtualScreenRect()
+            : physicalMonitor;
+        description.position = position;
+        description.backgroundColor = backgroundColor;
+
+        const DesktopWallpaperMonitor* binding = nullptr;
+        long long bestArea = 0;
+        for (const DesktopWallpaperMonitor& candidate : desktopMonitors) {
+            const long long area = IntersectionArea(
+                candidate.rect, physicalMonitor);
+            if (area > bestArea) {
+                bestArea = area;
+                binding = &candidate;
+            }
+        }
+
+        bool monitorNoImage = false;
+        bool monitorQuerySucceeded = false;
+        if (binding != nullptr) {
+            monitorQuerySucceeded = ReadWallpaperPath(
+                desktopWallpaper.Get(),
+                binding->id.c_str(),
+                description.path,
+                monitorNoImage);
+        }
+        if (!IsRegularFile(description.path) &&
+            globalQuerySucceeded && IsRegularFile(globalPath)) {
+            description.path = globalPath;
+        }
+        if (!IsRegularFile(description.path)) {
+            description.path = ResolveCachedWallpaper(description);
+        }
+        if (!IsRegularFile(description.path) && hasSpiPath) {
+            description.path = spiPath;
+        }
+        if (!IsRegularFile(description.path)) {
+            const bool confirmedNoImage =
+                monitorQuerySucceeded && monitorNoImage;
+            if (!confirmedNoImage) {
+                return false;
+            }
+            description.path.clear();
+            description.solidColor = true;
+        }
+        try {
+            descriptions.push_back(std::move(description));
+        } catch (...) {
+            return false;
         }
     }
-    if (description.position == DWPOS_SPAN) {
-        description.layoutRect = VirtualScreenRect();
-    }
-    return IsRegularFile(description.path);
+    return !descriptions.empty();
 }
 
 bool DecodeWallpaper(const std::wstring& path, DecodedWallpaper& image) {
@@ -513,7 +631,78 @@ void BlurPixels(std::vector<BYTE>& pixels, int width, int height) {
     }
 }
 
+#ifndef NDEBUG
+bool ShouldInjectSmokeWallpaperRefreshFailure() {
+    wchar_t enabled[2]{};
+    if (GetEnvironmentVariableW(
+            L"LATTICE_SMOKE_FAIL_WALLPAPER_REFRESH",
+            enabled,
+            ARRAYSIZE(enabled)) != 1 ||
+        enabled[0] != L'1') {
+        return false;
+    }
+    const DWORD required = GetEnvironmentVariableW(
+        L"DESKTOP_ORGANIZER_CONFIG_DIR", nullptr, 0);
+    if (required <= 1 || required > 32768) {
+        return false;
+    }
+    std::wstring configDirectory(required, L'\0');
+    const DWORD copied = GetEnvironmentVariableW(
+        L"DESKTOP_ORGANIZER_CONFIG_DIR",
+        configDirectory.data(),
+        required);
+    if (copied == 0 || copied >= required) {
+        return false;
+    }
+    configDirectory.resize(copied);
+    std::transform(
+        configDirectory.begin(),
+        configDirectory.end(),
+        configDirectory.begin(),
+        [](wchar_t value) {
+            return static_cast<wchar_t>(std::towlower(value));
+        });
+    return configDirectory.find(L"\\smoke-runs\\") !=
+        std::wstring::npos;
+}
+#endif
+
 }  // namespace
+
+bool BuildWallpaperMonitorSlices(
+    const RECT& outputScreenRect,
+    const std::vector<RECT>& monitorRects,
+    std::vector<WallpaperMonitorSlice>& slices) {
+    slices.clear();
+    if (outputScreenRect.right <= outputScreenRect.left ||
+        outputScreenRect.bottom <= outputScreenRect.top) {
+        return false;
+    }
+    try {
+        slices.reserve(monitorRects.size());
+        for (size_t index = 0; index < monitorRects.size(); ++index) {
+            RECT intersection{};
+            if (!IntersectRect(
+                    &intersection,
+                    &outputScreenRect,
+                    &monitorRects[index])) {
+                continue;
+            }
+            slices.push_back(WallpaperMonitorSlice{
+                index,
+                intersection,
+                RECT{
+                    intersection.left - outputScreenRect.left,
+                    intersection.top - outputScreenRect.top,
+                    intersection.right - outputScreenRect.left,
+                    intersection.bottom - outputScreenRect.top}});
+        }
+    } catch (...) {
+        slices.clear();
+        return false;
+    }
+    return !slices.empty();
+}
 
 bool WallpaperBackdrop::Refresh(
     HWND hwnd,
@@ -521,19 +710,7 @@ bool WallpaperBackdrop::Refresh(
     int minimumWidthPixels,
     int minimumHeightPixels,
     bool blur) {
-    bitmap_.Reset();
-    pixelSize_ = {};
     if (hwnd == nullptr || renderTarget == nullptr) {
-        return false;
-    }
-
-    WallpaperDescription description;
-    if (!ResolveWallpaper(hwnd, description)) {
-        return false;
-    }
-    const std::shared_ptr<const DecodedWallpaper> wallpaper =
-        CachedWallpaper(description.path);
-    if (wallpaper == nullptr) {
         return false;
     }
 
@@ -561,17 +738,81 @@ bool WallpaperBackdrop::Refresh(
         return false;
     }
 
+    const RECT sampleScreenRect{
+        clientOrigin.x - padding,
+        clientOrigin.y - padding,
+        clientOrigin.x - padding + sampleWidth,
+        clientOrigin.y - padding + sampleHeight};
+    std::vector<WallpaperDescription> descriptions;
+    if (!ResolveWallpapers(sampleScreenRect, descriptions)) {
+        return false;
+    }
+    std::vector<RECT> monitorRects;
+    monitorRects.reserve(descriptions.size());
+    for (const WallpaperDescription& description : descriptions) {
+        monitorRects.push_back(description.monitorRect);
+    }
+    std::vector<WallpaperMonitorSlice> slices;
+    if (!BuildWallpaperMonitorSlices(
+            sampleScreenRect, monitorRects, slices)) {
+        return false;
+    }
+    std::vector<std::shared_ptr<const DecodedWallpaper>> wallpapers;
+    wallpapers.reserve(descriptions.size());
+    for (const WallpaperDescription& description : descriptions) {
+        if (description.solidColor) {
+            wallpapers.push_back({});
+            continue;
+        }
+        std::shared_ptr<const DecodedWallpaper> wallpaper =
+            CachedWallpaper(description.path);
+        if (wallpaper == nullptr) {
+            return false;
+        }
+        wallpapers.push_back(std::move(wallpaper));
+    }
+
     std::vector<BYTE> sampled(static_cast<size_t>(sampleWidth) * sampleHeight * 4U);
-    for (int y = 0; y < sampleHeight; ++y) {
-        const double screenY = static_cast<double>(clientOrigin.y - padding + y) + 0.5;
-        for (int x = 0; x < sampleWidth; ++x) {
-            const double screenX = static_cast<double>(clientOrigin.x - padding + x) + 0.5;
-            const BgraPixel pixel = SampleWallpaper(*wallpaper, description, screenX, screenY);
-            const size_t offset = (static_cast<size_t>(y) * sampleWidth + x) * 4U;
-            sampled[offset] = pixel.blue;
-            sampled[offset + 1U] = pixel.green;
-            sampled[offset + 2U] = pixel.red;
-            sampled[offset + 3U] = 255;
+    const BgraPixel fallback = BackgroundPixel(
+        descriptions.front().backgroundColor);
+    for (size_t offset = 0; offset < sampled.size(); offset += 4U) {
+        sampled[offset] = fallback.blue;
+        sampled[offset + 1U] = fallback.green;
+        sampled[offset + 2U] = fallback.red;
+        sampled[offset + 3U] = 255;
+    }
+    for (const WallpaperMonitorSlice& slice : slices) {
+        if (slice.monitorIndex >= descriptions.size()) {
+            return false;
+        }
+        const WallpaperDescription& description =
+            descriptions[slice.monitorIndex];
+        const std::shared_ptr<const DecodedWallpaper>& wallpaper =
+            wallpapers[slice.monitorIndex];
+        for (LONG y = slice.destinationRect.top;
+             y < slice.destinationRect.bottom;
+             ++y) {
+            const double screenY =
+                static_cast<double>(sampleScreenRect.top + y) + 0.5;
+            for (LONG x = slice.destinationRect.left;
+                 x < slice.destinationRect.right;
+                 ++x) {
+                const double screenX =
+                    static_cast<double>(sampleScreenRect.left + x) + 0.5;
+                const BgraPixel pixel = wallpaper != nullptr
+                    ? SampleWallpaper(
+                          *wallpaper,
+                          description,
+                          screenX,
+                          screenY)
+                    : BackgroundPixel(description.backgroundColor);
+                const size_t offset =
+                    (static_cast<size_t>(y) * sampleWidth + x) * 4U;
+                sampled[offset] = pixel.blue;
+                sampled[offset + 1U] = pixel.green;
+                sampled[offset + 2U] = pixel.red;
+                sampled[offset + 3U] = 255;
+            }
         }
     }
     if (blur) {
@@ -593,14 +834,22 @@ bool WallpaperBackdrop::Refresh(
         D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED),
         dpi,
         dpi);
+#ifndef NDEBUG
+    if (ShouldInjectSmokeWallpaperRefreshFailure()) {
+        return false;
+    }
+#endif
+    Microsoft::WRL::ComPtr<ID2D1Bitmap> nextBitmap;
     const bool created = SUCCEEDED(renderTarget->CreateBitmap(
         D2D1::SizeU(static_cast<UINT>(outputWidth), static_cast<UINT>(outputHeight)),
         output.data(),
         static_cast<UINT32>(outputStride),
         properties,
-        bitmap_.GetAddressOf()));
+        nextBitmap.GetAddressOf()));
     if (created) {
+        bitmap_ = std::move(nextBitmap);
         pixelSize_ = SIZE{outputWidth, outputHeight};
+        ++generation_;
     }
     return created;
 }

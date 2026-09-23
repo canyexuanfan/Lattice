@@ -26,6 +26,9 @@ constexpr UINT kFinishRenameMessage = WM_APP + 42;
 constexpr UINT kCancelRenameMessage = WM_APP + 43;
 constexpr UINT kBeginRenameMessage = WM_APP + 44;
 constexpr UINT_PTR kRenameTimerId = 0x52454E41;
+constexpr UINT_PTR kWallpaperRecoveryTimerId = 0x57414C4C;
+constexpr UINT kWallpaperRecoveryDelayMilliseconds = 80;
+constexpr unsigned int kWallpaperRecoveryAttemptLimit = 5;
 constexpr UINT_PTR kRenameSubclassId = 1;
 constexpr DWORD kListViewQueryTimeoutMilliseconds = 50;
 
@@ -541,6 +544,7 @@ bool DesktopSurfaceWindow::Create(
             &item.shellChildPidl,
             snapshot_.viewIconSize);
     }
+    wallpaperReadyForTarget_ = false;
     if (!wallpaper_.Refresh(
             hwnd_, d2d_.Target(), width, height, false)) {
         errorMessage =
@@ -548,6 +552,7 @@ bool DesktopSurfaceWindow::Create(
         Close();
         return false;
     }
+    wallpaperReadyForTarget_ = true;
     if (!InstallKeyboardHook()) {
         errorMessage =
             L"无法建立桌面F2键盘路由。";
@@ -562,6 +567,12 @@ void DesktopSurfaceWindow::Show() {
     if (hwnd_ == nullptr) {
         return;
     }
+    if (!wallpaperReadyForTarget_ || !wallpaper_.HasBitmap()) {
+        wallpaperRecoveryHidden_ = true;
+        StartWallpaperRecovery(false);
+        return;
+    }
+    wallpaperRecoveryHidden_ = false;
     ShowWindow(hwnd_, SW_SHOWNOACTIVATE);
     MaintainDesktopLayer();
     RedrawWindow(
@@ -571,6 +582,7 @@ void DesktopSurfaceWindow::Show() {
 
 void DesktopSurfaceWindow::Hide() {
     if (hwnd_ != nullptr) {
+        wallpaperRecoveryHidden_ = false;
         desktopKeyboardSelectionArmed_ = false;
         CancelPendingRename();
         FinishRename(false);
@@ -706,6 +718,7 @@ void DesktopSurfaceWindow::ConfirmUnassignedItemAt(
 }
 
 void DesktopSurfaceWindow::Close() {
+    StopWallpaperRecovery();
     RemoveKeyboardHook();
     CancelPendingRename();
     FinishRename(false);
@@ -730,11 +743,109 @@ void DesktopSurfaceWindow::Close() {
     visibleInteractionRects_.clear();
     positionOverrides_.clear();
     snapshot_ = {};
+    wallpaperReadyForTarget_ = false;
+    wallpaperRecoveryHidden_ = false;
     hoverIndex_ = -1;
     selectedIdentities_.clear();
     desktopKeyboardSelectionArmed_ = false;
     EndInternalDragSession();
     ResetPointerGesture();
+}
+
+bool DesktopSurfaceWindow::RefreshWallpaperForCurrentTarget() {
+    if (hwnd_ == nullptr || d2d_.Target() == nullptr) {
+        return false;
+    }
+    const int width =
+        snapshot_.screenRect.right - snapshot_.screenRect.left;
+    const int height =
+        snapshot_.screenRect.bottom - snapshot_.screenRect.top;
+    if (width <= 0 || height <= 0 ||
+        !wallpaper_.Refresh(
+            hwnd_, d2d_.Target(), width, height, false)) {
+        return false;
+    }
+    wallpaperReadyForTarget_ = true;
+    StopWallpaperRecovery();
+    if (wallpaperRecoveryHidden_) {
+        wallpaperRecoveryHidden_ = false;
+        ShowWindow(hwnd_, SW_SHOWNOACTIVATE);
+        MaintainDesktopLayer();
+    }
+    InvalidateRect(hwnd_, nullptr, FALSE);
+    return true;
+}
+
+void DesktopSurfaceWindow::StartWallpaperRecovery(bool hideSurface) {
+    if (hwnd_ == nullptr) {
+        return;
+    }
+    if (hideSurface) {
+        if (IsWindowVisible(hwnd_) != FALSE) {
+            ShowWindow(hwnd_, SW_HIDE);
+        }
+        wallpaperRecoveryHidden_ = true;
+    }
+    if (!wallpaperRecoveryActive_) {
+        wallpaperRecoveryActive_ = true;
+        wallpaperRecoveryAttempts_ = 0;
+    }
+    if (wallpaperRecoveryAttempts_ <
+            kWallpaperRecoveryAttemptLimit) {
+        if (SetTimer(
+            hwnd_,
+            kWallpaperRecoveryTimerId,
+            kWallpaperRecoveryDelayMilliseconds,
+            nullptr) == 0) {
+            wallpaperRecoveryActive_ = false;
+        }
+    }
+}
+
+void DesktopSurfaceWindow::StopWallpaperRecovery() noexcept {
+    if (hwnd_ != nullptr) {
+        KillTimer(hwnd_, kWallpaperRecoveryTimerId);
+    }
+    wallpaperRecoveryActive_ = false;
+    wallpaperRecoveryAttempts_ = 0;
+}
+
+void DesktopSurfaceWindow::HandleWallpaperRecoveryTimer() {
+    if (hwnd_ == nullptr) {
+        return;
+    }
+    KillTimer(hwnd_, kWallpaperRecoveryTimerId);
+    if (RefreshWallpaperForCurrentTarget()) {
+        RedrawWindow(
+            hwnd_, nullptr, nullptr,
+            RDW_INVALIDATE | RDW_UPDATENOW);
+        return;
+    }
+    ++wallpaperRecoveryAttempts_;
+    if (wallpaperRecoveryAttempts_ >=
+            kWallpaperRecoveryAttemptLimit) {
+        wallpaperRecoveryActive_ = false;
+        return;
+    }
+    if (SetTimer(
+        hwnd_,
+        kWallpaperRecoveryTimerId,
+        kWallpaperRecoveryDelayMilliseconds,
+        nullptr) == 0) {
+        wallpaperRecoveryActive_ = false;
+    }
+}
+
+void DesktopSurfaceWindow::RecoverWallpaperAfterRenderFailure() {
+    if (hwnd_ == nullptr) {
+        return;
+    }
+    wallpaperReadyForTarget_ = false;
+    d2d_.RecreateTarget(hwnd_);
+    ConfigurePixelRenderTarget();
+    if (!RefreshWallpaperForCurrentTarget()) {
+        StartWallpaperRecovery(true);
+    }
 }
 
 bool DesktopSurfaceWindow::Refresh(
@@ -841,8 +952,8 @@ bool DesktopSurfaceWindow::Refresh(
         parentOrigin.y, width, height,
         SWP_NOZORDER | SWP_NOACTIVATE);
     d2d_.Resize(static_cast<UINT>(width), static_cast<UINT>(height));
-    if (refreshWallpaper && !wallpaper_.Refresh(
-            hwnd_, d2d_.Target(), width, height, false)) {
+    if (refreshWallpaper && !RefreshWallpaperForCurrentTarget()) {
+        StartWallpaperRecovery(!wallpaperReadyForTarget_);
         errorMessage =
             L"无法刷新与当前桌面一致的无模糊壁纸快照。";
         return false;
@@ -993,6 +1104,10 @@ LRESULT DesktopSurfaceWindow::HandleMessage(
             }
             return 0;
         case WM_TIMER:
+            if (wParam == kWallpaperRecoveryTimerId) {
+                HandleWallpaperRecoveryTimer();
+                return 0;
+            }
             if (wParam == kRenameTimerId) {
                 KillTimer(hwnd_, kRenameTimerId);
                 const std::wstring identity =
@@ -1236,6 +1351,7 @@ LRESULT DesktopSurfaceWindow::HandleMessage(
             return 0;
         }
         case WM_DESTROY:
+            StopWallpaperRecovery();
             RemoveKeyboardHook();
             CancelPendingRename();
             if (renameEdit_ != nullptr) {
@@ -1257,6 +1373,8 @@ LRESULT DesktopSurfaceWindow::HandleMessage(
             dropTargetRegistered_ = false;
             desktopDropTarget_.Reset();
             ResetPointerGesture();
+            wallpaperReadyForTarget_ = false;
+            wallpaperRecoveryHidden_ = false;
             hwnd_ = nullptr;
             return 0;
     }
@@ -1267,8 +1385,10 @@ void DesktopSurfaceWindow::Render() {
     PAINTSTRUCT paint{};
     BeginPaint(hwnd_, &paint);
     ID2D1HwndRenderTarget* target = d2d_.Target();
-    if (target == nullptr) {
+    if (target == nullptr || !wallpaperReadyForTarget_ ||
+        !wallpaper_.HasBitmap()) {
         EndPaint(hwnd_, &paint);
+        RecoverWallpaperAfterRenderFailure();
         return;
     }
     d2d_.BeginDraw();
@@ -1276,13 +1396,19 @@ void DesktopSurfaceWindow::Render() {
     target->Clear(D2D1::ColorF(D2D1::ColorF::Black));
     RECT client{};
     GetClientRect(hwnd_, &client);
-    wallpaper_.Draw(
+    const bool wallpaperDrawn = wallpaper_.Draw(
         target,
         D2D1::RectF(
             0.0f, 0.0f,
             static_cast<FLOAT>(client.right),
             static_cast<FLOAT>(client.bottom)),
         kWallpaperDrawMode);
+    if (!wallpaperDrawn) {
+        d2d_.EndDraw();
+        EndPaint(hwnd_, &paint);
+        RecoverWallpaperAfterRenderFailure();
+        return;
+    }
 
     Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> textBrush;
     Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> shadowBrush;
@@ -1437,17 +1563,10 @@ void DesktopSurfaceWindow::Render() {
         target->PopAxisAlignedClip();
     }
     const HRESULT result = d2d_.EndDraw();
-    if (result == D2DERR_RECREATE_TARGET) {
-        d2d_.RecreateTarget(hwnd_);
-        ConfigurePixelRenderTarget();
-        const int width =
-            snapshot_.screenRect.right - snapshot_.screenRect.left;
-        const int height =
-            snapshot_.screenRect.bottom - snapshot_.screenRect.top;
-        wallpaper_.Refresh(
-            hwnd_, d2d_.Target(), width, height, false);
-    }
     EndPaint(hwnd_, &paint);
+    if (FAILED(result)) {
+        RecoverWallpaperAfterRenderFailure();
+    }
 }
 
 void DesktopSurfaceWindow::UpdateViewMetrics() {
