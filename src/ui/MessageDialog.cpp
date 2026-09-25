@@ -511,7 +511,8 @@ int MessageDialog::Show(
     HWND owner,
     const std::wstring& message,
     const std::wstring& title,
-    UINT type) {
+    UINT type,
+    HWND* activeWindow) {
     ScopedPerMonitorV2Awareness dpiAwareness;
     WNDCLASSEXW windowClass{};
     windowClass.cbSize = sizeof(windowClass);
@@ -580,6 +581,9 @@ int MessageDialog::Show(
     if (hwnd == nullptr) {
         return state.result;
     }
+    if (activeWindow != nullptr) {
+        *activeWindow = hwnd;
+    }
 
     const RECT placement = CalculatePlacement(anchor, workArea, state.width, state.height);
     SetWindowPos(hwnd, HWND_TOP, placement.left, placement.top, 0, 0, SWP_NOSIZE | SWP_SHOWWINDOW);
@@ -608,6 +612,9 @@ int MessageDialog::Show(
     }
     if (quitRequested && IsWindow(hwnd)) {
         DestroyWindow(hwnd);
+    }
+    if (activeWindow != nullptr && *activeWindow == hwnd) {
+        *activeWindow = nullptr;
     }
     if (ownerEnabled && !quitRequested && IsWindow(owner)) {
         EnableWindow(owner, TRUE);

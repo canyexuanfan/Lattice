@@ -416,32 +416,32 @@ if (!(Test-Path -LiteralPath $debugExe -PathType Leaf)) {
     throw "Debug executable required for real update package validation was not found: $debugExe"
 }
 $updateSmokeRoot = Join-Path $projectRoot ".workspace\smoke-runs\update-package-validation"
-$previousUpdateSmokeEnvironment = @{}
-foreach ($name in @(
-    "LATTICE_SMOKE_UPDATE_STANDARD_INSTALLER",
-    "LATTICE_SMOKE_UPDATE_OFFLINE_INSTALLER",
-    "LATTICE_SMOKE_UPDATE_STANDARD_SHA256",
-    "LATTICE_SMOKE_UPDATE_OFFLINE_SHA256",
-    "LATTICE_SMOKE_UPDATE_ROOT")) {
-    $previousUpdateSmokeEnvironment[$name] = [Environment]::GetEnvironmentVariable($name, "Process")
+$updateSmokeStart = [Diagnostics.ProcessStartInfo]::new()
+$updateSmokeStart.FileName = $debugExe
+$updateSmokeStart.WorkingDirectory = Split-Path -Parent $debugExe
+$updateSmokeStart.UseShellExecute = $false
+if ($updateSmokeStart.PSObject.Properties.Name -contains "ArgumentList") {
+    $updateSmokeStart.ArgumentList.Add("--smoke-update-packages")
+} else {
+    $updateSmokeStart.Arguments = "--smoke-update-packages"
 }
+$updateSmokeStart.EnvironmentVariables["LATTICE_SMOKE_UPDATE_STANDARD_INSTALLER"] = $versionedInstaller
+$updateSmokeStart.EnvironmentVariables["LATTICE_SMOKE_UPDATE_OFFLINE_INSTALLER"] = $offlineVersionedInstaller
+$updateSmokeStart.EnvironmentVariables["LATTICE_SMOKE_UPDATE_STANDARD_SHA256"] = $versionedHash
+$updateSmokeStart.EnvironmentVariables["LATTICE_SMOKE_UPDATE_OFFLINE_SHA256"] = $offlineVersionedHash
+$updateSmokeStart.EnvironmentVariables["LATTICE_SMOKE_UPDATE_ROOT"] = $updateSmokeRoot
+$updateSmokeProcess = [Diagnostics.Process]::Start($updateSmokeStart)
 try {
-    $env:LATTICE_SMOKE_UPDATE_STANDARD_INSTALLER = $versionedInstaller
-    $env:LATTICE_SMOKE_UPDATE_OFFLINE_INSTALLER = $offlineVersionedInstaller
-    $env:LATTICE_SMOKE_UPDATE_STANDARD_SHA256 = $versionedHash
-    $env:LATTICE_SMOKE_UPDATE_OFFLINE_SHA256 = $offlineVersionedHash
-    $env:LATTICE_SMOKE_UPDATE_ROOT = $updateSmokeRoot
-    & $debugExe --smoke-update-packages
-    if ($LASTEXITCODE -ne 0) {
-        throw "Real update package validation failed with exit code $LASTEXITCODE"
+    if (!$updateSmokeProcess.WaitForExit(30000)) {
+        $updateSmokeProcess.Kill()
+        [void]$updateSmokeProcess.WaitForExit(5000)
+        throw "Real update package validation exceeded 30 seconds."
+    }
+    if ($updateSmokeProcess.ExitCode -ne 0) {
+        throw "Real update package validation failed with exit code $($updateSmokeProcess.ExitCode)"
     }
 } finally {
-    foreach ($name in $previousUpdateSmokeEnvironment.Keys) {
-        [Environment]::SetEnvironmentVariable(
-            $name,
-            $previousUpdateSmokeEnvironment[$name],
-            "Process")
-    }
+    $updateSmokeProcess.Dispose()
 }
 if (Test-Path -LiteralPath $updateSmokeRoot) {
     throw "Real update package validation did not clean its workspace root: $updateSmokeRoot"

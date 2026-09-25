@@ -111,6 +111,8 @@ private:
 
     void StartScan();
     void CancelScan(bool showCancelledState);
+    void DeactivateAndRelease();
+    void RestoreVisibleResources();
     void AdoptScanResult(ScanResult* rawResult);
     void Render();
     void RenderBase();
@@ -205,5 +207,6 @@ private:
     std::map<std::wstring, int> groupRowOffsets_;
     bool desktopChangeBlocksApply_ = false;
     bool trackingMouse_ = false;
+    bool resourcesSuspended_ = false;
     UINT dpi_ = 96;
 };

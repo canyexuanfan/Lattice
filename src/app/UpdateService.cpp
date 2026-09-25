@@ -418,7 +418,7 @@ bool RequestHttps(
     InternetHandle& connection,
     InternetHandle& request) {
     session.value = WinHttpOpen(
-        L"Lattice/0.4.64",
+        L"Lattice/0.4.75",
         WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
         WINHTTP_NO_PROXY_NAME,
         WINHTTP_NO_PROXY_BYPASS,
@@ -813,6 +813,21 @@ UpdateServiceResult RunUpdate(bool manual) {
         return result;
     }
 
+    std::wstring releaseVersion;
+    if (!UpdateService::ParseReleaseVersion(json, releaseVersion)) {
+        result.message = L"公开更新源返回的版本信息无效，未执行更新。";
+        return result;
+    }
+    if (UpdateService::CompareVersions(
+            releaseVersion, UpdateService::kCurrentVersion) <= 0) {
+        result.status = UpdateServiceStatus::UpToDate;
+        result.message = std::wstring(L"当前版本：") +
+            UpdateService::kCurrentVersion +
+            L"\n公开版本：" + releaseVersion +
+            L"\n\n已经是最新版本。";
+        return result;
+    }
+
     UpdateReleaseAsset asset;
     if (!UpdateService::SelectReleaseAssetMetadataForVariant(
             json,
@@ -822,15 +837,6 @@ UpdateServiceResult RunUpdate(bool manual) {
             L"公开更新源返回的安装包信息不完整或不唯一（需要HTTPS地址、大小和SHA-256），未执行更新。";
         return result;
     }
-    if (UpdateService::CompareVersions(
-            asset.version,
-            UpdateService::kCurrentVersion) <= 0) {
-        result.status = UpdateServiceStatus::UpToDate;
-        result.message = std::wstring(L"当前版本：") +
-            UpdateService::kCurrentVersion + L"\n\n已经是最新版本。";
-        return result;
-    }
-
     std::wstring installerPath;
     const DownloadFailure failure = DownloadInstaller(asset, installerPath);
     if (failure != DownloadFailure::None) {
@@ -850,7 +856,10 @@ UpdateServiceResult RunUpdate(bool manual) {
 
 }  // namespace
 
-std::atomic<bool> UpdateService::busy_{false};
+std::mutex UpdateService::stateMutex_;
+bool UpdateService::busy_ = false;
+bool UpdateService::manualRequested_ = false;
+HWND UpdateService::manualDialogOwner_ = nullptr;
 
 int UpdateService::CompareVersions(
     const std::wstring& left,
@@ -860,6 +869,31 @@ int UpdateService::CompareVersions(
     if (lhs < rhs) return -1;
     if (lhs > rhs) return 1;
     return 0;
+}
+
+bool UpdateService::ParseReleaseVersion(
+    const std::string& json,
+    std::wstring& version) {
+    version.clear();
+    size_t rootStart = 0;
+    size_t rootEnd = 0;
+    if (!ParseRootObject(json, rootStart, rootEnd)) return false;
+    std::string tag;
+    if (!GetObjectStringField(
+            json, rootStart, rootEnd, "tag_name", tag)) {
+        return false;
+    }
+    version = Utf8ToWide(tag);
+    if (!version.empty() &&
+        (version.front() == L'v' || version.front() == L'V')) {
+        version.erase(version.begin());
+    }
+    std::array<int, 4> parsedVersion{};
+    if (!TryVersionParts(version, parsedVersion)) {
+        version.clear();
+        return false;
+    }
+    return true;
 }
 
 bool UpdateService::SelectReleaseAsset(
@@ -894,26 +928,11 @@ bool UpdateService::SelectReleaseAssetMetadataForVariant(
     UpdatePackageVariant variant,
     UpdateReleaseAsset& asset) {
     asset = {};
+    std::wstring version;
+    if (!ParseReleaseVersion(json, version)) return false;
     size_t rootStart = 0;
     size_t rootEnd = 0;
     if (!ParseRootObject(json, rootStart, rootEnd)) return false;
-
-    std::string tag;
-    if (!GetObjectStringField(
-            json,
-            rootStart,
-            rootEnd,
-            "tag_name",
-            tag)) {
-        return false;
-    }
-    std::wstring version = Utf8ToWide(tag);
-    if (!version.empty() &&
-        (version.front() == L'v' || version.front() == L'V')) {
-        version.erase(version.begin());
-    }
-    std::array<int, 4> parsedVersion{};
-    if (!TryVersionParts(version, parsedVersion)) return false;
 
     std::string versionAscii;
     versionAscii.reserve(version.size());
@@ -1170,8 +1189,7 @@ bool UpdateService::Start(
     HWND notificationWindow,
     bool manual,
     HWND dialogOwner) {
-    if (notificationWindow == nullptr || IsWindow(notificationWindow) == FALSE ||
-        busy_.exchange(true)) {
+    if (notificationWindow == nullptr || IsWindow(notificationWindow) == FALSE) {
         return false;
     }
     if (!manual &&
@@ -1179,22 +1197,53 @@ bool UpdateService::Start(
             L"DESKTOP_ORGANIZER_DISABLE_AUTO_UPDATE",
             nullptr,
             0) > 0) {
-        busy_ = false;
         return true;
     }
-    std::thread([notificationWindow, manual, dialogOwner]() {
-        UpdateServiceResult* result =
-            new UpdateServiceResult(RunUpdate(manual));
-        result->dialogOwner = dialogOwner;
-        busy_ = false;
-        if (IsWindow(notificationWindow) == FALSE ||
-            PostMessageW(
-                notificationWindow,
-                kUpdateServiceResultMessage,
-                0,
-                reinterpret_cast<LPARAM>(result)) == FALSE) {
-            delete result;
+    {
+        std::lock_guard<std::mutex> lock(stateMutex_);
+        if (busy_) {
+            if (manual) {
+                manualRequested_ = true;
+                manualDialogOwner_ = dialogOwner;
+            }
+            return true;
         }
-    }).detach();
+        busy_ = true;
+        manualRequested_ = manual;
+        manualDialogOwner_ = dialogOwner;
+    }
+    try {
+        std::thread([notificationWindow, manual]() {
+            UpdateServiceResult* result = nullptr;
+            try {
+                result = new UpdateServiceResult(RunUpdate(manual));
+            } catch (...) {
+                result = new UpdateServiceResult{};
+                result->message = L"检查更新时发生异常，请稍后重试。";
+            }
+            {
+                std::lock_guard<std::mutex> lock(stateMutex_);
+                result->manual = manualRequested_;
+                result->dialogOwner = manualDialogOwner_;
+                manualRequested_ = false;
+                manualDialogOwner_ = nullptr;
+                busy_ = false;
+            }
+            if (IsWindow(notificationWindow) == FALSE ||
+                PostMessageW(
+                    notificationWindow,
+                    kUpdateServiceResultMessage,
+                    0,
+                    reinterpret_cast<LPARAM>(result)) == FALSE) {
+                delete result;
+            }
+        }).detach();
+    } catch (...) {
+        std::lock_guard<std::mutex> lock(stateMutex_);
+        busy_ = false;
+        manualRequested_ = false;
+        manualDialogOwner_ = nullptr;
+        return false;
+    }
     return true;
 }

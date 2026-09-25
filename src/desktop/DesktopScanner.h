@@ -1,6 +1,7 @@
 #pragma once
 
 #include <functional>
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -9,6 +10,10 @@
 class DesktopScanner {
 public:
     std::vector<DesktopItem> Scan(bool includePublicDesktop = true) const;
+#ifndef NDEBUG
+    static void ResetScanCountForTesting() noexcept;
+    static std::uint64_t ScanCountForTesting() noexcept;
+#endif
     DesktopItem CreateItemFromPath(
         const std::wstring& path,
         bool resolveShortcut = true) const;

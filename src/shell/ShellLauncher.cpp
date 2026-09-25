@@ -274,7 +274,7 @@ bool ShellLauncher::OpenPath(const std::wstring& path) const {
             return succeeded;
         }
     }
-    HINSTANCE result = ShellExecuteW(nullptr, L"open", path.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    HINSTANCE result = ShellExecuteW(nullptr, nullptr, path.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
     return reinterpret_cast<INT_PTR>(result) > 32;
 }
 

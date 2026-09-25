@@ -1,8 +1,10 @@
 param(
     [ValidateSet(
         "--smoke-scan",
+        "--smoke-desktop-snapshot",
         "--smoke-resource-idle",
         "--smoke-config",
+        "--smoke-layout-restore",
         "--smoke-layout",
         "--smoke-auto-organize-logic",
         "--smoke-auto-organize-layout",
@@ -19,11 +21,14 @@ param(
         "--smoke-widget-desktop-layer",
         "--smoke-desktop-icon-fidelity",
         "--smoke-desktop-display-takeover",
+        "--smoke-desktop-double-click",
         "--smoke-collapse-selection-logic",
         "--smoke-widget-interaction",
         "--smoke-widget-normal-exit",
         "--smoke-widget-drop-latency",
         "--smoke-widget-drop-placement",
+        "--smoke-unified-host-widget-slice",
+        "--smoke-unified-host-production",
         "--smoke-update-dialog")]
     [string]$Mode = "",
     [switch]$SkipBuild,
@@ -204,7 +209,9 @@ try {
         @(
         "--smoke-collapse-selection-logic",
         "--smoke-scan",
+        "--smoke-desktop-snapshot",
         "--smoke-config",
+        "--smoke-layout-restore",
         "--smoke-layout",
         "--smoke-auto-organize-logic",
         "--smoke-auto-organize-layout",
@@ -221,10 +228,13 @@ try {
         "--smoke-widget-desktop-layer",
         "--smoke-desktop-icon-fidelity",
         "--smoke-desktop-display-takeover",
+        "--smoke-desktop-double-click",
         "--smoke-widget-interaction",
         "--smoke-widget-normal-exit",
         "--smoke-widget-drop-latency",
         "--smoke-widget-drop-placement",
+        "--smoke-unified-host-widget-slice",
+        "--smoke-unified-host-production",
         "--smoke-update-dialog")
     }
     foreach ($mode in $modes) {

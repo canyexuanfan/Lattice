@@ -3,8 +3,8 @@
 #include <Windows.h>
 
 #include <array>
-#include <atomic>
 #include <cstdint>
+#include <mutex>
 #include <string>
 
 constexpr UINT kUpdateServiceResultMessage = WM_APP + 21;
@@ -47,10 +47,11 @@ enum class UpdateInstallerValidationFailure {
 
 class UpdateService {
 public:
-    static constexpr wchar_t kCurrentVersion[] = L"0.4.64";
+    static constexpr wchar_t kCurrentVersion[] = L"0.4.75";
 
     static bool Start(HWND notificationWindow, bool manual, HWND dialogOwner = nullptr);
     static int CompareVersions(const std::wstring& left, const std::wstring& right);
+    static bool ParseReleaseVersion(const std::string& json, std::wstring& version);
     static bool SelectReleaseAsset(
         const std::string& json,
         std::wstring& version,
@@ -70,5 +71,8 @@ public:
         const UpdateReleaseAsset& asset);
 
 private:
-    static std::atomic<bool> busy_;
+    static std::mutex stateMutex_;
+    static bool busy_;
+    static bool manualRequested_;
+    static HWND manualDialogOwner_;
 };

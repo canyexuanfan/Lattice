@@ -3,6 +3,8 @@
 #include <dwmapi.h>
 #include <commdlg.h>
 #include <shellapi.h>
+#include <ShlObj.h>
+#include <ShObjIdl.h>
 #include <windowsx.h>
 #include <wrl/client.h>
 
@@ -16,7 +18,9 @@
 
 #include "desktop/DesktopScanner.h"
 #include "desktop/DesktopLayout.h"
+#include "desktop/DesktopItemOrder.h"
 #include "desktop/CategoryStorageManager.h"
+#include "config/LayoutSnapshot.h"
 #include "app/resource.h"
 #include "app/UpdateService.h"
 #include "ui/InputDialog.h"
@@ -93,6 +97,7 @@ constexpr int kSearchScopeId = 4002;
 constexpr UINT kDesktopChangedMessage = WM_APP + 11;
 constexpr UINT kIconReadyMessage = WM_APP + 14;
 constexpr UINT kAutoOrganizeTransactionCompleteMessage = WM_APP + 64;
+constexpr UINT kLayoutRestoreCompleteMessage = WM_APP + 65;
 const UINT kUpdateExitMessage = RegisterWindowMessageW(L"Lattice.RequestExitForUpdate.V1");
 const UINT kTaskbarCreatedMessage = RegisterWindowMessageW(L"TaskbarCreated");
 constexpr UINT kDesktopRefreshTimerId = 7001;
@@ -105,6 +110,68 @@ constexpr int kRefreshIconCommand = 2106;
 constexpr int kMoveItemBaseCommand = 3000;
 constexpr int kTileToggleCollapseCommand = 17;
 constexpr int kTileOpenWidgetCommand = 18;
+constexpr UINT kHostedShellNewFirst = 0x5000;
+constexpr UINT kHostedShellNewLast = 0x5FFF;
+
+thread_local IContextMenu2* gHostedBackgroundMenu2 = nullptr;
+thread_local IContextMenu3* gHostedBackgroundMenu3 = nullptr;
+
+int FindHostedShellNewSubmenu(HMENU menu) {
+    const int count = GetMenuItemCount(menu);
+    for (int index = 0; index < count; ++index) {
+        wchar_t text[128]{};
+        GetMenuStringW(menu, index, text, ARRAYSIZE(text), MF_BYPOSITION);
+        std::wstring label(text);
+        std::erase(label, L'&');
+        std::transform(
+            label.begin(), label.end(), label.begin(),
+            [](wchar_t value) {
+                return static_cast<wchar_t>(std::towlower(value));
+            });
+        if (label.find(L"新建") == std::wstring::npos &&
+            label != L"new" && label.rfind(L"new ", 0) != 0) {
+            continue;
+        }
+        MENUITEMINFOW info{};
+        info.cbSize = sizeof(info);
+        info.fMask = MIIM_SUBMENU;
+        if (GetMenuItemInfoW(
+                menu, static_cast<UINT>(index), TRUE, &info) &&
+            info.hSubMenu != nullptr) {
+            return index;
+        }
+    }
+    return -1;
+}
+
+std::vector<std::wstring> ClipboardFilePaths(HWND owner) {
+    std::vector<std::wstring> paths;
+    if (OpenClipboard(owner) == FALSE) {
+        return paths;
+    }
+    const HDROP drop = reinterpret_cast<HDROP>(
+        GetClipboardData(CF_HDROP));
+    if (drop != nullptr) {
+        const UINT count = DragQueryFileW(
+            drop, 0xFFFFFFFFU, nullptr, 0);
+        paths.reserve(count);
+        for (UINT index = 0; index < count; ++index) {
+            const UINT length = DragQueryFileW(
+                drop, index, nullptr, 0);
+            if (length == 0) {
+                continue;
+            }
+            std::wstring path(static_cast<size_t>(length) + 1, L'\0');
+            if (DragQueryFileW(
+                    drop, index, path.data(), length + 1) == length) {
+                path.resize(length);
+                paths.push_back(std::move(path));
+            }
+        }
+    }
+    CloseClipboard();
+    return paths;
+}
 
 UINT MonitorDpi(HMONITOR monitor) {
     using GetDpiForMonitorFunction = HRESULT(WINAPI*)(
@@ -158,6 +225,52 @@ std::vector<lattice::organize::MonitorLayout> CurrentMonitorLayouts() {
                 std::tie(right.workArea.left, right.workArea.top, right.id);
         });
     return monitors;
+}
+
+std::vector<LayoutMonitorSnapshot> CurrentLayoutMonitors() {
+    std::vector<LayoutMonitorSnapshot> monitors;
+    EnumDisplayMonitors(
+        nullptr, nullptr,
+        [](HMONITOR monitor, HDC, LPRECT, LPARAM context) -> BOOL {
+            auto* result = reinterpret_cast<
+                std::vector<LayoutMonitorSnapshot>*>(context);
+            MONITORINFOEXW info{};
+            info.cbSize = sizeof(info);
+            if (GetMonitorInfoW(monitor, &info)) {
+                result->push_back(LayoutMonitorSnapshot{
+                    info.szDevice,
+                    LayoutRect{
+                        info.rcWork.left, info.rcWork.top,
+                        info.rcWork.right, info.rcWork.bottom},
+                    static_cast<int>(MonitorDpi(monitor)),
+                    (info.dwFlags & MONITORINFOF_PRIMARY) != 0});
+            }
+            return TRUE;
+        },
+        reinterpret_cast<LPARAM>(&monitors));
+    std::sort(
+        monitors.begin(), monitors.end(),
+        [](const LayoutMonitorSnapshot& left,
+           const LayoutMonitorSnapshot& right) {
+            return std::tie(
+                       left.workArea.left,
+                       left.workArea.top,
+                       left.id) <
+                   std::tie(
+                       right.workArea.left,
+                       right.workArea.top,
+                       right.id);
+        });
+    return monitors;
+}
+
+std::uint64_t CurrentFileTime() {
+    FILETIME value{};
+    GetSystemTimeAsFileTime(&value);
+    ULARGE_INTEGER integer{};
+    integer.LowPart = value.dwLowDateTime;
+    integer.HighPart = value.dwHighDateTime;
+    return integer.QuadPart;
 }
 
 template <typename Config>
@@ -345,11 +458,6 @@ void MainWindow::RequestNormalExit() {
     lastNormalExitError_.clear();
 
     bool stateSaved = true;
-    for (auto& widget : widgetWindows_) {
-        if (widget != nullptr && widget->IsOpen() && !widget->FlushPendingStateForExit()) {
-            stateSaved = false;
-        }
-    }
     SaveWindowConfig();
     if (!ConfigStore::DrainPendingWrites(5000)) {
         stateSaved = false;
@@ -377,11 +485,7 @@ void MainWindow::RequestNormalExit() {
         }
         LoadOrganizerConfig();
         LoadDesktopItems();
-        for (auto& widget : widgetWindows_) {
-            if (widget != nullptr && widget->IsOpen()) {
-                widget->RefreshFromConfig();
-            }
-        }
+        SyncHostedWidgets();
         InvalidateRect(hwnd_, nullptr, FALSE);
         MessageDialog::Show(
             instance_,
@@ -406,12 +510,7 @@ MainWindow::~MainWindow() {
         desktopSurface_->Close();
         desktopSurface_.reset();
     }
-    for (auto& widget : widgetWindows_) {
-        if (widget != nullptr) {
-            widget->Close();
-        }
-    }
-    widgetWindows_.clear();
+    hostedWidgetCategoryIds_.clear();
     desktopWatcher_.Stop();
     trayIcon_.Remove();
 }
@@ -428,6 +527,8 @@ bool MainWindow::EnableDesktopDisplayTakeover(
             AssignedDesktopIdentities(), errorMessage)) {
         return false;
     }
+    surface->SetIconCacheCapacity(
+        static_cast<size_t>(organizerConfig_.settings.iconCacheSize));
     surface->SetDisplayPositionCommitHandler(
         [this](const std::vector<DesktopPosition>& positions) {
             std::vector<DesktopPlacementConfig> placements;
@@ -470,6 +571,28 @@ bool MainWindow::EnableDesktopDisplayTakeover(
             }
             return true;
         });
+    surface->SetHostedWidgetCommandHandler(
+        [this](const HostedWidgetCommand& command) {
+            return ExecuteHostedWidgetCommand(command);
+        });
+    surface->SetShellMenuForwardHandler(
+        [this](UINT message, WPARAM wParam, LPARAM lParam,
+               LRESULT& result) {
+            if (message == WM_MENUCHAR &&
+                gHostedBackgroundMenu3 != nullptr &&
+                SUCCEEDED(gHostedBackgroundMenu3->HandleMenuMsg2(
+                    message, wParam, lParam, &result))) {
+                return true;
+            }
+            if (gHostedBackgroundMenu2 != nullptr &&
+                SUCCEEDED(gHostedBackgroundMenu2->HandleMenuMsg(
+                    message, wParam, lParam))) {
+                result = 0;
+                return true;
+            }
+            return launcher_.ForwardContextMenuMessage(
+                message, wParam, lParam, result);
+        });
     const AppConfig appConfig = configStore_.LoadAppConfig();
     surface->UpdateDisplayPositions(
         ToDesktopPositions(appConfig.desktopDisplayLayout));
@@ -480,24 +603,1094 @@ bool MainWindow::EnableDesktopDisplayTakeover(
         desktopSurface_->Close();
     }
     desktopSurface_ = std::move(surface);
+    std::wstring hostedError;
+    if (!SyncHostedWidgets(&hostedError)) {
+        errorMessage = hostedError.empty()
+            ? L"无法发布统一宿主格子集合。"
+            : hostedError;
+        desktopSurface_->Close();
+        desktopSurface_.reset();
+        return false;
+    }
     if (wasVisible) {
         desktopSurface_->Show();
     }
     return true;
 }
 
-void MainWindow::ConfigureWidgetShellDrop(WidgetWindow& widget) {
-    widget.SetDesktopShellDropHandler(
-        [this](
-            const std::vector<std::wstring>& sourcePaths,
-            POINT screenPoint) -> std::optional<bool> {
-            if (desktopSurface_ == nullptr ||
-                desktopSurface_->Window() == nullptr) {
-                return std::nullopt;
+std::vector<HostedWidgetDescriptor> MainWindow::BuildHostedWidgets() const {
+    std::vector<HostedWidgetDescriptor> result;
+    if (desktopSnapshot_ == nullptr) {
+        return result;
+    }
+    result.reserve(hostedWidgetCategoryIds_.size());
+    std::vector<std::pair<HMONITOR, UINT>> monitorDpis;
+    for (const std::wstring& categoryId : hostedWidgetCategoryIds_) {
+        HostedWidgetDescriptor descriptor;
+        descriptor.categoryId = categoryId;
+        descriptor.theme = organizerConfig_.settings.theme;
+        descriptor.visible = organizerConfig_.settings.lastVisible;
+        descriptor.singleClickOpen =
+            organizerConfig_.settings.singleClickOpen;
+        if (categoryId == kUncategorizedCategoryId) {
+            descriptor.title = organizerConfig_.uncategorizedName.empty()
+                ? L"未分类"
+                : organizerConfig_.uncategorizedName;
+            descriptor.config = organizerConfig_.window;
+        } else {
+            const Category* category = FindCategory(categoryId);
+            if (category == nullptr) {
+                continue;
             }
-            return desktopSurface_->DropShellItemsOnTargetAtScreenPoint(
-                sourcePaths, screenPoint);
-        });
+            descriptor.title = category->name;
+            descriptor.config = category->layout;
+        }
+        const RECT widgetScreenRect{
+            descriptor.config.x,
+            descriptor.config.y,
+            descriptor.config.x + descriptor.config.width,
+            descriptor.config.y + descriptor.config.height};
+        const HMONITOR monitor = MonitorFromRect(
+            &widgetScreenRect, MONITOR_DEFAULTTONEAREST);
+        if (monitor != nullptr) {
+            const auto known = std::find_if(
+                monitorDpis.begin(), monitorDpis.end(),
+                [monitor](const auto& value) {
+                    return value.first == monitor;
+                });
+            const UINT dpi = known == monitorDpis.end()
+                ? MonitorDpi(monitor) : known->second;
+            if (known == monitorDpis.end()) {
+                monitorDpis.emplace_back(monitor, dpi);
+            }
+            descriptor.config.dpi = static_cast<int>(dpi);
+        }
+        descriptor.items =
+            desktopSnapshot_->CopyItemsForCategory(categoryId);
+        SortDesktopItemsForWindow(descriptor.items, descriptor.config);
+        result.push_back(std::move(descriptor));
+    }
+    return result;
+}
+
+bool MainWindow::SyncHostedWidgets(std::wstring* errorMessage) {
+    if (errorMessage != nullptr) {
+        errorMessage->clear();
+    }
+    if (desktopSurface_ == nullptr ||
+        desktopSurface_->Window() == nullptr) {
+        if (hostedWidgetCategoryIds_.empty()) {
+            return true;
+        }
+        if (errorMessage != nullptr) {
+            *errorMessage = L"桌面宿主尚未就绪。";
+        }
+        return false;
+    }
+    std::wstring publishError;
+    const bool published = desktopSurface_->ApplyHostedWidgets(
+        BuildHostedWidgets(), publishError);
+    if (!published && errorMessage != nullptr) {
+        *errorMessage = publishError;
+    }
+    return published;
+}
+
+bool MainWindow::ExecuteHostedWidgetCommand(
+    const HostedWidgetCommand& command) {
+    if (command.categoryId.empty()) {
+        return false;
+    }
+    if (hostedCollectionsPending_ != 0 &&
+        command.type != HostedWidgetCommandType::CollectPaths &&
+        command.type != HostedWidgetCommandType::BringToFront) {
+        if (!hostedCollectionBusyNotified_) {
+            ShowNonBlockingNotice(
+                L"正在收纳桌面项目",
+                L"请等待当前收纳完成后再调整格子。鼠标和窗口仍可正常使用。");
+            hostedCollectionBusyNotified_ = true;
+        }
+        return false;
+    }
+    organizerConfig_.currentCategoryId = command.categoryId;
+    switch (command.type) {
+        case HostedWidgetCommandType::BringToFront: {
+            const auto existing = std::find(
+                hostedWidgetCategoryIds_.begin(),
+                hostedWidgetCategoryIds_.end(),
+                command.categoryId);
+            if (existing == hostedWidgetCategoryIds_.end()) {
+                return false;
+            }
+            std::rotate(
+                existing, existing + 1,
+                hostedWidgetCategoryIds_.end());
+            return true;
+        }
+        case HostedWidgetCommandType::OpenSelection: {
+            bool opened = !command.itemIds.empty();
+            for (const std::wstring& itemId : command.itemIds) {
+                if (const DesktopItem* item = FindItem(itemId);
+                    item != nullptr) {
+                    opened = launcher_.OpenPath(item->path) && opened;
+                } else {
+                    opened = false;
+                }
+            }
+            if (!opened) {
+                const HWND owner = desktopSurface_ != nullptr &&
+                        desktopSurface_->Window() != nullptr
+                    ? desktopSurface_->Window()
+                    : hwnd_;
+                MessageDialog::Show(
+                    instance_, owner,
+                    L"无法打开格子中的项目，请检查文件或默认关联应用。",
+                    L"打开项目失败", MB_OK | MB_ICONWARNING);
+            }
+            return opened;
+        }
+        case HostedWidgetCommandType::RenameSelection:
+            return command.itemIds.size() == 1 &&
+                RenameHostedShellItem(command.itemIds.front());
+        case HostedWidgetCommandType::DeleteSelection:
+            return InvokeHostedShellVerb(command.itemIds, L"delete");
+        case HostedWidgetCommandType::CopySelection:
+            return InvokeHostedShellVerb(command.itemIds, L"copy");
+        case HostedWidgetCommandType::CutSelection:
+            return InvokeHostedShellVerb(command.itemIds, L"cut");
+        case HostedWidgetCommandType::ShowSelectionMenu:
+            ShowHostedShellMenu(
+                command.categoryId,
+                command.itemIds,
+                command.screenPoint);
+            return true;
+        case HostedWidgetCommandType::ReorderSelection:
+            return ReorderHostedSelection(
+                command.categoryId,
+                command.itemIds,
+                static_cast<size_t>(std::max(0, command.insertionIndex)));
+        case HostedWidgetCommandType::MoveSelectionToCategory:
+            for (const std::wstring& itemId : command.itemIds) {
+                MoveItemToCategory(itemId, command.targetCategoryId);
+            }
+            if (command.insertionIndex >= 0) {
+                ReorderHostedSelection(
+                    command.targetCategoryId,
+                    command.itemIds,
+                    static_cast<size_t>(command.insertionIndex));
+            }
+            return true;
+        case HostedWidgetCommandType::MoveSelectionOut:
+            for (size_t index = 0; index < command.itemIds.size(); ++index) {
+                const POINT* dropPoint = index < command.itemScreenPoints.size()
+                    ? &command.itemScreenPoints[index]
+                    : &command.screenPoint;
+                if (!MoveItemOut(
+                        command.itemIds[index], true, dropPoint)) {
+                    return false;
+                }
+            }
+            return true;
+        case HostedWidgetCommandType::ToggleCollapsed: {
+            WindowConfig* layout = command.categoryId ==
+                    kUncategorizedCategoryId
+                ? &organizerConfig_.window
+                : (FindCategory(command.categoryId) == nullptr
+                    ? nullptr
+                    : &FindCategory(command.categoryId)->layout);
+            if (layout == nullptr) return false;
+            layout->collapsed = !layout->collapsed;
+            if (layout->collapsed) {
+                layout->normalHeight = std::max(
+                    layout->normalHeight, layout->height);
+            } else {
+                layout->height = std::max(layout->normalHeight, 120);
+            }
+            windowConfig_ = organizerConfig_.window;
+            return SaveOrganizerConfig();
+        }
+        case HostedWidgetCommandType::ToggleLocked: {
+            WindowConfig* layout = command.categoryId ==
+                    kUncategorizedCategoryId
+                ? &organizerConfig_.window
+                : (FindCategory(command.categoryId) == nullptr
+                    ? nullptr
+                    : &FindCategory(command.categoryId)->layout);
+            if (layout == nullptr) return false;
+            layout->locked = !layout->locked;
+            windowConfig_ = organizerConfig_.window;
+            return SaveOrganizerConfig();
+        }
+        case HostedWidgetCommandType::CommitLayout: {
+            if (command.categoryId == kUncategorizedCategoryId) {
+                organizerConfig_.window = command.layout;
+                windowConfig_ = command.layout;
+            } else if (Category* category = FindCategory(command.categoryId);
+                       category != nullptr) {
+                category->layout = command.layout;
+            } else {
+                return false;
+            }
+            return SaveOrganizerConfig();
+        }
+        case HostedWidgetCommandType::RefreshIcons:
+            RefreshIconCache();
+            return true;
+        case HostedWidgetCommandType::ShellDropTarget: {
+            const DesktopItem* target = FindItem(command.targetItemId);
+            if (target == nullptr || target->path.empty()) {
+                return false;
+            }
+            ShellItemReference targetReference;
+            if (FAILED(CreateDesktopShellItemReference(
+                    target->path, targetReference))) {
+                return false;
+            }
+            std::vector<ShellItemReference> sources;
+            for (const std::wstring& itemId : command.itemIds) {
+                const DesktopItem* source = FindItem(itemId);
+                if (source == nullptr || source->path.empty()) {
+                    return false;
+                }
+                ShellItemReference reference;
+                if (FAILED(CreateDesktopShellItemReference(
+                        source->path, reference))) {
+                    return false;
+                }
+                sources.push_back(std::move(reference));
+            }
+            DWORD performedEffect = DROPEFFECT_NONE;
+            DWORD keyState = 0;
+            if ((GetKeyState(VK_CONTROL) & 0x8000) != 0) {
+                keyState |= MK_CONTROL;
+            }
+            if ((GetKeyState(VK_SHIFT) & 0x8000) != 0) {
+                keyState |= MK_SHIFT;
+            }
+            return SUCCEEDED(DropShellItemsOnDesktopItem(
+                desktopSurface_ == nullptr
+                    ? hwnd_
+                    : desktopSurface_->Window(),
+                sources,
+                targetReference,
+                command.screenPoint,
+                keyState,
+                DROPEFFECT_COPY | DROPEFFECT_MOVE | DROPEFFECT_LINK,
+                &performedEffect));
+        }
+        case HostedWidgetCommandType::CollectPaths:
+            return CollectHostedPaths(
+                command.categoryId,
+                command.paths,
+                command.insertionIndex,
+                true);
+        case HostedWidgetCommandType::OpenCategoryLocation:
+            return launcher_.OpenPath(L"shell:desktop");
+        case HostedWidgetCommandType::ToggleContentView: {
+            WindowConfig* layout = HostedWidgetLayout(
+                command.categoryId);
+            if (layout == nullptr) {
+                return false;
+            }
+            layout->contentViewMode = layout->contentViewMode == 0 ? 1 : 0;
+            if (command.categoryId == kUncategorizedCategoryId) {
+                windowConfig_ = *layout;
+            }
+            return SaveOrganizerConfig();
+        }
+        case HostedWidgetCommandType::ShowSortMenu:
+            ShowHostedWidgetSortMenu(
+                command.categoryId, command.screenPoint);
+            return true;
+        case HostedWidgetCommandType::ShowBackgroundMenu:
+            ShowHostedWidgetBackgroundMenu(
+                command.categoryId, command.screenPoint);
+            return true;
+        case HostedWidgetCommandType::None:
+            return false;
+    }
+    return false;
+}
+
+WindowConfig* MainWindow::HostedWidgetLayout(
+    const std::wstring& categoryId) {
+    if (categoryId == kUncategorizedCategoryId) {
+        return &organizerConfig_.window;
+    }
+    Category* category = FindCategory(categoryId);
+    return category == nullptr ? nullptr : &category->layout;
+}
+
+const WindowConfig* MainWindow::HostedWidgetLayout(
+    const std::wstring& categoryId) const {
+    if (categoryId == kUncategorizedCategoryId) {
+        return &organizerConfig_.window;
+    }
+    const Category* category = FindCategory(categoryId);
+    return category == nullptr ? nullptr : &category->layout;
+}
+
+void MainWindow::ShowHostedWidgetSortMenu(
+    const std::wstring& categoryId,
+    POINT screenPoint) {
+    WindowConfig* layout = HostedWidgetLayout(categoryId);
+    if (layout == nullptr) {
+        return;
+    }
+    constexpr int kCustom = 1;
+    constexpr int kName = 2;
+    constexpr int kType = 3;
+    constexpr int kModified = 4;
+    constexpr int kAutoArrange = 5;
+    HMENU menu = CreatePopupMenu();
+    AppendMenuW(menu, MF_STRING | (layout->sortMode == 0 ? MF_CHECKED : 0), kCustom, L"自定义顺序");
+    AppendMenuW(menu, MF_STRING | (layout->sortMode == 1 ? MF_CHECKED : 0), kName, L"按名称排列");
+    AppendMenuW(menu, MF_STRING | (layout->sortMode == 2 ? MF_CHECKED : 0), kType, L"按类型排列");
+    AppendMenuW(menu, MF_STRING | (layout->sortMode == 3 ? MF_CHECKED : 0), kModified, L"按修改时间排列");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING | (layout->autoArrange ? MF_CHECKED : 0), kAutoArrange, L"自动排列图标");
+    const HWND owner = desktopSurface_ != nullptr &&
+            desktopSurface_->Window() != nullptr
+        ? desktopSurface_->Window()
+        : hwnd_;
+    const int selected = TrackPopupMenu(
+        menu, TPM_RIGHTBUTTON | TPM_RETURNCMD,
+        screenPoint.x, screenPoint.y, 0, owner, nullptr);
+    DestroyMenu(menu);
+    if (selected >= kCustom && selected <= kModified) {
+        layout->sortMode = selected - kCustom;
+    } else if (selected == kAutoArrange) {
+        layout->autoArrange = !layout->autoArrange;
+    } else {
+        return;
+    }
+    if (categoryId == kUncategorizedCategoryId) {
+        windowConfig_ = *layout;
+    }
+    SaveOrganizerConfig();
+}
+
+void MainWindow::ShowHostedWidgetBackgroundMenu(
+    const std::wstring& categoryId,
+    POINT screenPoint) {
+    WindowConfig* layout = HostedWidgetLayout(categoryId);
+    if (layout == nullptr) {
+        return;
+    }
+    organizerConfig_.currentCategoryId = categoryId;
+    enum Command : UINT {
+        kGrid = 1,
+        kList,
+        kIconSmall,
+        kIconMedium,
+        kIconLarge,
+        kSortCustom,
+        kSortName,
+        kSortType,
+        kSortModified,
+        kAutoArrange,
+        kRefresh,
+        kAutoOrganize,
+        kUndoAutoOrganize,
+        kToggleCollapse,
+        kFixedExpanded,
+        kToggleLock,
+        kOpenLocation,
+        kRenameCategory,
+        kCreateCategory,
+        kDeleteCategory,
+        kImportUnassigned,
+        kExportCategory,
+        kImportCategory,
+        kMoveCategoryUp,
+        kMoveCategoryDown,
+        kHideAll,
+        kToggleAllLocked,
+        kRefreshAll,
+        kToggleStartup,
+        kSettings,
+        kExportConfig,
+        kImportConfig,
+        kOpenData,
+        kCheckUpdates,
+        kExit,
+        kPaste,
+        kPasteShortcut,
+        kFeedback,
+        kPersonalCenter,
+    };
+
+    const HWND owner = desktopSurface_ != nullptr &&
+            desktopSurface_->Window() != nullptr
+        ? desktopSurface_->Window()
+        : hwnd_;
+    HMENU menu = CreatePopupMenu();
+    HMENU view = CreatePopupMenu();
+    AppendMenuW(view, MF_STRING | (layout->contentViewMode == 0 ? MF_CHECKED : 0), kGrid, L"图标显示");
+    AppendMenuW(view, MF_STRING | (layout->contentViewMode == 1 ? MF_CHECKED : 0), kList, L"列表显示");
+    HMENU size = CreatePopupMenu();
+    AppendMenuW(size, MF_STRING | (layout->iconSize <= 32 ? MF_CHECKED : 0), kIconSmall, L"小图标");
+    AppendMenuW(size, MF_STRING | (layout->iconSize > 32 && layout->iconSize < 64 ? MF_CHECKED : 0), kIconMedium, L"中等图标");
+    AppendMenuW(size, MF_STRING | (layout->iconSize >= 64 ? MF_CHECKED : 0), kIconLarge, L"大图标");
+    AppendMenuW(view, MF_POPUP, reinterpret_cast<UINT_PTR>(size), L"图标大小");
+    AppendMenuW(view, MF_STRING | (layout->autoArrange ? MF_CHECKED : 0), kAutoArrange, L"自动排列图标");
+    AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(view), L"查看(V)");
+    HMENU sort = CreatePopupMenu();
+    AppendMenuW(sort, MF_STRING | (layout->sortMode == 0 ? MF_CHECKED : 0), kSortCustom, L"自定义顺序");
+    AppendMenuW(sort, MF_STRING | (layout->sortMode == 1 ? MF_CHECKED : 0), kSortName, L"名称");
+    AppendMenuW(sort, MF_STRING | (layout->sortMode == 2 ? MF_CHECKED : 0), kSortType, L"类型");
+    AppendMenuW(sort, MF_STRING | (layout->sortMode == 3 ? MF_CHECKED : 0), kSortModified, L"修改时间");
+    AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(sort), L"排序方式(O)");
+    AppendMenuW(menu, MF_STRING, kRefresh, L"刷新(E)");
+    AppendMenuW(menu, MF_STRING, kAutoOrganize, L"自动整理桌面…");
+    AppendMenuW(
+        menu,
+        configStore_.LoadAppConfig().autoOrganizeUndoHistory.empty()
+            ? MF_GRAYED : MF_STRING,
+        kUndoAutoOrganize,
+        L"撤销上次自动整理");
+    const UINT pasteState = IsClipboardFormatAvailable(CF_HDROP)
+        ? MF_STRING : MF_GRAYED;
+    AppendMenuW(menu, pasteState, kPaste, L"粘贴(P)");
+    AppendMenuW(menu, pasteState, kPasteShortcut, L"粘贴快捷方式(S)");
+    HMENU shellRootMenu = nullptr;
+    Microsoft::WRL::ComPtr<IContextMenu> shellBackgroundMenu;
+    Microsoft::WRL::ComPtr<IContextMenu2> shellBackgroundMenu2;
+    Microsoft::WRL::ComPtr<IContextMenu3> shellBackgroundMenu3;
+    bool shellNewAdded = false;
+    Microsoft::WRL::ComPtr<IShellFolder> desktopFolder;
+    if (SUCCEEDED(SHGetDesktopFolder(
+            desktopFolder.GetAddressOf())) &&
+        desktopFolder != nullptr &&
+        SUCCEEDED(desktopFolder->CreateViewObject(
+            owner,
+            IID_PPV_ARGS(shellBackgroundMenu.GetAddressOf())))) {
+        shellRootMenu = CreatePopupMenu();
+        if (shellRootMenu != nullptr &&
+            SUCCEEDED(shellBackgroundMenu->QueryContextMenu(
+                shellRootMenu, 0,
+                kHostedShellNewFirst, kHostedShellNewLast,
+                CMF_NORMAL | CMF_EXPLORE))) {
+            const int newIndex = FindHostedShellNewSubmenu(
+                shellRootMenu);
+            if (newIndex >= 0) {
+                MENUITEMINFOW info{};
+                info.cbSize = sizeof(info);
+                info.fMask = MIIM_SUBMENU;
+                if (GetMenuItemInfoW(
+                        shellRootMenu, static_cast<UINT>(newIndex),
+                        TRUE, &info) && info.hSubMenu != nullptr &&
+                    RemoveMenu(
+                        shellRootMenu,
+                        static_cast<UINT>(newIndex),
+                        MF_BYPOSITION)) {
+                    AppendMenuW(
+                        menu, MF_POPUP,
+                        reinterpret_cast<UINT_PTR>(info.hSubMenu),
+                        L"新建(W)");
+                    shellBackgroundMenu.As(&shellBackgroundMenu2);
+                    shellBackgroundMenu.As(&shellBackgroundMenu3);
+                    shellNewAdded = true;
+                }
+            }
+        }
+    }
+    if (!shellNewAdded) {
+        AppendMenuW(menu, MF_GRAYED, 0, L"新建(W)");
+    }
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING, kRenameCategory, L"重命名格子(M)");
+    AppendMenuW(menu, MF_STRING, kCreateCategory, L"新建格子");
+    AppendMenuW(
+        menu,
+        categoryId == kUncategorizedCategoryId ? MF_GRAYED : MF_STRING,
+        kDeleteCategory,
+        L"解散该格子");
+    HMENU utility = CreatePopupMenu();
+    AppendMenuW(utility, MF_STRING | (layout->fixedExpanded && !layout->collapsed ? MF_GRAYED : 0), kToggleCollapse, layout->collapsed ? L"展开格子" : L"收起格子");
+    AppendMenuW(utility, MF_STRING | (layout->fixedExpanded ? MF_CHECKED : 0), kFixedExpanded, L"固定为展开状态");
+    AppendMenuW(utility, MF_STRING, kToggleLock, layout->locked ? L"解锁格子" : L"锁定格子");
+    AppendMenuW(utility, MF_STRING, kOpenLocation, L"打开格子所在位置");
+    HMENU category = CreatePopupMenu();
+    const UINT categoryState = categoryId == kUncategorizedCategoryId
+        ? MF_GRAYED : MF_STRING;
+    AppendMenuW(category, categoryState, kImportUnassigned, L"收纳未分类项目到此格子");
+    AppendMenuW(category, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(category, categoryState, kExportCategory, L"导出当前格子...");
+    AppendMenuW(category, categoryState, kImportCategory, L"导入到当前格子...");
+    AppendMenuW(category, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(category, categoryState, kMoveCategoryUp, L"分类顺序上移");
+    AppendMenuW(category, categoryState, kMoveCategoryDown, L"分类顺序下移");
+    AppendMenuW(utility, MF_POPUP, reinterpret_cast<UINT_PTR>(category), L"当前格子管理");
+    HMENU all = CreatePopupMenu();
+    AppendMenuW(all, MF_STRING, kHideAll, L"隐藏全部格子");
+    AppendMenuW(all, MF_STRING, kToggleAllLocked, L"切换全部格子锁定状态");
+    AppendMenuW(all, MF_STRING, kRefreshAll, L"刷新全部格子");
+    AppendMenuW(utility, MF_POPUP, reinterpret_cast<UINT_PTR>(all), L"全部格子");
+    HMENU settings = CreatePopupMenu();
+    AppendMenuW(settings, MF_STRING | (startupManager_.IsEnabled() ? MF_CHECKED : 0), kToggleStartup, L"开机自启");
+    AppendMenuW(settings, MF_STRING, kExportConfig, L"导出全部配置...");
+    AppendMenuW(settings, MF_STRING, kImportConfig, L"导入全部配置...");
+    AppendMenuW(utility, MF_POPUP, reinterpret_cast<UINT_PTR>(settings), L"备份与启动");
+    AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(utility), L"实用功能");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING, kFeedback, L"我要反馈");
+    AppendMenuW(menu, MF_STRING, kSettings, L"设置中心");
+    AppendMenuW(menu, MF_STRING, kPersonalCenter, L"个人中心");
+    AppendMenuW(menu, MF_STRING, kCheckUpdates, L"检查更新");
+    AppendMenuW(menu, MF_STRING, kOpenData, L"我的整理数据");
+    AppendMenuW(menu, MF_STRING, kExit, L"退出 Lattice");
+
+    gHostedBackgroundMenu2 = shellBackgroundMenu2.Get();
+    gHostedBackgroundMenu3 = shellBackgroundMenu3.Get();
+    const int selected = TrackPopupMenu(
+        menu, TPM_RIGHTBUTTON | TPM_RETURNCMD,
+        screenPoint.x, screenPoint.y, 0, owner, nullptr);
+    gHostedBackgroundMenu2 = nullptr;
+    gHostedBackgroundMenu3 = nullptr;
+    DestroyMenu(menu);
+    if (shellRootMenu != nullptr) {
+        DestroyMenu(shellRootMenu);
+    }
+    if (selected >= static_cast<int>(kHostedShellNewFirst) &&
+        selected <= static_cast<int>(kHostedShellNewLast) &&
+        shellBackgroundMenu != nullptr) {
+        CMINVOKECOMMANDINFOEX invoke{};
+        invoke.cbSize = sizeof(invoke);
+        invoke.fMask = CMIC_MASK_UNICODE;
+        invoke.hwnd = owner;
+        invoke.lpVerb = MAKEINTRESOURCEA(
+            selected - kHostedShellNewFirst);
+        invoke.lpVerbW = MAKEINTRESOURCEW(
+            selected - kHostedShellNewFirst);
+        invoke.nShow = SW_SHOWNORMAL;
+        shellBackgroundMenu->InvokeCommand(
+            reinterpret_cast<LPCMINVOKECOMMANDINFO>(&invoke));
+        ScheduleDesktopRefresh();
+        return;
+    }
+
+    bool layoutChanged = false;
+    if (selected == kGrid || selected == kList) {
+        layout->contentViewMode = selected == kList ? 1 : 0;
+        layoutChanged = true;
+    } else if (selected >= kIconSmall && selected <= kIconLarge) {
+        layout->iconSize = selected == kIconSmall
+            ? 32 : (selected == kIconMedium ? 48 : 64);
+        layoutChanged = true;
+    } else if (selected >= kSortCustom && selected <= kSortModified) {
+        layout->sortMode = selected - kSortCustom;
+        layoutChanged = true;
+    } else if (selected == kAutoArrange) {
+        layout->autoArrange = !layout->autoArrange;
+        layoutChanged = true;
+    } else if (selected == kToggleCollapse) {
+        layout->collapsed = !layout->collapsed;
+        if (layout->collapsed) {
+            layout->normalHeight = std::max(
+                layout->normalHeight, layout->height);
+        } else {
+            layout->height = std::max(layout->normalHeight, 120);
+        }
+        layoutChanged = true;
+    } else if (selected == kFixedExpanded) {
+        layout->fixedExpanded = !layout->fixedExpanded;
+        if (layout->fixedExpanded && layout->collapsed) {
+            layout->collapsed = false;
+            layout->height = std::max(layout->normalHeight, 120);
+        }
+        layoutChanged = true;
+    } else if (selected == kToggleLock) {
+        layout->locked = !layout->locked;
+        layoutChanged = true;
+    }
+    if (layoutChanged) {
+        if (categoryId == kUncategorizedCategoryId) {
+            windowConfig_ = *layout;
+        }
+        SaveOrganizerConfig();
+        return;
+    }
+
+    if (selected == kRefresh || selected == kRefreshAll) {
+        LoadDesktopItems();
+    } else if (selected == kAutoOrganize) {
+        ShowAutoOrganizePreview();
+    } else if (selected == kUndoAutoOrganize) {
+        UndoLastAutoOrganize();
+    } else if (selected == kPaste ||
+               selected == kPasteShortcut) {
+        CollectHostedPaths(
+            categoryId, ClipboardFilePaths(owner), -1, true);
+    } else if (selected == kOpenLocation) {
+        launcher_.OpenPath(L"shell:desktop");
+    } else if (selected == kRenameCategory) {
+        RenameCurrentCategory();
+    } else if (selected == kCreateCategory) {
+        CreateCategory();
+    } else if (selected == kDeleteCategory) {
+        DeleteCurrentCategory();
+    } else if (selected == kImportUnassigned) {
+        ImportUnassignedDesktopItems();
+    } else if (selected == kExportCategory) {
+        ExportCurrentCategory();
+    } else if (selected == kImportCategory) {
+        ImportCurrentCategory();
+    } else if (selected == kMoveCategoryUp) {
+        MoveCurrentCategory(-1);
+    } else if (selected == kMoveCategoryDown) {
+        MoveCurrentCategory(1);
+    } else if (selected == kHideAll) {
+        ToggleAllVisible();
+    } else if (selected == kToggleAllLocked) {
+        ToggleAllLocked();
+    } else if (selected == kToggleStartup) {
+        ToggleStartup();
+    } else if (selected == kSettings) {
+        ShowSettings();
+    } else if (selected == kExportConfig) {
+        ExportConfig();
+    } else if (selected == kImportConfig) {
+        ImportConfig();
+    } else if (selected == kOpenData) {
+        const std::filesystem::path configPath(configStore_.ConfigPath());
+        if (!configPath.parent_path().empty()) {
+            launcher_.OpenPath(configPath.parent_path().wstring());
+        }
+    } else if (selected == kCheckUpdates) {
+        CheckForUpdates(owner);
+    } else if (selected == kFeedback) {
+        const std::filesystem::path dataDirectory =
+            std::filesystem::path(configStore_.ConfigPath()).parent_path();
+        if (!dataDirectory.empty()) {
+            const std::filesystem::path feedbackPath =
+                dataDirectory / L"Lattice-问题反馈.txt";
+            HANDLE file = CreateFileW(
+                feedbackPath.c_str(), GENERIC_WRITE,
+                FILE_SHARE_READ, nullptr, OPEN_ALWAYS,
+                FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (file != INVALID_HANDLE_VALUE) {
+                LARGE_INTEGER fileSize{};
+                if (GetFileSizeEx(file, &fileSize) && fileSize.QuadPart == 0) {
+                    const std::wstring content =
+                        std::wstring(L"Lattice 问题反馈\r\n\r\n") +
+                        L"请描述遇到的问题：\r\n\r\n"
+                        L"复现步骤：\r\n1. \r\n2. \r\n\r\n"
+                        L"期望结果：\r\n\r\n"
+                        L"当前版本：" +
+                        UpdateService::kCurrentVersion + L"\r\n";
+                    const WORD bom = 0xFEFF;
+                    DWORD written = 0;
+                    WriteFile(file, &bom, sizeof(bom), &written, nullptr);
+                    WriteFile(
+                        file, content.data(),
+                        static_cast<DWORD>(
+                            content.size() * sizeof(wchar_t)),
+                        &written, nullptr);
+                }
+                CloseHandle(file);
+                launcher_.OpenPath(feedbackPath.wstring());
+            }
+        }
+    } else if (selected == kPersonalCenter) {
+        wchar_t userName[256]{};
+        DWORD userNameLength = ARRAYSIZE(userName);
+        if (!GetUserNameW(userName, &userNameLength)) {
+            wcscpy_s(userName, L"Windows 用户");
+        }
+        const std::wstring message =
+            std::wstring(L"当前用户：") + userName +
+            L"\n格子数量：" +
+            std::to_wstring(organizerConfig_.categories.size()) +
+            L"\n当前版本：" +
+            UpdateService::kCurrentVersion +
+            L"\n\n整理数据保存在当前用户的 Lattice 数据目录中。";
+        MessageDialog::Show(
+            instance_, owner, message.c_str(),
+            L"个人中心", MB_OK | MB_ICONINFORMATION);
+    } else if (selected == kExit) {
+        RequestNormalExit();
+    }
+}
+
+bool MainWindow::CollectHostedPaths(
+    const std::wstring& categoryId,
+    const std::vector<std::wstring>& paths,
+    int insertionIndex,
+    bool showError) {
+    if (paths.empty() || HostedWidgetLayout(categoryId) == nullptr) {
+        return false;
+    }
+    size_t queued = 0;
+    const size_t baseInsertion = insertionIndex < 0
+        ? (categoryId == kUncategorizedCategoryId
+            ? organizerConfig_.uncategorizedItemIds.size()
+            : FindCategory(categoryId)->itemIds.size())
+        : static_cast<size_t>(insertionIndex);
+    for (const std::wstring& path : paths) {
+        DesktopCollectionItemRequest request;
+        request.categoryId = categoryId;
+        request.path = path;
+        request.insertionIndex = baseInsertion + queued;
+        request.showError = showError;
+        request.sourceWindow = hwnd_;
+        if (desktopSnapshot_ != nullptr) {
+            if (const DesktopItem* item =
+                    desktopSnapshot_->FindUniqueByPath(path);
+                item != nullptr) {
+                request.sourceVisibleId = item->id;
+            }
+        }
+        if (desktopPlacementCoordinator_.CollectItemAsync(request) == 0) {
+            if (showError) {
+                ShowNonBlockingNotice(
+                    L"桌面项目收纳失败",
+                    L"无法把项目交给后台收纳任务。已排队的项目会继续处理。");
+            }
+            break;
+        }
+        ++queued;
+        ++hostedCollectionsPending_;
+    }
+    return queued != 0;
+}
+
+bool MainWindow::ReorderHostedSelection(
+    const std::wstring& categoryId,
+    const std::vector<std::wstring>& itemIds,
+    size_t insertionIndex) {
+    std::vector<std::wstring>* configuredIds = nullptr;
+    WindowConfig* layout = nullptr;
+    if (categoryId == kUncategorizedCategoryId) {
+        configuredIds = &organizerConfig_.uncategorizedItemIds;
+        layout = &organizerConfig_.window;
+    } else if (Category* category = FindCategory(categoryId);
+               category != nullptr) {
+        configuredIds = &category->itemIds;
+        layout = &category->layout;
+    }
+    if (configuredIds == nullptr || layout == nullptr || itemIds.empty()) {
+        return false;
+    }
+
+    const auto isSelected = [&](const std::wstring& candidate) {
+        return std::find(itemIds.begin(), itemIds.end(), candidate) !=
+            itemIds.end();
+    };
+    std::vector<std::wstring> moving;
+    moving.reserve(itemIds.size());
+    for (const std::wstring& configuredId : *configuredIds) {
+        if (isSelected(configuredId)) {
+            moving.push_back(configuredId);
+        }
+    }
+    if (moving.empty()) {
+        return false;
+    }
+
+    std::vector<std::wstring> remaining;
+    remaining.reserve(configuredIds->size() - moving.size());
+    size_t removedBeforeInsertion = 0;
+    for (size_t index = 0; index < configuredIds->size(); ++index) {
+        if (isSelected((*configuredIds)[index])) {
+            if (index < insertionIndex) {
+                ++removedBeforeInsertion;
+            }
+            continue;
+        }
+        remaining.push_back((*configuredIds)[index]);
+    }
+    const size_t normalizedInsertion = std::min(
+        insertionIndex >= removedBeforeInsertion
+            ? insertionIndex - removedBeforeInsertion
+            : size_t{0},
+        remaining.size());
+    remaining.insert(
+        remaining.begin() + static_cast<std::ptrdiff_t>(normalizedInsertion),
+        moving.begin(), moving.end());
+
+    *configuredIds = std::move(remaining);
+    layout->autoArrange = false;
+    layout->sortMode = 0;
+    if (categoryId == kUncategorizedCategoryId) {
+        windowConfig_ = *layout;
+    }
+    return SaveOrganizerConfig();
+}
+
+bool MainWindow::RenameHostedShellItem(const std::wstring& itemId) {
+    const DesktopItem* item = FindItem(itemId);
+    if (item == nullptr) {
+        return false;
+    }
+    const std::wstring previousIdentity = item->path;
+    const std::wstring previousDisplayName = item->displayName;
+    bool canRename = false;
+    if (FAILED(CanRenameShellPath(previousIdentity, canRename)) ||
+        !canRename) {
+        MessageDialog::Show(
+            instance_, hwnd_,
+            L"Windows 不允许重命名这个项目。",
+            L"Lattice 重命名",
+            MB_OK | MB_ICONWARNING);
+        return false;
+    }
+    const HWND owner = desktopSurface_ != nullptr &&
+            desktopSurface_->Window() != nullptr
+        ? desktopSurface_->Window()
+        : hwnd_;
+    const auto name = InputDialog::Prompt(
+        instance_, owner, L"重命名", L"名称", previousDisplayName);
+    if (!name.has_value() || *name == previousDisplayName) {
+        return true;
+    }
+    if (name->empty()) {
+        MessageDialog::Show(
+            instance_, owner,
+            L"名称不能为空。",
+            L"Lattice 重命名",
+            MB_OK | MB_ICONWARNING);
+        return false;
+    }
+
+    ShellPathRenameResult renamedItem;
+    const HRESULT result = RenameShellPath(
+        owner, previousIdentity, *name, renamedItem);
+    if (FAILED(result) &&
+        renamedItem.disposition == ShellRenameDisposition::Unchanged) {
+        MessageDialog::Show(
+            instance_, owner,
+            (L"Windows 无法完成这个重命名。请检查名称冲突、无效字符或项目权限。\n\n错误代码：" +
+             std::to_wstring(static_cast<unsigned long>(result))).c_str(),
+            L"Lattice 重命名",
+            MB_OK | MB_ICONERROR);
+        return false;
+    }
+    if (renamedItem.parsingName.empty()) {
+        ScheduleDesktopRefresh();
+        MessageDialog::Show(
+            instance_, owner,
+            L"Windows 已完成重命名，但 Lattice 暂时无法确认新的 Shell 身份。请刷新或重新启动 Lattice 完成协调。",
+            L"Lattice 重命名",
+            MB_OK | MB_ICONWARNING);
+        return false;
+    }
+
+    const std::wstring displayName = renamedItem.displayName.empty()
+        ? *name
+        : renamedItem.displayName;
+    const bool accepted = configStore_.SaveShellRenameAsync(
+        previousIdentity, renamedItem.parsingName, displayName);
+    for (RegisteredItem& registered : organizerConfig_.items) {
+        if (CompareStringOrdinal(
+                registered.path.c_str(), -1,
+                previousIdentity.c_str(), -1,
+                TRUE) == CSTR_EQUAL) {
+            registered.path = renamedItem.parsingName;
+            registered.displayName = displayName;
+        }
+        if (!registered.originalDesktopPath.empty() &&
+            CompareStringOrdinal(
+                registered.originalDesktopPath.c_str(), -1,
+                previousIdentity.c_str(), -1,
+                TRUE) == CSTR_EQUAL) {
+            registered.originalDesktopPath = renamedItem.parsingName;
+        }
+    }
+    ScheduleDesktopRefresh();
+    if (!accepted || FAILED(result)) {
+        MessageDialog::Show(
+            instance_, owner,
+            L"Windows 已完成重命名，但配置更新仍在等待后台写入。请稍后再退出 Lattice。",
+            L"Lattice 重命名",
+            MB_OK | MB_ICONWARNING);
+    }
+    return true;
+}
+
+bool MainWindow::InvokeHostedShellVerb(
+    const std::vector<std::wstring>& itemIds,
+    const std::wstring& canonicalVerb) {
+    std::vector<std::wstring> paths;
+    std::vector<ShellItemReference> desktopItems;
+    paths.reserve(itemIds.size());
+    desktopItems.reserve(itemIds.size());
+    for (const std::wstring& itemId : itemIds) {
+        const DesktopItem* item = FindItem(itemId);
+        if (item == nullptr || item->path.empty()) {
+            return false;
+        }
+        paths.push_back(item->path);
+        ShellItemReference reference;
+        if (SUCCEEDED(CreateDesktopShellItemReference(item->path, reference))) {
+            desktopItems.push_back(std::move(reference));
+        }
+    }
+    if (paths.empty()) {
+        return false;
+    }
+    const HWND owner = desktopSurface_ != nullptr &&
+            desktopSurface_->Window() != nullptr
+        ? desktopSurface_->Window()
+        : hwnd_;
+    bool invoked = desktopItems.size() == paths.size()
+        ? launcher_.InvokeDesktopContextMenuVerb(
+            owner, desktopItems, canonicalVerb)
+        : false;
+    if (!invoked && paths.size() == 1) {
+        invoked = launcher_.InvokeContextMenuVerb(
+            owner, paths.front(), canonicalVerb);
+    } else if (!invoked &&
+               CompareStringOrdinal(
+                   canonicalVerb.c_str(), -1,
+                   L"delete", -1, TRUE) == CSTR_EQUAL) {
+        for (const std::wstring& path : paths) {
+            invoked = launcher_.InvokeContextMenuVerb(
+                owner, path, canonicalVerb) || invoked;
+        }
+    }
+    if (invoked &&
+        (CompareStringOrdinal(
+             canonicalVerb.c_str(), -1,
+             L"delete", -1, TRUE) == CSTR_EQUAL ||
+         CompareStringOrdinal(
+             canonicalVerb.c_str(), -1,
+             L"cut", -1, TRUE) == CSTR_EQUAL)) {
+        ScheduleDesktopRefresh();
+    }
+    return invoked;
+}
+
+void MainWindow::ShowHostedShellMenu(
+    const std::wstring& categoryId,
+    const std::vector<std::wstring>& itemIds,
+    POINT screenPoint) {
+    if (itemIds.empty()) {
+        return;
+    }
+    constexpr UINT kMoveOutCommand = 0x7000;
+    constexpr UINT kMoveToUncategorizedCommand = 0x7001;
+    constexpr UINT kRefreshCommand = 0x7002;
+    constexpr UINT kMoveCategoryBaseCommand = 0x7100;
+
+    const AppConfig appConfig = configStore_.LoadAppConfig();
+    std::vector<std::wstring> selectedIds;
+    std::vector<std::wstring> selectedPaths;
+    std::vector<ShellItemReference> desktopItems;
+    selectedIds.reserve(itemIds.size());
+    selectedPaths.reserve(itemIds.size());
+    desktopItems.reserve(itemIds.size());
+    for (const std::wstring& itemId : itemIds) {
+        const DesktopItem* item = FindItem(itemId);
+        if (item == nullptr || item->path.empty()) {
+            continue;
+        }
+        selectedIds.push_back(itemId);
+        selectedPaths.push_back(item->path);
+        ShellItemReference reference;
+        if (SUCCEEDED(CreateDesktopShellItemReference(item->path, reference))) {
+            desktopItems.push_back(std::move(reference));
+        }
+    }
+    if (selectedIds.empty()) {
+        return;
+    }
+    bool useDesktopSelection = desktopItems.size() == selectedIds.size();
+    if (selectedIds.size() > 1 && !useDesktopSelection) {
+        selectedIds.resize(1);
+        selectedPaths.resize(1);
+        desktopItems.clear();
+        ShellItemReference reference;
+        if (SUCCEEDED(CreateDesktopShellItemReference(
+                selectedPaths.front(), reference))) {
+            desktopItems.push_back(std::move(reference));
+            useDesktopSelection = true;
+        }
+    }
+    bool canRename = false;
+    if (selectedIds.size() == 1) {
+        CanRenameShellPath(selectedPaths.front(), canRename);
+    }
+    const ShellMenuAppender appendCommands = [&](HMENU menu) {
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        HMENU moveMenu = CreatePopupMenu();
+        if (categoryId != kUncategorizedCategoryId) {
+            AppendMenuW(
+                moveMenu, MF_STRING,
+                kMoveToUncategorizedCommand, L"未分类");
+        }
+        for (size_t index = 0; index < appConfig.categories.size(); ++index) {
+            if (appConfig.categories[index].id == categoryId) {
+                continue;
+            }
+            AppendMenuW(
+                moveMenu, MF_STRING,
+                kMoveCategoryBaseCommand + static_cast<UINT>(index),
+                appConfig.categories[index].name.c_str());
+        }
+        if (GetMenuItemCount(moveMenu) == 0) {
+            AppendMenuW(moveMenu, MF_GRAYED, 0, L"暂无其他分类");
+        }
+        AppendMenuW(
+            menu, MF_POPUP,
+            reinterpret_cast<UINT_PTR>(moveMenu),
+            L"移动到分类");
+        AppendMenuW(menu, MF_STRING, kMoveOutCommand, L"移出格子");
+        AppendMenuW(menu, MF_STRING, kRefreshCommand, L"刷新图标");
+    };
+
+    const HWND owner = desktopSurface_ != nullptr &&
+            desktopSurface_->Window() != nullptr
+        ? desktopSurface_->Window()
+        : hwnd_;
+    UINT customCommand = 0;
+    std::wstring invokedVerb;
+    const ShellContextMenuResult result = useDesktopSelection
+        ? launcher_.ShowDesktopContextMenuWithExtensions(
+            owner, desktopItems, screenPoint, canRename,
+            appendCommands, customCommand, invokedVerb)
+        : launcher_.ShowContextMenuWithExtensions(
+            owner, selectedPaths.front(), screenPoint, canRename,
+            appendCommands, customCommand, invokedVerb);
+    if (result == ShellContextMenuResult::RenameRequested) {
+        RenameHostedShellItem(selectedIds.front());
+        return;
+    }
+    if (result == ShellContextMenuResult::Invoked) {
+        if (CompareStringOrdinal(
+                invokedVerb.c_str(), -1, L"delete", -1, TRUE) ==
+                CSTR_EQUAL ||
+            CompareStringOrdinal(
+                invokedVerb.c_str(), -1, L"cut", -1, TRUE) ==
+                CSTR_EQUAL) {
+            ScheduleDesktopRefresh();
+        }
+        return;
+    }
+    if (result != ShellContextMenuResult::CustomCommand) {
+        return;
+    }
+
+    if (customCommand == kRefreshCommand) {
+        RefreshIconCache();
+    } else if (customCommand == kMoveOutCommand) {
+        for (const std::wstring& itemId : selectedIds) {
+            MoveItemOut(itemId);
+        }
+    } else if (customCommand == kMoveToUncategorizedCommand) {
+        for (const std::wstring& itemId : selectedIds) {
+            MoveItemToCategory(itemId, kUncategorizedCategoryId);
+        }
+    } else if (customCommand >= kMoveCategoryBaseCommand &&
+               customCommand < kMoveCategoryBaseCommand +
+                   static_cast<UINT>(appConfig.categories.size())) {
+        const size_t categoryIndex = static_cast<size_t>(
+            customCommand - kMoveCategoryBaseCommand);
+        for (const std::wstring& itemId : selectedIds) {
+            MoveItemToCategory(
+                itemId, appConfig.categories[categoryIndex].id);
+        }
+    }
 }
 
 void MainWindow::ReloadPersistedState() {
@@ -544,10 +1737,26 @@ bool MainWindow::QueueDesktopPlacement(const DesktopPlacementRequest& request) {
 }
 
 void MainWindow::HandleDesktopPlacementEvents(bool allowDialogs) {
+    std::wstring hostedCollectionError;
     for (DesktopPlacementCoordinator::Event& event :
          desktopPlacementCoordinator_.TakeEvents()) {
         if (event.collection) {
-            if (event.sourceWindow != nullptr &&
+            if (event.sourceWindow == hwnd_) {
+                if (hostedCollectionsPending_ != 0) {
+                    --hostedCollectionsPending_;
+                }
+                if (hostedCollectionsPending_ == 0) {
+                    hostedCollectionBusyNotified_ = false;
+                }
+                hostedCollectionDirty_ = hostedCollectionDirty_ ||
+                    event.collectionResult.succeeded;
+                if (!event.collectionResult.succeeded &&
+                    event.showError &&
+                    hostedCollectionError.empty()) {
+                    hostedCollectionError =
+                        event.collectionResult.errorMessage;
+                }
+            } else if (event.sourceWindow != nullptr &&
                 IsWindow(event.sourceWindow) != FALSE) {
                 SendMessageW(
                     event.sourceWindow,
@@ -622,6 +1831,20 @@ void MainWindow::HandleDesktopPlacementEvents(bool allowDialogs) {
                 L"Lattice background desktop placement failed for " +
                 event.path + L": " + errorMessage + L"\n";
             OutputDebugStringW(diagnostic.c_str());
+        }
+    }
+    if (hostedCollectionsPending_ == 0 && hostedCollectionDirty_ &&
+        hwnd_ != nullptr &&
+        IsWindow(hwnd_) != FALSE) {
+        hostedCollectionDirty_ = false;
+        PostMessageW(hwnd_, kOrganizerConfigChangedMessage, 0, 0);
+    }
+    if (!hostedCollectionError.empty()) {
+        if (allowDialogs) {
+            ShowNonBlockingNotice(
+                L"桌面项目收纳失败", hostedCollectionError);
+        } else {
+            OutputDebugStringW(hostedCollectionError.c_str());
         }
     }
 }
@@ -739,12 +1962,7 @@ void MainWindow::Show(int showCommand, bool enableDesktopTakeover) {
     organizerConfig_.window.viewMode = 1;
     ShowWindow(hwnd_, SW_HIDE);
     if (showCommand == SW_HIDE) {
-        for (auto& widget : widgetWindows_) {
-            if (widget != nullptr && widget->IsOpen()) {
-                widget->Close();
-            }
-        }
-        widgetWindows_.clear();
+        hostedWidgetCategoryIds_.clear();
         if (desktopSurface_ != nullptr) {
             desktopSurface_->Close();
             desktopSurface_.reset();
@@ -771,13 +1989,24 @@ void MainWindow::Show(int showCommand, bool enableDesktopTakeover) {
 
 void MainWindow::CheckForUpdates(HWND sourceWindow) {
     if (!UpdateService::Start(hwnd_, true, sourceWindow)) {
-        MessageDialog::Show(instance_, sourceWindow, L"更新检查已在后台进行，请稍候。", L"检查更新", MB_OK | MB_ICONINFORMATION);
+        MessageDialog::Show(instance_, sourceWindow, L"无法开始检查更新，请稍后重试。", L"检查更新", MB_OK | MB_ICONWARNING);
+        return;
     }
+    MessageDialog::Show(
+        instance_, sourceWindow,
+        L"正在检查公开版本，请稍候。检查完成后会显示结果。",
+        L"检查更新", MB_OK | MB_ICONINFORMATION,
+        &updateProgressDialog_);
 }
 
 void MainWindow::HandleUpdateServiceResult(UpdateServiceResult* rawResult) {
     std::unique_ptr<UpdateServiceResult> result(rawResult);
     if (result == nullptr || !result->manual) return;
+    if (updateProgressDialog_ != nullptr &&
+        IsWindow(updateProgressDialog_) != FALSE) {
+        DestroyWindow(updateProgressDialog_);
+        updateProgressDialog_ = nullptr;
+    }
     const UINT icon = result->status == UpdateServiceStatus::Failed ? MB_ICONWARNING : MB_ICONINFORMATION;
     HWND owner = result->dialogOwner != nullptr && IsWindow(result->dialogOwner) != FALSE
         ? result->dialogOwner
@@ -935,6 +2164,7 @@ LRESULT MainWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
                 iconGrid_.SetLightTheme(
                     UseLightTheme(organizerConfig_.settings.theme));
                 RefreshTileViews();
+                SyncHostedWidgets();
                 InvalidateRect(hwnd_, nullptr, FALSE);
             }
             break;
@@ -1522,21 +2752,11 @@ LRESULT MainWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
                     if (desktopSurface_ != nullptr) {
                         desktopSurface_->RefreshIconCache();
                     }
-                    for (auto& widget : widgetWindows_) {
-                        if (widget != nullptr && widget->IsOpen()) {
-                            widget->RefreshIconCache();
-                        }
-                    }
                 } else {
                     iconCache_.Invalidate(changes.paths);
                     if (desktopSurface_ != nullptr) {
                         desktopSurface_->InvalidateIconCache(
                             changes.paths);
-                    }
-                    for (auto& widget : widgetWindows_) {
-                        if (widget != nullptr && widget->IsOpen()) {
-                            widget->InvalidateIconCache(changes.paths);
-                        }
                     }
                 }
                 if (!changes.requiresRescan) {
@@ -1589,6 +2809,11 @@ LRESULT MainWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
                 reinterpret_cast<AutoOrganizeTransactionResult*>(lParam));
             return 0;
 
+        case kLayoutRestoreCompleteMessage:
+            HandleLayoutRestoreResult(
+                reinterpret_cast<LayoutRestoreResult*>(lParam));
+            return 0;
+
         case kOrganizerConfigSyncMessage:
             // Keep the persisted item graph current while Explorer finishes
             // positioning without triggering a desktop scan or visual refresh.
@@ -1601,6 +2826,7 @@ LRESULT MainWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
                 return 0;
             }
             LoadOrganizerConfig();
+            RepublishDesktopSnapshotMembership();
             RefreshDesktopSurfaceAssignments();
             return 0;
 
@@ -1961,12 +3187,13 @@ LRESULT MainWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
                 desktopSurface_->Close();
                 desktopSurface_.reset();
             }
+            hostedWidgetCategoryIds_.clear();
+#ifndef NDEBUG
             for (auto& widget : widgetWindows_) {
-                if (widget != nullptr) {
-                    widget->Close();
-                }
+                if (widget != nullptr) widget->Close();
             }
             widgetWindows_.clear();
+#endif
             desktopWatcher_.Stop();
             trayIcon_.Remove();
             PostQuitMessage(0);
@@ -1981,15 +3208,22 @@ LRESULT MainWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
 
 void MainWindow::LoadDesktopItems() {
     DesktopScanner scanner;
-    items_ = scanner.Scan(organizerConfig_.settings.showPublicDesktopItems);
-    ReconcileDeletedDesktopItems();
+    std::vector<DesktopItem> items =
+        scanner.Scan(organizerConfig_.settings.showPublicDesktopItems);
+    ReconcileDeletedDesktopItems(items);
     for (const RegisteredItem& registeredItem : organizerConfig_.items) {
+        if (desktopInitialScanComplete_ &&
+            IsItemAssigned(registeredItem.id) &&
+            IsConfirmedDeletedDesktopPath(registeredItem.path)) {
+            continue;
+        }
         scanner.MergeRegisteredItem(
-            items_,
+            items,
             registeredItem.id,
             registeredItem.path,
             registeredItem.displayName);
     }
+    PublishDesktopSnapshot(std::move(items));
     iconGrid_.SetIconSize(windowConfig_.iconSize);
     iconGrid_.SetDensity(windowConfig_.density);
     iconGrid_.SetCompactStyle(false);
@@ -1997,19 +3231,57 @@ void MainWindow::LoadDesktopItems() {
     iconCache_.SetCapacity(static_cast<size_t>(organizerConfig_.settings.iconCacheSize));
     RefreshCurrentItems();
     iconGrid_.SetBounds(GridBounds());
-    for (auto& widget : widgetWindows_) {
-        if (widget != nullptr && widget->IsOpen()) {
-            widget->RefreshFromConfig();
-        }
+    RefreshDesktopSurfaceAssignments();
+    desktopInitialScanComplete_ = true;
+}
+
+void MainWindow::PublishDesktopSnapshot(std::vector<DesktopItem> items) {
+    desktopSnapshot_ = BuildDesktopSnapshot(
+        ++desktopSnapshotRevision_, std::move(items), organizerConfig_);
+    SyncHostedWidgets();
+}
+
+void MainWindow::RepublishDesktopSnapshotMembership() {
+    if (desktopSnapshot_ != nullptr &&
+        desktopSnapshot_->MembershipMatches(organizerConfig_)) {
+        SyncHostedWidgets();
+        return;
     }
+    PublishDesktopSnapshot(DesktopItems());
+    RefreshCurrentItems();
     RefreshDesktopSurfaceAssignments();
 }
 
-void MainWindow::ReconcileDeletedDesktopItems() {
+const std::vector<DesktopItem>& MainWindow::DesktopItems() const noexcept {
+    static const std::vector<DesktopItem> empty;
+    return desktopSnapshot_ == nullptr ? empty : desktopSnapshot_->Items();
+}
+
+void MainWindow::ReconcileDeletedDesktopItems(
+    std::vector<DesktopItem>& items) {
     std::vector<std::wstring> removedIdentities;
+    std::vector<std::wstring> deferredIdentities;
+    std::vector<std::wstring> removedItemIds;
+    for (const RegisteredItem& item : organizerConfig_.items) {
+        if (!desktopInitialScanComplete_ || item.id.empty() ||
+            item.path.empty() || !IsItemAssigned(item.id) ||
+            !shortcutStore_.IsDesktopPath(item.path) ||
+            !IsConfirmedDeletedDesktopPath(item.path)) {
+            continue;
+        }
+        deferredIdentities.push_back(item.path);
+    }
     const auto confirmDeleted = [&](const std::wstring& path) {
         if (path.empty() || !shortcutStore_.IsDesktopPath(path) ||
             !IsConfirmedDeletedDesktopPath(path)) {
+            return false;
+        }
+        if (std::any_of(deferredIdentities.begin(), deferredIdentities.end(),
+                [&](const std::wstring& deferred) {
+                    return CompareStringOrdinal(
+                        deferred.c_str(), -1, path.c_str(), -1,
+                        TRUE) == CSTR_EQUAL;
+                })) {
             return false;
         }
         if (std::none_of(removedIdentities.begin(), removedIdentities.end(),
@@ -2021,12 +3293,10 @@ void MainWindow::ReconcileDeletedDesktopItems() {
         }
         return true;
     };
-    std::vector<std::wstring> removedItemIds;
     for (const RegisteredItem& item : organizerConfig_.items) {
-        if (item.id.empty() || !confirmDeleted(item.path)) {
-            continue;
+        if (!item.id.empty() && confirmDeleted(item.path)) {
+            removedItemIds.push_back(item.id);
         }
-        removedItemIds.push_back(item.id);
     }
     // Explorer's hidden view can retain a deleted, unregistered temporary item.
     // Confirm against the same filesystem rules used for registered items.
@@ -2035,22 +3305,28 @@ void MainWindow::ReconcileDeletedDesktopItems() {
             confirmDeleted(item.path);
         }
     }
-    for (const DesktopItem& item : items_) {
+    for (const DesktopItem& item : items) {
         confirmDeleted(item.path);
+    }
+    // Missing items leave the visible desktop immediately. Their category
+    // stays in persisted metadata for this process so a long-running updater
+    // can recreate the same path without losing its stable member identity.
+    if (desktopSurface_ != nullptr && !deferredIdentities.empty()) {
+        desktopSurface_->RemoveDeletedIdentities(deferredIdentities);
     }
     if (removedIdentities.empty() ||
         (!removedItemIds.empty() && !configStore_.RemoveItemsAsync(removedItemIds))) {
         return;
     }
 
-    items_.erase(std::remove_if(items_.begin(), items_.end(),
+    items.erase(std::remove_if(items.begin(), items.end(),
         [&](const DesktopItem& item) {
             return std::any_of(removedIdentities.begin(), removedIdentities.end(),
                 [&](const std::wstring& identity) {
                     return CompareStringOrdinal(identity.c_str(), -1,
                         item.path.c_str(), -1, TRUE) == CSTR_EQUAL;
                 });
-        }), items_.end());
+        }), items.end());
     if (desktopSurface_ != nullptr) {
         desktopSurface_->RemoveDeletedIdentities(removedIdentities);
     }
@@ -2229,13 +3505,12 @@ void MainWindow::ToggleAllVisible() {
     if (hwnd_ == nullptr) {
         return;
     }
-    bool anyVisible = windowConfig_.viewMode == 1 ? false : IsWindowVisible(hwnd_) != FALSE;
-    for (const auto& widget : widgetWindows_) {
-        if (widget != nullptr && widget->IsVisible()) {
-            anyVisible = true;
-            break;
-        }
-    }
+    bool anyVisible = windowConfig_.viewMode == 1
+        ? desktopSurface_ != nullptr &&
+            desktopSurface_->Window() != nullptr &&
+            IsWindowVisible(desktopSurface_->Window()) != FALSE &&
+            !hostedWidgetCategoryIds_.empty()
+        : IsWindowVisible(hwnd_) != FALSE;
     const bool show = !anyVisible;
     if (show &&
         (desktopSurface_ == nullptr ||
@@ -2250,7 +3525,7 @@ void MainWindow::ToggleAllVisible() {
         }
     }
     if (show && windowConfig_.viewMode == 1 &&
-        widgetWindows_.empty()) {
+        hostedWidgetCategoryIds_.empty()) {
         OpenAllCategoryWidgets();
     }
     if (windowConfig_.viewMode == 1) {
@@ -2259,22 +3534,14 @@ void MainWindow::ToggleAllVisible() {
         ShowWindow(hwnd_, show ? SW_SHOWNOACTIVATE : SW_HIDE);
     }
     if (show) {
-        for (auto& widget : widgetWindows_) {
-            if (widget != nullptr && widget->IsOpen()) {
-                widget->SetVisible(true);
-            }
-        }
+        organizerConfig_.settings.lastVisible = true;
+        SyncHostedWidgets();
         if (desktopSurface_ != nullptr) {
             desktopSurface_->Show();
         }
         UpdateWindow(hwnd_);
     } else {
-        for (auto& widget : widgetWindows_) {
-            if (widget != nullptr && widget->IsOpen()) {
-                widget->Close();
-            }
-        }
-        widgetWindows_.clear();
+        hostedWidgetCategoryIds_.clear();
         if (desktopSurface_ != nullptr) {
             desktopSurface_->Close();
             desktopSurface_.reset();
@@ -2331,6 +3598,10 @@ void MainWindow::ShowSettings() {
 
 void MainWindow::ApplyLiveSettings(bool publicDesktopChanged) {
     iconCache_.SetCapacity(static_cast<size_t>(organizerConfig_.settings.iconCacheSize));
+    if (desktopSurface_ != nullptr) {
+        desktopSurface_->SetIconCacheCapacity(
+            static_cast<size_t>(organizerConfig_.settings.iconCacheSize));
+    }
     iconGrid_.SetLightTheme(UseLightTheme(organizerConfig_.settings.theme));
     if (publicDesktopChanged) {
         LoadDesktopItems();
@@ -2395,7 +3666,7 @@ AutoOrganizePreviewInput MainWindow::BuildAutoOrganizePreviewInput() const {
 
     const DesktopViewSnapshot* desktopSnapshot =
         desktopSurface_ == nullptr ? nullptr : &desktopSurface_->Snapshot();
-    for (const DesktopItem& item : items_) {
+    for (const DesktopItem& item : DesktopItems()) {
         lattice::organize::ItemSnapshot snapshot;
         snapshot.id = item.id;
         snapshot.parsingIdentity = item.path;
@@ -2407,22 +3678,27 @@ AutoOrganizePreviewInput MainWindow::BuildAutoOrganizePreviewInput() const {
         snapshot.kind = item.kind;
         snapshot.missing = item.missing;
 
-        const ConfiguredItemMembership membership =
-            FindConfiguredItemMembership(currentConfig, item.id);
-        snapshot.sourceCategoryId = membership.categoryId;
-        snapshot.sourceIndex = membership.index < 0
-            ? 0u : static_cast<std::size_t>(membership.index);
-        if (membership.categoryId == kUncategorizedCategoryId) {
+        const DesktopSnapshotMembership* membership =
+            desktopSnapshot_ == nullptr
+                ? nullptr
+                : desktopSnapshot_->MembershipForItem(item.id);
+        snapshot.sourceCategoryId = membership == nullptr || !membership->IsUnique()
+            ? std::wstring{}
+            : membership->categoryId;
+        snapshot.sourceIndex = membership == nullptr || !membership->IsUnique()
+            ? 0u
+            : membership->order;
+        if (snapshot.sourceCategoryId == kUncategorizedCategoryId) {
             snapshot.sourceCategoryName = currentConfig.uncategorizedName;
             snapshot.monitorId = currentConfig.window.monitorId.empty()
                 ? monitorForPoint(POINT{
                     currentConfig.window.x, currentConfig.window.y})
                 : currentConfig.window.monitorId;
-        } else if (!membership.categoryId.empty()) {
+        } else if (!snapshot.sourceCategoryId.empty()) {
             const auto category = std::find_if(
                 currentConfig.categories.begin(), currentConfig.categories.end(),
                 [&](const CategoryConfig& value) {
-                    return value.id == membership.categoryId;
+                    return value.id == snapshot.sourceCategoryId;
                 });
             if (category != currentConfig.categories.end()) {
                 snapshot.sourceCategoryName = category->name;
@@ -2467,10 +3743,10 @@ AutoOrganizeApplyRequest MainWindow::BuildAutoOrganizeApplyRequest(
             decision.targetCategoryId == decision.sourceCategoryId) {
             continue;
         }
-        const auto desktopItem = std::find_if(
-            items_.begin(), items_.end(),
-            [&](const DesktopItem& item) { return item.id == decision.itemId; });
-        if (desktopItem == items_.end() || desktopItem->missing ||
+        const DesktopItem* desktopItem = desktopSnapshot_ == nullptr
+            ? nullptr
+            : desktopSnapshot_->FindUniqueById(decision.itemId);
+        if (desktopItem == nullptr || desktopItem->missing ||
             CompareStringOrdinal(
                 desktopItem->path.c_str(), -1,
                 decision.parsingIdentity.c_str(), -1, TRUE) != CSTR_EQUAL) {
@@ -2718,6 +3994,8 @@ void MainWindow::UndoLastAutoOrganize() {
 
 bool MainWindow::PublishReloadedOrganizerState(
     const std::vector<std::wstring>& newCategoryIds) {
+    const std::vector<std::wstring> previousOpenCategories =
+        hostedWidgetCategoryIds_;
     LoadOrganizerConfig();
     windowConfig_ = organizerConfig_.window;
     if (!newCategoryIds.empty() &&
@@ -2725,48 +4003,27 @@ bool MainWindow::PublishReloadedOrganizerState(
             configStore_.ConfigPath())) {
         return false;
     }
-    std::vector<std::unique_ptr<WidgetWindow>> preparedWidgets;
+    std::erase_if(
+        hostedWidgetCategoryIds_,
+        [&](const std::wstring& categoryId) {
+            return categoryId != kUncategorizedCategoryId &&
+                FindCategory(categoryId) == nullptr;
+        });
     for (const std::wstring& categoryId : newCategoryIds) {
-        if (FindCategory(categoryId) == nullptr) continue;
-        const bool alreadyOpen = std::any_of(
-            widgetWindows_.begin(), widgetWindows_.end(),
-            [&](const std::unique_ptr<WidgetWindow>& widget) {
-                return widget != nullptr && widget->IsOpen() &&
-                    widget->IsForCategory(categoryId);
-            });
-        if (alreadyOpen) continue;
-        auto widget = std::make_unique<WidgetWindow>(
-            instance_, hwnd_, categoryId,
-            static_cast<int>(widgetWindows_.size() +
-                preparedWidgets.size()) * 36);
-        ConfigureWidgetShellDrop(*widget);
-        if (!widget->Create()) {
-            for (auto& prepared : preparedWidgets) prepared->Close();
-            return false;
-        }
-        preparedWidgets.push_back(std::move(widget));
-    }
-    for (auto iterator = widgetWindows_.begin();
-         iterator != widgetWindows_.end();) {
-        const bool valid = *iterator != nullptr && (*iterator)->IsOpen() &&
-            ((*iterator)->IsForCategory(kUncategorizedCategoryId) ||
-             std::any_of(
-                 organizerConfig_.categories.begin(),
-                 organizerConfig_.categories.end(),
-                 [&](const Category& category) {
-                     return (*iterator)->IsForCategory(category.id);
-                 }));
-        if (!valid) {
-            if (*iterator != nullptr) (*iterator)->Close();
-            iterator = widgetWindows_.erase(iterator);
-        } else {
-            ++iterator;
+        if (FindCategory(categoryId) != nullptr &&
+            std::find(
+                hostedWidgetCategoryIds_.begin(),
+                hostedWidgetCategoryIds_.end(),
+                categoryId) == hostedWidgetCategoryIds_.end()) {
+            hostedWidgetCategoryIds_.push_back(categoryId);
         }
     }
     LoadDesktopItems();
-    for (auto& widget : preparedWidgets) {
-        widget->Show(SW_SHOWNOACTIVATE);
-        widgetWindows_.push_back(std::move(widget));
+    std::wstring publishError;
+    if (!SyncHostedWidgets(&publishError)) {
+        hostedWidgetCategoryIds_ = previousOpenCategories;
+        SyncHostedWidgets();
+        return false;
     }
     InvalidateRect(hwnd_, nullptr, FALSE);
     return true;
@@ -2840,6 +4097,193 @@ void MainWindow::HandleAutoOrganizeTransactionResult(
     }
 }
 
+LayoutIdentityIndex MainWindow::CurrentLayoutIdentityIndex() const {
+    LayoutIdentityIndex result;
+    if (desktopSnapshot_ == nullptr) return result;
+    result.uniqueItemIds.reserve(desktopSnapshot_->Items().size());
+    result.uniquePaths.reserve(desktopSnapshot_->Items().size());
+    for (const DesktopItem& item : desktopSnapshot_->Items()) {
+        if (!item.id.empty() &&
+            desktopSnapshot_->ItemIndicesById(item.id).size() == 1) {
+            result.uniqueItemIds.push_back(item.id);
+        }
+        if (!item.path.empty() &&
+            desktopSnapshot_->ItemIndicesByPath(item.path).size() == 1) {
+            result.uniquePaths.push_back(item.path);
+        }
+    }
+    return result;
+}
+
+bool MainWindow::PublishLayoutConfig(
+    const AppConfig& config,
+    const std::vector<LayoutMonitorSnapshot>& expectedMonitors,
+    std::uint64_t expectedDesktopRevision,
+    bool enforceGuards) {
+    if (enforceGuards &&
+        (desktopSnapshot_ == nullptr ||
+         desktopSnapshot_->Revision() != expectedDesktopRevision ||
+         !SameLayoutMonitorTopology(
+             expectedMonitors, CurrentLayoutMonitors()))) {
+        return false;
+    }
+
+    const bool visible = config.settings.lastVisible;
+    const bool widgetMode = config.window.viewMode == 1;
+    if (visible &&
+        (desktopSurface_ == nullptr ||
+         desktopSurface_->Window() == nullptr)) {
+        std::wstring takeoverError;
+        if (!EnableDesktopDisplayTakeover(takeoverError)) {
+            return false;
+        }
+    }
+
+    std::vector<std::wstring> targetWidgetIds;
+    if (!config.uncategorizedItemIds.empty() || config.categories.empty()) {
+        targetWidgetIds.push_back(kUncategorizedCategoryId);
+    }
+    for (const CategoryConfig& category : config.categories) {
+        targetWidgetIds.push_back(category.id);
+    }
+    int injectedFailureIndex = -1;
+    if (enforceGuards &&
+        ToLowerCopy(configStore_.ConfigPath()).find(
+            L"\\smoke-runs\\") != std::wstring::npos) {
+        wchar_t value[32]{};
+        if (GetEnvironmentVariableW(
+                L"LATTICE_SMOKE_FAIL_LAYOUT_WIDGET_INDEX",
+                value,
+                ARRAYSIZE(value)) > 0) {
+            try {
+                injectedFailureIndex = std::stoi(value);
+            } catch (...) {
+                injectedFailureIndex = -1;
+            }
+        }
+    }
+
+    if (injectedFailureIndex >= 0 &&
+        injectedFailureIndex < static_cast<int>(targetWidgetIds.size())) {
+        return false;
+    }
+
+    if (SetLayeredWindowAttributes(
+            hwnd_, 0, static_cast<BYTE>(config.window.opacity),
+            LWA_ALPHA) == FALSE ||
+        SetWindowPos(
+            hwnd_, nullptr,
+            config.window.x,
+            config.window.y,
+            config.window.width,
+            config.window.height,
+            SWP_NOZORDER | SWP_NOACTIVATE) == FALSE) {
+        return false;
+    }
+
+    ApplyOrganizerConfig(config);
+    windowConfig_ = config.window;
+    hostedWidgetCategoryIds_ = visible && widgetMode
+        ? targetWidgetIds
+        : std::vector<std::wstring>{};
+    RepublishDesktopSnapshotMembership();
+    RefreshCurrentItems();
+    iconGrid_.SetBounds(GridBounds());
+    LayoutSearchEdit();
+
+    if (desktopSurface_ != nullptr) {
+        desktopSurface_->UpdateAssignedIdentities(
+            AssignedDesktopIdentities());
+        desktopSurface_->UpdateDisplayPositions(
+            ToDesktopPositions(config.desktopDisplayLayout));
+        if (visible) {
+            std::wstring publishError;
+            if (!SyncHostedWidgets(&publishError)) {
+                return false;
+            }
+            desktopSurface_->Show();
+        } else {
+            desktopSurface_->Close();
+            desktopSurface_.reset();
+        }
+    }
+    if (widgetMode) {
+        ShowWindow(hwnd_, SW_HIDE);
+    } else {
+        ShowWindow(hwnd_, visible ? SW_SHOWNOACTIVATE : SW_HIDE);
+    }
+    InvalidateRect(hwnd_, nullptr, FALSE);
+    return true;
+}
+
+void MainWindow::HandleLayoutRestoreResult(
+    LayoutRestoreResult* rawResult) {
+    std::unique_ptr<LayoutRestoreResult> result(rawResult);
+    if (result == nullptr || result->token != layoutOperationToken_) return;
+
+    if (layoutOperation_ == LayoutOperation::Restore) {
+        if (!result->succeeded) {
+            layoutOperation_ = LayoutOperation::None;
+            MessageDialog::Show(
+                instance_, hwnd_, result->message.c_str(),
+                L"布局方案", MB_OK | MB_ICONWARNING);
+            return;
+        }
+        if (PublishLayoutConfig(
+                result->candidate,
+                result->expectedMonitors,
+                result->desktopSnapshotRevision,
+                true)) {
+            layoutOperation_ = LayoutOperation::None;
+            if (result->legacyMainOnly || result->recoveredFromBackup) {
+                std::wstring message = result->message;
+                if (result->recoveredFromBackup) {
+                    message += L" 已从安全备份读取布局方案。";
+                }
+                ShowNonBlockingNotice(L"布局方案", message);
+            }
+            return;
+        }
+
+        (void)PublishLayoutConfig(
+            result->before,
+            CurrentLayoutMonitors(),
+            desktopSnapshot_ == nullptr
+                ? 0 : desktopSnapshot_->Revision(),
+            false);
+        layoutOperation_ = LayoutOperation::Rollback;
+        const std::uint64_t rollbackToken = ++layoutOperationToken_;
+        if (!configStore_.RollbackLayoutRestoreAsync(
+                result->before,
+                hwnd_,
+                kLayoutRestoreCompleteMessage,
+                rollbackToken)) {
+            layoutOperation_ = LayoutOperation::None;
+            MessageDialog::Show(
+                instance_, hwnd_,
+                L"布局窗口无法统一发布，且旧配置回滚任务未能进入写入队列；请重新启动 Lattice 读取磁盘状态。",
+                L"布局方案", MB_OK | MB_ICONERROR);
+        }
+        return;
+    }
+
+    if (layoutOperation_ == LayoutOperation::Rollback) {
+        layoutOperation_ = LayoutOperation::None;
+        if (result->succeeded) {
+            (void)PublishLayoutConfig(
+                result->candidate,
+                CurrentLayoutMonitors(),
+                desktopSnapshot_ == nullptr
+                    ? 0 : desktopSnapshot_->Revision(),
+                false);
+        }
+        MessageDialog::Show(
+            instance_, hwnd_, result->message.c_str(),
+            L"布局方案",
+            MB_OK | (result->succeeded ? MB_ICONWARNING : MB_ICONERROR));
+    }
+}
+
 void MainWindow::ExportConfig() {
     SaveOrganizerConfig();
     wchar_t path[MAX_PATH] = L"Lattice-config.ini";
@@ -2879,12 +4323,6 @@ void MainWindow::ImportConfig() {
         return;
     }
 
-    for (auto& widget : widgetWindows_) {
-        if (widget != nullptr) {
-            widget->Close();
-        }
-    }
-    widgetWindows_.clear();
     if (!configStore_.ImportAppConfig(path)) {
         MessageDialog::Show(instance_, hwnd_, L"配置文件无效或无法写入，当前配置未改变。", L"导入配置", MB_OK | MB_ICONWARNING);
         return;
@@ -2912,13 +4350,11 @@ void MainWindow::ShowTrayMenu() {
     if (menu == nullptr) {
         return;
     }
-    bool anyVisible = IsWindowVisible(hwnd_) != FALSE;
-    for (const auto& widget : widgetWindows_) {
-        if (widget != nullptr && widget->IsVisible()) {
-            anyVisible = true;
-            break;
-        }
-    }
+    bool anyVisible = IsWindowVisible(hwnd_) != FALSE ||
+        (desktopSurface_ != nullptr &&
+         desktopSurface_->Window() != nullptr &&
+         IsWindowVisible(desktopSurface_->Window()) != FALSE &&
+         !hostedWidgetCategoryIds_.empty());
     AppendMenuW(menu, MF_STRING, kTrayToggleVisibleCommand, anyVisible ? L"隐藏全部格子" : L"显示全部格子");
     AppendMenuW(menu, MF_STRING, kTrayToggleLockCommand, windowConfig_.locked ? L"解除布局锁定" : L"锁定全部布局");
     AppendMenuW(menu, MF_STRING, kTrayRefreshCommand, L"刷新桌面项目");
@@ -3022,6 +4458,10 @@ void MainWindow::DockTileWindowToWorkArea(bool rememberRestore) {
 
 void MainWindow::LoadOrganizerConfig() {
     const AppConfig appConfig = configStore_.LoadAppConfig();
+    ApplyOrganizerConfig(appConfig);
+}
+
+void MainWindow::ApplyOrganizerConfig(const AppConfig& appConfig) {
     organizerConfig_.window = appConfig.window;
     organizerConfig_.window.viewMode = 1;
     organizerConfig_.settings = appConfig.settings;
@@ -3715,7 +5155,17 @@ void MainWindow::SaveWindowConfig() {
     SaveOrganizerConfig();
 }
 
-bool MainWindow::SaveOrganizerConfig() {
+bool MainWindow::SaveOrganizerConfig(
+    const DesktopPlacementConfig* displayPlacement) {
+    if (hostedCollectionsPending_ != 0) {
+        if (!hostedCollectionBusyNotified_) {
+            ShowNonBlockingNotice(
+                L"正在收纳桌面项目",
+                L"收纳完成后再保存设置或布局，避免覆盖正在写入的显示归属。");
+            hostedCollectionBusyNotified_ = true;
+        }
+        return false;
+    }
     AppConfig appConfig = configStore_.LoadAppConfig();
     appConfig.settings = organizerConfig_.settings;
     appConfig.window = windowConfig_;
@@ -3757,6 +5207,22 @@ bool MainWindow::SaveOrganizerConfig() {
             placement->y = item.desktopY;
         }
     }
+    if (displayPlacement != nullptr) {
+        auto existing = std::find_if(
+            appConfig.desktopDisplayLayout.begin(),
+            appConfig.desktopDisplayLayout.end(),
+            [&](const DesktopPlacementConfig& value) {
+                return CompareStringOrdinal(
+                           value.path.c_str(), -1,
+                           displayPlacement->path.c_str(), -1,
+                           TRUE) == CSTR_EQUAL;
+            });
+        if (existing == appConfig.desktopDisplayLayout.end()) {
+            appConfig.desktopDisplayLayout.push_back(*displayPlacement);
+        } else {
+            *existing = *displayPlacement;
+        }
+    }
     appConfig.uncategorizedItemIds = organizerConfig_.uncategorizedItemIds;
     appConfig.categories.clear();
     for (const Category& category : organizerConfig_.categories) {
@@ -3774,11 +5240,7 @@ bool MainWindow::SaveOrganizerConfig() {
     if (!configStore_.SaveAppConfig(appConfig)) {
         return false;
     }
-    for (auto& widget : widgetWindows_) {
-        if (widget != nullptr && widget->IsOpen()) {
-            widget->RefreshFromConfig();
-        }
-    }
+    RepublishDesktopSnapshotMembership();
     return true;
 }
 
@@ -3819,28 +5281,16 @@ int MainWindow::HoverButton() const {
 void MainWindow::RefreshCurrentItems() {
     std::vector<DesktopItem> nextItems;
     if (searchScope_ == 1) {
-        nextItems = items_;
+        nextItems = DesktopItems();
     } else if (searchScope_ == 2 || organizerConfig_.currentCategoryId == kUncategorizedCategoryId) {
-        for (const std::wstring& itemId : organizerConfig_.uncategorizedItemIds) {
-            const auto found = std::find_if(items_.begin(), items_.end(), [&](const DesktopItem& item) {
-                return item.id == itemId;
-            });
-            if (found != items_.end()) {
-                nextItems.push_back(*found);
-            }
-        }
+        nextItems = desktopSnapshot_ == nullptr
+            ? std::vector<DesktopItem>{}
+            : desktopSnapshot_->CopyItemsForCategory(kUncategorizedCategoryId);
     } else {
-        const Category* category = FindCategory(organizerConfig_.currentCategoryId);
-        if (category != nullptr) {
-            for (const std::wstring& itemId : category->itemIds) {
-                const auto found = std::find_if(items_.begin(), items_.end(), [&](const DesktopItem& item) {
-                    return item.id == itemId;
-                });
-                if (found != items_.end()) {
-                    nextItems.push_back(*found);
-                }
-            }
-        }
+        nextItems = desktopSnapshot_ == nullptr
+            ? std::vector<DesktopItem>{}
+            : desktopSnapshot_->CopyItemsForCategory(
+                  organizerConfig_.currentCategoryId);
     }
     nextItems.erase(
         std::remove_if(nextItems.begin(), nextItems.end(), [&](const DesktopItem& item) {
@@ -3867,11 +5317,10 @@ void MainWindow::RefreshTileViews() {
         std::wstring id;
         std::wstring name;
         std::wstring color;
-        const std::vector<std::wstring>* itemIds = nullptr;
     };
     std::vector<Source> sources;
     if (searchScope_ != 2) {
-        sources.push_back(Source{kUncategorizedCategoryId, L"\u672a\u5206\u7c7b", L"#2D8CFF", &organizerConfig_.uncategorizedItemIds});
+        sources.push_back(Source{kUncategorizedCategoryId, L"\u672a\u5206\u7c7b", L"#2D8CFF"});
     }
     if (searchScope_ != 2) {
         for (size_t categoryIndex = 0; categoryIndex < organizerConfig_.categories.size(); ++categoryIndex) {
@@ -3879,12 +5328,11 @@ void MainWindow::RefreshTileViews() {
             sources.push_back(Source{
                 category.id,
                 category.name,
-                EffectiveCategoryColor(category.color, categoryIndex),
-                &category.itemIds});
+                EffectiveCategoryColor(category.color, categoryIndex)});
         }
     }
     if (searchScope_ == 2) {
-        sources.push_back(Source{kUncategorizedCategoryId, L"\u672a\u5206\u7c7b", L"#2D8CFF", &organizerConfig_.uncategorizedItemIds});
+        sources.push_back(Source{kUncategorizedCategoryId, L"\u672a\u5206\u7c7b", L"#2D8CFF"});
     }
 
     const RECT content = GridBounds();
@@ -3905,17 +5353,14 @@ void MainWindow::RefreshTileViews() {
         }
         const int left = content.left;
         const int top = cursorTop;
-        std::vector<DesktopItem> viewItems;
-        if (source.itemIds != nullptr) {
-            for (const std::wstring& itemId : *source.itemIds) {
-                const auto found = std::find_if(items_.begin(), items_.end(), [&](const DesktopItem& item) {
-                    return item.id == itemId && MatchesSearch(item);
-                });
-                if (found != items_.end()) {
-                    viewItems.push_back(*found);
-                }
-            }
-        }
+        std::vector<DesktopItem> viewItems = desktopSnapshot_ == nullptr
+            ? std::vector<DesktopItem>{}
+            : desktopSnapshot_->CopyItemsForCategory(source.id);
+        viewItems.erase(
+            std::remove_if(
+                viewItems.begin(), viewItems.end(),
+                [&](const DesktopItem& item) { return !MatchesSearch(item); }),
+            viewItems.end());
         view.itemCount = viewItems.size();
         const int tileHeight = view.collapsed ? kTileHeaderHeight : kTileExpandedHeight;
         view.bounds = RECT{left, top, left + tileWidth, top + tileHeight};
@@ -3978,26 +5423,28 @@ void MainWindow::OpenCurrentCategoryWidget() {
         return;
     }
 
-    for (auto it = widgetWindows_.begin(); it != widgetWindows_.end();) {
-        if (*it == nullptr || !(*it)->IsOpen()) {
-            it = widgetWindows_.erase(it);
-            continue;
-        }
-        if ((*it)->IsForCategory(categoryId)) {
-            (*it)->Show(SW_SHOWNOACTIVATE);
+    const auto opened = std::find(
+            hostedWidgetCategoryIds_.begin(),
+            hostedWidgetCategoryIds_.end(),
+            categoryId);
+    if (opened == hostedWidgetCategoryIds_.end()) {
+        hostedWidgetCategoryIds_.push_back(categoryId);
+    } else {
+        std::rotate(
+            opened, opened + 1,
+            hostedWidgetCategoryIds_.end());
+    }
+    if (desktopSurface_ == nullptr ||
+        desktopSurface_->Window() == nullptr) {
+        std::wstring errorMessage;
+        if (!EnableDesktopDisplayTakeover(errorMessage)) {
+            ShowNonBlockingNotice(L"Lattice 桌面显示", errorMessage);
             return;
         }
-        ++it;
     }
-
-    const int spawnOffset = static_cast<int>(widgetWindows_.size()) * 36;
-    auto widget = std::make_unique<WidgetWindow>(instance_, hwnd_, categoryId, spawnOffset);
-    ConfigureWidgetShellDrop(*widget);
-    if (!widget->Create()) {
-        return;
-    }
-    widget->Show(SW_SHOWNOACTIVATE);
-    widgetWindows_.push_back(std::move(widget));
+    organizerConfig_.settings.lastVisible = true;
+    SyncHostedWidgets();
+    desktopSurface_->Show();
 }
 
 void MainWindow::OpenAllCategoryWidgets() {
@@ -4009,34 +5456,18 @@ void MainWindow::OpenAllCategoryWidgets() {
         categoryIds.push_back(category.id);
     }
 
-    for (size_t index = 0; index < categoryIds.size(); ++index) {
-        const std::wstring& categoryId = categoryIds[index];
-        bool alreadyOpen = false;
-        for (auto it = widgetWindows_.begin(); it != widgetWindows_.end();) {
-            if (*it == nullptr || !(*it)->IsOpen()) {
-                it = widgetWindows_.erase(it);
-                continue;
+    std::stable_partition(
+        categoryIds.begin(), categoryIds.end(),
+        [&](const std::wstring& categoryId) {
+            if (categoryId == kUncategorizedCategoryId) {
+                return organizerConfig_.window.collapsed;
             }
-            if ((*it)->IsForCategory(categoryId)) {
-                (*it)->SetVisible(true);
-                alreadyOpen = true;
-            }
-            ++it;
-        }
-        if (alreadyOpen) {
-            continue;
-        }
-        auto widget = std::make_unique<WidgetWindow>(
-            instance_,
-            hwnd_,
-            categoryId,
-            static_cast<int>(index) * 36);
-        ConfigureWidgetShellDrop(*widget);
-        if (widget->Create()) {
-            widget->Show(SW_SHOWNOACTIVATE);
-            widgetWindows_.push_back(std::move(widget));
-        }
-    }
+            const Category* category = FindCategory(categoryId);
+            return category != nullptr && category->layout.collapsed;
+        });
+
+    hostedWidgetCategoryIds_ = std::move(categoryIds);
+    SyncHostedWidgets();
 }
 
 void MainWindow::MoveCurrentCategory(int delta) {
@@ -4159,31 +5590,84 @@ void MainWindow::ImportCurrentCategory() {
     category->layout = imported.layout;
     organizerConfig_.window = windowConfig_;
     SaveOrganizerConfig();
-    LoadDesktopItems();
     InvalidateRect(hwnd_, nullptr, FALSE);
 }
 
 void MainWindow::SaveLayoutProfile() {
+    if (layoutOperation_ != LayoutOperation::None) {
+        MessageDialog::Show(
+            instance_, hwnd_,
+            L"布局方案正在恢复，请稍后再保存。",
+            L"布局方案", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
     SaveWindowConfig();
-    if (!configStore_.SaveLayoutProfile(windowConfig_)) {
+    if (!ConfigStore::DrainPendingWrites(5000)) {
+        MessageDialog::Show(
+            instance_, hwnd_,
+            L"最新布局尚未完整写入，未生成布局方案。",
+            L"布局方案", MB_OK | MB_ICONWARNING);
+        return;
+    }
+    const std::vector<LayoutMonitorSnapshot> monitors =
+        CurrentLayoutMonitors();
+    if (monitors.empty()) {
+        MessageDialog::Show(
+            instance_, hwnd_,
+            L"无法读取当前显示器布局，未生成布局方案。",
+            L"布局方案", MB_OK | MB_ICONWARNING);
+        return;
+    }
+    const LayoutSnapshot snapshot = BuildLayoutSnapshot(
+        configStore_.LoadAppConfig(), monitors, CurrentFileTime());
+    if (!configStore_.SaveLayoutProfile(snapshot)) {
         MessageDialog::Show(instance_, hwnd_, L"\u5e03\u5c40\u65b9\u6848\u4fdd\u5b58\u5931\u8d25\u3002", L"\u5e03\u5c40\u65b9\u6848", MB_OK | MB_ICONWARNING);
     }
 }
 
 void MainWindow::RestoreLayoutProfile() {
-    WindowConfig profile;
-    if (!configStore_.LoadLayoutProfile(profile)) {
+    if (layoutOperation_ != LayoutOperation::None) {
+        MessageDialog::Show(
+            instance_, hwnd_,
+            L"布局方案正在恢复，请稍后再试。",
+            L"布局方案", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+    LayoutSnapshot profile;
+    bool recoveredFromBackup = false;
+    if (!configStore_.LoadLayoutProfile(
+            profile, &recoveredFromBackup)) {
         MessageDialog::Show(instance_, hwnd_, L"\u5c1a\u672a\u4fdd\u5b58\u5e03\u5c40\u65b9\u6848\u3002", L"\u5e03\u5c40\u65b9\u6848", MB_OK | MB_ICONINFORMATION);
         return;
     }
-    windowConfig_ = profile;
-    organizerConfig_.window = windowConfig_;
-    SetLayeredWindowAttributes(hwnd_, 0, static_cast<BYTE>(windowConfig_.opacity), LWA_ALPHA);
-    SetWindowPos(hwnd_, nullptr, windowConfig_.x, windowConfig_.y, windowConfig_.width, windowConfig_.height, SWP_NOZORDER | SWP_NOACTIVATE);
-    EnsureWindowVisible();
-    RefreshCurrentItems();
-    SaveOrganizerConfig();
-    InvalidateRect(hwnd_, nullptr, FALSE);
+    std::vector<LayoutMonitorSnapshot> monitors = CurrentLayoutMonitors();
+    if (monitors.empty() || desktopSnapshot_ == nullptr) {
+        MessageDialog::Show(
+            instance_, hwnd_,
+            L"当前显示器或桌面快照尚未就绪，未恢复任何布局。",
+            L"布局方案", MB_OK | MB_ICONWARNING);
+        return;
+    }
+    LayoutRestoreRequest request;
+    request.snapshot = std::move(profile);
+    request.currentMonitors = std::move(monitors);
+    request.identities = CurrentLayoutIdentityIndex();
+    request.desktopSnapshotRevision = desktopSnapshot_->Revision();
+    request.recoveredFromBackup = recoveredFromBackup;
+
+    layoutOperation_ = LayoutOperation::Restore;
+    const std::uint64_t token = ++layoutOperationToken_;
+    if (!configStore_.RestoreLayoutAsync(
+            request,
+            hwnd_,
+            kLayoutRestoreCompleteMessage,
+            token)) {
+        layoutOperation_ = LayoutOperation::None;
+        MessageDialog::Show(
+            instance_, hwnd_,
+            L"布局恢复任务未能进入配置写入队列，当前布局未改变。",
+            L"布局方案", MB_OK | MB_ICONWARNING);
+    }
 }
 
 void MainWindow::ResetLayout() {
@@ -4215,11 +5699,8 @@ void MainWindow::SetViewMode(int viewMode) {
         windowConfig_ = tileRestoreConfig_;
         windowConfig_.viewMode = nextViewMode;
         hasTileRestoreConfig_ = false;
-        for (auto& widget : widgetWindows_) {
-            if (widget != nullptr && widget->IsOpen()) {
-                widget->SetVisible(false);
-            }
-        }
+        hostedWidgetCategoryIds_.clear();
+        SyncHostedWidgets();
         SetWindowPos(
             hwnd_,
             nullptr,
@@ -4234,11 +5715,8 @@ void MainWindow::SetViewMode(int viewMode) {
             OpenAllCategoryWidgets();
             ShowWindow(hwnd_, SW_HIDE);
         } else {
-            for (auto& widget : widgetWindows_) {
-                if (widget != nullptr && widget->IsOpen()) {
-                    widget->SetVisible(false);
-                }
-            }
+            hostedWidgetCategoryIds_.clear();
+            SyncHostedWidgets();
             ShowWindow(hwnd_, SW_SHOWNOACTIVATE);
         }
     }
@@ -4269,7 +5747,7 @@ void MainWindow::RenameItemDisplayName(const std::wstring& itemId) {
             break;
         }
     }
-    DesktopItem* item = FindItem(itemId);
+    const DesktopItem* item = FindItem(itemId);
     if (registered == nullptr || item == nullptr) {
         return;
     }
@@ -4283,9 +5761,8 @@ void MainWindow::RenameItemDisplayName(const std::wstring& itemId) {
         return;
     }
     registered->displayName = *name;
-    item->displayName = *name;
     SaveOrganizerConfig();
-    RefreshCurrentItems();
+    LoadDesktopItems();
     InvalidateRect(hwnd_, nullptr, FALSE);
 }
 
@@ -4293,11 +5770,6 @@ void MainWindow::RefreshIconCache() {
     iconCache_.Clear();
     if (desktopSurface_ != nullptr) {
         desktopSurface_->RefreshIconCache();
-    }
-    for (auto& widget : widgetWindows_) {
-        if (widget != nullptr && widget->IsOpen()) {
-            widget->RefreshIconCache();
-        }
     }
     InvalidateRect(hwnd_, nullptr, FALSE);
 }
@@ -4381,7 +5853,7 @@ void MainWindow::ShowIconMenu(POINT screenPoint, int iconIndex) {
 }
 
 void MainWindow::ShowItemMenu(POINT screenPoint, const std::wstring& itemId) {
-    DesktopItem* item = FindItem(itemId);
+    const DesktopItem* item = FindItem(itemId);
     if (item == nullptr) {
         return;
     }
@@ -4571,16 +6043,7 @@ void MainWindow::DeleteCurrentCategory() {
         MessageDialog::Show(instance_, hwnd_, storageError.c_str(), L"未能删除分类", MB_OK | MB_ICONWARNING);
         return;
     }
-    for (auto& widget : widgetWindows_) {
-        if (widget != nullptr && widget->IsForCategory(id)) {
-            widget->Close();
-        }
-    }
-    widgetWindows_.erase(
-        std::remove_if(widgetWindows_.begin(), widgetWindows_.end(), [&](const auto& widget) {
-            return widget == nullptr || widget->IsForCategory(id);
-        }),
-        widgetWindows_.end());
+    std::erase(hostedWidgetCategoryIds_, id);
     organizerConfig_.categories.erase(
         std::remove_if(organizerConfig_.categories.begin(), organizerConfig_.categories.end(), [&](const Category& category) {
             return category.id == id;
@@ -4622,12 +6085,11 @@ void MainWindow::ToggleAllLocked() {
     const bool locked = !windowConfig_.locked;
     windowConfig_.locked = locked;
     organizerConfig_.window = windowConfig_;
-    SaveOrganizerConfig();
-    for (auto& widget : widgetWindows_) {
-        if (widget != nullptr && widget->IsOpen()) {
-            widget->SetLocked(locked);
-        }
+    for (Category& category : organizerConfig_.categories) {
+        category.layout.locked = locked;
     }
+    SaveOrganizerConfig();
+    SyncHostedWidgets();
     InvalidateRect(hwnd_, nullptr, FALSE);
 }
 
@@ -4651,18 +6113,10 @@ void MainWindow::SetDensity(int density) {
 }
 
 void MainWindow::ImportUnassignedDesktopItems() {
-    DesktopScanner scanner;
-    items_ = scanner.Scan();
-    for (const RegisteredItem& registeredItem : organizerConfig_.items) {
-        scanner.MergeRegisteredItem(
-            items_,
-            registeredItem.id,
-            registeredItem.path,
-            registeredItem.displayName);
-    }
+    LoadDesktopItems();
 
     std::vector<std::wstring> paths;
-    for (const DesktopItem& item : items_) {
+    for (const DesktopItem& item : DesktopItems()) {
         if (!IsItemAssigned(item.id)) {
             paths.push_back(item.path);
         }
@@ -4769,7 +6223,7 @@ void MainWindow::ReorderItemInCategory(
 }
 
 void MainWindow::MoveItemToCategory(const std::wstring& itemId, const std::wstring& categoryId) {
-    DesktopItem* item = FindItem(itemId);
+    const DesktopItem* item = FindItem(itemId);
     if (item == nullptr || categoryId.empty()) {
         return;
     }
@@ -4890,7 +6344,6 @@ void MainWindow::MoveItemToCategory(const std::wstring& itemId, const std::wstri
         MessageDialog::Show(instance_, hwnd_, errorMessage.c_str(), L"更改桌面项目归属失败", MB_OK | MB_ICONERROR);
         return;
     }
-    LoadDesktopItems();
     InvalidateRect(hwnd_, nullptr, FALSE);
 }
 
@@ -4903,16 +6356,34 @@ bool MainWindow::MoveItemOut(
     bool showError,
     const POINT* dropScreenPoint,
     std::uint64_t dragGhostGeneration) {
-    DesktopItem* item = FindItem(itemId);
+    const DesktopItem* item = FindItem(itemId);
     if (item == nullptr) {
         return false;
     }
     const std::wstring sourcePath = item->path;
+    DesktopPlacementConfig displayPlacement;
+    const bool hasDropPlacement =
+        dropScreenPoint != nullptr &&
+        shortcutStore_.IsDesktopPath(sourcePath);
+    if (hasDropPlacement) {
+        const HWND listView = desktopSurface_ == nullptr
+            ? nullptr
+            : desktopSurface_->Snapshot().listViewWindow;
+        if (listView == nullptr || IsWindow(listView) == FALSE) {
+            DragGhostWindow::Instance().EndIfGeneration(
+                dragGhostGeneration);
+            return false;
+        }
+        POINT viewPoint = *dropScreenPoint;
+        if (ScreenToClient(listView, &viewPoint) == FALSE) {
+            DragGhostWindow::Instance().EndIfGeneration(
+                dragGhostGeneration);
+            return false;
+        }
+        displayPlacement = DesktopPlacementConfig{
+            sourcePath, viewPoint.x, viewPoint.y};
+    }
     const OrganizerConfig originalConfig = organizerConfig_;
-    const auto registeredBeforeRemoval = std::find_if(originalConfig.items.begin(), originalConfig.items.end(), [&](const RegisteredItem& value) {
-        return value.id == itemId;
-    });
-    const RegisteredItem placement = registeredBeforeRemoval == originalConfig.items.end() ? RegisteredItem{} : *registeredBeforeRemoval;
     const auto persistRemoval = [&]() {
         organizerConfig_.uncategorizedItemIds.erase(
             std::remove(organizerConfig_.uncategorizedItemIds.begin(), organizerConfig_.uncategorizedItemIds.end(), itemId),
@@ -4927,7 +6398,8 @@ bool MainWindow::MoveItemOut(
                 return value.id == itemId;
             }),
             organizerConfig_.items.end());
-        if (!SaveOrganizerConfig()) {
+        if (!SaveOrganizerConfig(
+                hasDropPlacement ? &displayPlacement : nullptr)) {
             organizerConfig_ = originalConfig;
             return false;
         }
@@ -4935,7 +6407,6 @@ bool MainWindow::MoveItemOut(
     };
 
     bool moved = false;
-    std::wstring desktopPath = sourcePath;
     std::wstring errorMessage;
     if (shortcutStore_.IsManagedPath(sourcePath)) {
         errorMessage =
@@ -4955,50 +6426,17 @@ bool MainWindow::MoveItemOut(
         }
         return false;
     }
-    const bool canPlaceOnDesktop = shortcutStore_.IsDesktopPath(desktopPath);
-    if (dropScreenPoint != nullptr && canPlaceOnDesktop) {
-        DesktopPlacementRequest request;
-        request.path = desktopPath;
-        request.screenPoint = *dropScreenPoint;
-        request.dragGhostGeneration = dragGhostGeneration;
-        request.showError = showError;
-        request.sourceWindow = hwnd_;
-        if (!QueueDesktopPlacement(request)) {
-            DesktopLayout desktopLayout;
-            POINT restoredPoint{};
-            std::wstring restoreError;
-            const bool restored = desktopLayout.RestoreScreenPosition(
-                desktopPath,
-                *dropScreenPoint,
-                restoredPoint,
-                restoreError);
-            DragGhostWindow::Instance().EndIfGeneration(dragGhostGeneration);
-            if (restored) {
-                SaveDesktopPlacement(
-                    desktopPath,
-                    restoredPoint,
-                    showError,
-                    hwnd_,
-                    true);
-            } else if (showError) {
-                MessageDialog::Show(
-                    instance_,
-                    hwnd_,
-                    restoreError.c_str(),
-                    L"桌面坐标恢复",
-                    MB_OK | MB_ICONWARNING);
-            }
-        }
-    } else if (dropScreenPoint != nullptr) {
+    if (dropScreenPoint != nullptr) {
         DragGhostWindow::Instance().EndIfGeneration(dragGhostGeneration);
     }
     if (dropScreenPoint != nullptr) {
-        items_.erase(
-            std::remove_if(items_.begin(), items_.end(), [&](const DesktopItem& value) {
-                return value.id == itemId;
-            }),
-            items_.end());
-        RefreshCurrentItems();
+        currentItems_.erase(
+            std::remove_if(
+                currentItems_.begin(), currentItems_.end(),
+                [&](const DesktopItem& value) { return value.id == itemId; }),
+            currentItems_.end());
+        iconGrid_.SetItems(currentItems_);
+        RefreshTileViews();
     } else {
         LoadDesktopItems();
     }
@@ -5018,18 +6456,10 @@ bool MainWindow::ImportPathToCategory(
     DesktopItem item = scanner.CreateItemFromPath(path, false);
     const std::wstring sourceDerivedId = item.id;
     std::wstring sourceVisibleId = sourceDerivedId;
-    const auto visibleItem = std::find_if(
-        items_.begin(),
-        items_.end(),
-        [&](const DesktopItem& value) {
-            return CompareStringOrdinal(
-                       value.path.c_str(),
-                       -1,
-                       item.path.c_str(),
-                       -1,
-                       TRUE) == CSTR_EQUAL;
-        });
-    if (visibleItem != items_.end()) {
+    const DesktopItem* visibleItem = desktopSnapshot_ == nullptr
+        ? nullptr
+        : desktopSnapshot_->FindUniqueByPath(item.path);
+    if (visibleItem != nullptr) {
         sourceVisibleId = visibleItem->id;
         item.displayName = visibleItem->displayName;
         item.targetPath = visibleItem->targetPath;
@@ -5187,13 +6617,11 @@ bool MainWindow::ImportPathToCategory(
     return true;
 }
 
-DesktopItem* MainWindow::FindItem(const std::wstring& itemId) {
-    for (DesktopItem& item : items_) {
-        if (item.id == itemId) {
-            return &item;
-        }
-    }
-    return nullptr;
+const DesktopItem* MainWindow::FindItem(
+    const std::wstring& itemId) const {
+    return desktopSnapshot_ == nullptr
+        ? nullptr
+        : desktopSnapshot_->FindUniqueById(itemId);
 }
 
 bool MainWindow::IsItemAssigned(const std::wstring& itemId) const {

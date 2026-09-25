@@ -159,6 +159,10 @@ struct AutoOrganizeTransactionResult {
     std::wstring message;
 };
 
+struct LayoutSnapshot;
+struct LayoutRestoreRequest;
+struct LayoutRestoreResult;
+
 std::wstring CategoryStorageFolder(const AppConfig& config, const std::wstring& categoryId);
 inline ConfiguredItemMembership FindConfiguredItemMembership(
     const AppConfig& config,
@@ -202,8 +206,20 @@ public:
     bool ImportAppConfig(const std::wstring& path) const;
     bool ExportCategoryConfig(const CategoryConfig& category, const std::wstring& path) const;
     bool ImportCategoryConfig(const std::wstring& path, CategoryConfig& category) const;
-    bool SaveLayoutProfile(const WindowConfig& config) const;
-    bool LoadLayoutProfile(WindowConfig& config) const;
+    bool SaveLayoutProfile(const LayoutSnapshot& snapshot) const;
+    bool LoadLayoutProfile(
+        LayoutSnapshot& snapshot,
+        bool* recoveredFromBackup = nullptr) const;
+    bool RestoreLayoutAsync(
+        const LayoutRestoreRequest& request,
+        HWND notificationWindow,
+        UINT notificationMessage,
+        std::uint64_t token) const;
+    bool RollbackLayoutRestoreAsync(
+        const AppConfig& before,
+        HWND notificationWindow,
+        UINT notificationMessage,
+        std::uint64_t token) const;
     std::wstring ConfigPath() const { return configPath_; }
 
 private:

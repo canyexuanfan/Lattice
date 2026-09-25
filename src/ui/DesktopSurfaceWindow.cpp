@@ -15,7 +15,10 @@
 #include <set>
 
 #include "shell/ShellDragDrop.h"
+#include "shell/ShellDropTarget.h"
+#include "ui/DragGhostWindow.h"
 #include "ui/MessageDialog.h"
+#include "ui/WidgetAlignment.h"
 
 namespace {
 
@@ -133,6 +136,7 @@ public:
         }
         ResetInternalItemTarget(true);
         internalDataObject_.Reset();
+        ResetExternalRoute(true);
         internalDrag_ = owner_ != nullptr && owner_->internalDragActive_;
 #ifndef NDEBUG
         if (internalDrag_) {
@@ -147,12 +151,13 @@ public:
             internalDataObject_ = dataObject;
             routedResult = RouteInternalDrag(
                 dataObject, keyState, point, effect);
-        } else if (explorerTarget_ != nullptr) {
-            routedResult = explorerTarget_->DragEnter(
-                dataObject, keyState, point, effect);
         } else {
-            *effect = DROPEFFECT_NONE;
-            routedResult = E_FAIL;
+            externalDataObject_ = dataObject;
+            externalAllowedEffects_ = *effect &
+                (DROPEFFECT_COPY | DROPEFFECT_MOVE | DROPEFFECT_LINK);
+            externalPaths_ = ExtractShellDropPaths(dataObject);
+            routedResult = RouteExternalDrag(
+                dataObject, keyState, point, effect);
         }
         POINT screenPoint{point.x, point.y};
         GetPhysicalCursorPos(&screenPoint);
@@ -177,12 +182,9 @@ public:
         if (internalDrag_) {
             routedResult = RouteInternalDrag(
                 internalDataObject_.Get(), keyState, point, effect);
-        } else if (explorerTarget_ != nullptr) {
-            routedResult = explorerTarget_->DragOver(
-                keyState, point, effect);
         } else {
-            *effect = DROPEFFECT_NONE;
-            routedResult = E_FAIL;
+            routedResult = RouteExternalDrag(
+                externalDataObject_.Get(), keyState, point, effect);
         }
         POINT screenPoint{point.x, point.y};
         GetPhysicalCursorPos(&screenPoint);
@@ -199,14 +201,14 @@ public:
             ResetInternalItemTarget(true);
             internalDataObject_.Reset();
             internalAllowedEffects_ = DROPEFFECT_NONE;
+        } else {
+            ResetExternalRoute(true);
+            externalDataObject_.Reset();
+            externalPaths_.clear();
+            externalAllowedEffects_ = DROPEFFECT_NONE;
         }
         if (dragImageHelper_ != nullptr) {
             dragImageHelper_->DragLeave();
-        }
-        if (!wasInternal) {
-            return explorerTarget_ != nullptr
-                ? explorerTarget_->DragLeave()
-                : E_FAIL;
         }
         return S_OK;
     }
@@ -220,22 +222,70 @@ public:
             return E_POINTER;
         }
         POINT screenPoint{point.x, point.y};
-        GetPhysicalCursorPos(&screenPoint);
+        POINT imagePoint = screenPoint;
+        GetPhysicalCursorPos(&imagePoint);
         if (!internalDrag_) {
+            if (dataObject != externalDataObject_.Get()) {
+                ResetExternalRoute(true);
+                externalDataObject_ = dataObject;
+                externalPaths_ = ExtractShellDropPaths(dataObject);
+            }
+            const HRESULT routedResult = RouteExternalDrag(
+                dataObject, keyState, point, effect);
             if (dragImageHelper_ != nullptr) {
                 dragImageHelper_->Drop(
-                    dataObject, &screenPoint, *effect);
+                    dataObject, &imagePoint, *effect);
             }
-            return explorerTarget_ != nullptr
-                ? explorerTarget_->Drop(dataObject, keyState, point, effect)
-                : E_FAIL;
+            if (FAILED(routedResult)) {
+                *effect = DROPEFFECT_NONE;
+                ResetExternalRoute(false);
+                return routedResult;
+            }
+            HRESULT result = S_OK;
+            if (externalRoute_ == ExternalRoute::Explorer &&
+                explorerTarget_ != nullptr) {
+                result = explorerTarget_->Drop(
+                    dataObject, keyState, point, effect);
+            } else if (externalRoute_ == ExternalRoute::HostedIcon) {
+                DWORD targetEffect = externalItemEffect_;
+                if (externalItemTarget_ != nullptr &&
+                    targetEffect != DROPEFFECT_NONE) {
+                    result = externalItemTarget_->Drop(
+                        dataObject, keyState, point, &targetEffect);
+                }
+                *effect = SUCCEEDED(result)
+                    ? targetEffect : DROPEFFECT_NONE;
+            } else if (externalRoute_ == ExternalRoute::HostedBlank) {
+                POINT clientPoint = screenPoint;
+                ScreenToClient(owner_->Window(), &clientPoint);
+                const auto& hosted = owner_->hostedWidgets_[
+                    static_cast<size_t>(externalWidgetIndex_)];
+                const WidgetViewAction action =
+                    hosted->view.BuildDropAction(clientPoint, {});
+                HostedWidgetCommand command;
+                command.type = HostedWidgetCommandType::CollectPaths;
+                command.categoryId = hosted->descriptor.categoryId;
+                command.paths = externalPaths_;
+                command.insertionIndex = action.insertionIndex;
+                command.screenPoint = screenPoint;
+                if (action.type == WidgetViewActionType::ReorderSelection &&
+                    owner_->hostedWidgetCommandHandler_ != nullptr) {
+                    owner_->hostedWidgetCommandHandler_(command);
+                }
+                // Membership changes only; no source file was moved.
+                *effect = DROPEFFECT_NONE;
+            } else {
+                *effect = DROPEFFECT_NONE;
+            }
+            ResetExternalRoute(false);
+            return result;
         }
         HRESULT routedResult = RouteInternalDrag(
             dataObject, keyState, point, effect);
         internalDrag_ = false;
         if (dragImageHelper_ != nullptr) {
             dragImageHelper_->Drop(
-                dataObject, &screenPoint, *effect);
+                dataObject, &imagePoint, *effect);
         }
         if (internalItemHit_) {
             DWORD targetEffect = internalItemEffect_;
@@ -267,8 +317,34 @@ public:
                 DesktopSurfaceWindow::InternalDropStage::DropReceived;
         }
 #endif
-        const bool positioned = owner_ != nullptr &&
-            owner_->CommitInternalDesktopDrop(screenPoint);
+        bool positioned = false;
+        if (owner_ != nullptr) {
+            POINT clientPoint = screenPoint;
+            ScreenToClient(owner_->Window(), &clientPoint);
+            const int hostedIndex = owner_->HostedWidgetIndexAt(clientPoint);
+            if (hostedIndex >= 0) {
+                const auto& hosted = owner_->hostedWidgets_[
+                    static_cast<size_t>(hostedIndex)];
+                const WidgetViewAction action =
+                    hosted->view.BuildDropAction(clientPoint, {});
+                if (action.type ==
+                        WidgetViewActionType::ReorderSelection &&
+                    owner_->hostedWidgetCommandHandler_ != nullptr) {
+                    HostedWidgetCommand command;
+                    command.type = HostedWidgetCommandType::CollectPaths;
+                    command.categoryId = hosted->descriptor.categoryId;
+                    command.insertionIndex = action.insertionIndex;
+                    command.screenPoint = screenPoint;
+                    for (const DesktopPosition& source :
+                         owner_->internalDragOriginalPositions_) {
+                        command.paths.push_back(source.path);
+                    }
+                    positioned = owner_->hostedWidgetCommandHandler_(command);
+                }
+            } else {
+                positioned = owner_->CommitInternalDesktopDrop(screenPoint);
+            }
+        }
         *effect = positioned ? DROPEFFECT_MOVE : DROPEFFECT_NONE;
         ResetInternalItemTarget(false);
         internalDataObject_.Reset();
@@ -277,6 +353,168 @@ public:
     }
 
 private:
+    enum class ExternalRoute {
+        None,
+        Explorer,
+        HostedBlank,
+        HostedIcon,
+    };
+
+    HRESULT RouteExternalDrag(
+        IDataObject* dataObject,
+        DWORD keyState,
+        POINTL point,
+        DWORD* effect) {
+        if (owner_ == nullptr || dataObject == nullptr ||
+            effect == nullptr) {
+            if (effect != nullptr) *effect = DROPEFFECT_NONE;
+            return E_FAIL;
+        }
+        POINT screenPoint{point.x, point.y};
+        POINT clientPoint = screenPoint;
+        if (ScreenToClient(owner_->Window(), &clientPoint) == FALSE) {
+            *effect = DROPEFFECT_NONE;
+            return E_FAIL;
+        }
+        const int hostedIndex = owner_->HostedWidgetIndexAt(clientPoint);
+        ExternalRoute nextRoute = ExternalRoute::Explorer;
+        std::wstring nextTargetPath;
+        if (hostedIndex >= 0) {
+            nextRoute = ExternalRoute::None;
+            const auto& hosted = owner_->hostedWidgets_[
+                static_cast<size_t>(hostedIndex)];
+            const WidgetViewHit hit =
+                hosted->view.HitTestHostPoint(clientPoint);
+            if (hit.kind == WidgetViewHitKind::ItemIcon &&
+                hit.itemIndex >= 0) {
+                const DesktopItem* item = hosted->view.ItemAt(
+                    static_cast<size_t>(hit.itemIndex));
+                if (item != nullptr &&
+                    std::none_of(
+                        externalPaths_.begin(), externalPaths_.end(),
+                        [&](const std::wstring& path) {
+                            return IdentitiesEqual(path, item->path);
+                        })) {
+                    nextRoute = ExternalRoute::HostedIcon;
+                    nextTargetPath = item->path;
+                }
+            } else if (!externalPaths_.empty() &&
+                       hosted->view.BuildDropAction(
+                           clientPoint, {}).type ==
+                           WidgetViewActionType::ReorderSelection) {
+                nextRoute = ExternalRoute::HostedBlank;
+            }
+        }
+
+        const bool changed = nextRoute != externalRoute_ ||
+            hostedIndex != externalWidgetIndex_ ||
+            !IdentitiesEqual(nextTargetPath, externalTargetPath_);
+        if (changed) {
+            ResetExternalRoute(true);
+            externalRoute_ = nextRoute;
+            externalWidgetIndex_ = hostedIndex;
+            externalTargetPath_ = nextTargetPath;
+            DWORD nextEffect = externalAllowedEffects_;
+            if (nextRoute == ExternalRoute::Explorer) {
+                if (explorerTarget_ == nullptr) {
+                    *effect = DROPEFFECT_NONE;
+                    return S_OK;
+                }
+                const HRESULT result = explorerTarget_->DragEnter(
+                    dataObject, keyState, point, &nextEffect);
+                *effect = SUCCEEDED(result)
+                    ? nextEffect : DROPEFFECT_NONE;
+                return result;
+            }
+            if (nextRoute == ExternalRoute::HostedIcon) {
+                ShellItemReference reference;
+                if (FAILED(CreateDesktopShellItemReference(
+                        nextTargetPath, reference)) ||
+                    FAILED(CreateDesktopShellSelectionObject(
+                        owner_->Window(),
+                        std::vector<ShellItemReference>{reference},
+                        IID_IDropTarget,
+                        reinterpret_cast<void**>(
+                            externalItemTarget_.GetAddressOf()))) ||
+                    externalItemTarget_ == nullptr) {
+                    *effect = DROPEFFECT_NONE;
+                    return S_OK;
+                }
+                const HRESULT result = externalItemTarget_->DragEnter(
+                    dataObject, keyState, point, &nextEffect);
+                externalItemEffect_ = SUCCEEDED(result)
+                    ? nextEffect : DROPEFFECT_NONE;
+                *effect = externalItemEffect_;
+                return S_OK;
+            }
+        }
+        if (nextRoute == ExternalRoute::Explorer) {
+            if (explorerTarget_ == nullptr) {
+                *effect = DROPEFFECT_NONE;
+                return S_OK;
+            }
+            return explorerTarget_->DragOver(keyState, point, effect);
+        }
+        if (nextRoute == ExternalRoute::HostedIcon) {
+            if (externalItemTarget_ == nullptr) {
+                *effect = DROPEFFECT_NONE;
+                return S_OK;
+            }
+            DWORD nextEffect = externalAllowedEffects_;
+            const HRESULT result = externalItemTarget_->DragOver(
+                keyState, point, &nextEffect);
+            externalItemEffect_ = SUCCEEDED(result)
+                ? nextEffect : DROPEFFECT_NONE;
+            *effect = externalItemEffect_;
+            return S_OK;
+        }
+        if (nextRoute == ExternalRoute::HostedBlank &&
+            hostedIndex >= 0) {
+            const auto& hosted = owner_->hostedWidgets_[
+                static_cast<size_t>(hostedIndex)];
+            const WidgetViewAction action =
+                hosted->view.BuildDropAction(clientPoint, {});
+            hosted->view.SetInsertionIndex(action.insertionIndex);
+            InvalidateRect(owner_->Window(), nullptr, FALSE);
+        }
+        *effect = nextRoute == ExternalRoute::HostedBlank
+            ? PreferredShellDropPreviewEffect(externalAllowedEffects_)
+            : DROPEFFECT_NONE;
+        return S_OK;
+    }
+
+    void ResetExternalRoute(bool notifyLeave) noexcept {
+        if (owner_ != nullptr && externalWidgetIndex_ >= 0 &&
+            static_cast<size_t>(externalWidgetIndex_) <
+                owner_->hostedWidgets_.size()) {
+            const auto& hosted = owner_->hostedWidgets_[
+                static_cast<size_t>(externalWidgetIndex_)];
+            if (hosted != nullptr) {
+                hosted->view.SetInsertionIndex(-1);
+                InvalidateRect(owner_->Window(), nullptr, FALSE);
+            }
+        }
+        if (notifyLeave) {
+            if (externalRoute_ == ExternalRoute::Explorer &&
+                explorerTarget_ != nullptr) {
+                explorerTarget_->DragLeave();
+            } else if (externalRoute_ == ExternalRoute::HostedIcon &&
+                       externalItemTarget_ != nullptr) {
+                externalItemTarget_->DragLeave();
+            }
+        }
+        externalItemTarget_.Reset();
+        externalTargetPath_.clear();
+        externalItemEffect_ = DROPEFFECT_NONE;
+        externalRoute_ = ExternalRoute::None;
+        externalWidgetIndex_ = -1;
+        if (!notifyLeave) {
+            externalDataObject_.Reset();
+            externalPaths_.clear();
+            externalAllowedEffects_ = DROPEFFECT_NONE;
+        }
+    }
+
     HRESULT RouteInternalDrag(
         IDataObject* dataObject,
         DWORD keyState,
@@ -366,6 +604,14 @@ private:
     Microsoft::WRL::ComPtr<IDropTargetHelper> dragImageHelper_;
     Microsoft::WRL::ComPtr<IDataObject> internalDataObject_;
     Microsoft::WRL::ComPtr<IDropTarget> internalItemTarget_;
+    Microsoft::WRL::ComPtr<IDataObject> externalDataObject_;
+    Microsoft::WRL::ComPtr<IDropTarget> externalItemTarget_;
+    std::vector<std::wstring> externalPaths_;
+    std::wstring externalTargetPath_;
+    ExternalRoute externalRoute_ = ExternalRoute::None;
+    int externalWidgetIndex_ = -1;
+    DWORD externalAllowedEffects_ = DROPEFFECT_NONE;
+    DWORD externalItemEffect_ = DROPEFFECT_NONE;
     std::wstring internalItemTargetIdentity_;
     DWORD internalAllowedEffects_ = DROPEFFECT_NONE;
     DWORD internalItemEffect_ = DROPEFFECT_NONE;
@@ -376,6 +622,20 @@ private:
 DesktopSurfaceWindow::DesktopSurfaceWindow(HINSTANCE instance)
     : instance_(instance) {
 }
+
+#ifndef NDEBUG
+bool DesktopSurfaceWindow::AttachDropTargetForSmoke(
+    IDropTarget* explorerTarget) {
+    if (hwnd_ == nullptr || explorerTarget == nullptr ||
+        desktopDropTarget_ != nullptr) {
+        return false;
+    }
+    desktopDropTarget_.Attach(
+        new (std::nothrow) DesktopSurfaceDropTarget(
+            this, explorerTarget));
+    return desktopDropTarget_ != nullptr;
+}
+#endif
 
 DesktopSurfaceWindow::~DesktopSurfaceWindow() {
     Close();
@@ -582,6 +842,7 @@ void DesktopSurfaceWindow::Show() {
 
 void DesktopSurfaceWindow::Hide() {
     if (hwnd_ != nullptr) {
+        ResetHostedPointerGesture();
         wallpaperRecoveryHidden_ = false;
         desktopKeyboardSelectionArmed_ = false;
         CancelPendingRename();
@@ -718,6 +979,7 @@ void DesktopSurfaceWindow::ConfirmUnassignedItemAt(
 }
 
 void DesktopSurfaceWindow::Close() {
+    ResetHostedPointerGesture();
     StopWallpaperRecovery();
     RemoveKeyboardHook();
     CancelPendingRename();
@@ -895,6 +1157,17 @@ bool DesktopSurfaceWindow::Refresh(
                 static_cast<long long>(nextFolderResult)) + L"。";
         return false;
     }
+    std::vector<std::wstring> newlyObserved;
+    for (const DesktopViewItem& item : next.items) {
+        const bool wasPresent = std::any_of(
+            snapshot_.items.begin(), snapshot_.items.end(),
+            [&](const DesktopViewItem& previous) {
+                return IdentitiesEqual(previous.path, item.path);
+            });
+        if (!wasPresent) {
+            newlyObserved.push_back(item.path);
+        }
+    }
     ReleaseListViewQueryAccess();
     snapshot_ = std::move(next);
     explorerFolderView_ = std::move(nextFolderView);
@@ -923,7 +1196,7 @@ bool DesktopSurfaceWindow::Refresh(
         }
         SetItemScreenPoint(value.identity, value.screenPoint);
     }
-    RebuildVisibleItems();
+    RebuildVisibleItems(newlyObserved);
     for (const DesktopViewItem& item : visibleItems_) {
         iconCache_.PreloadShellIcon(
             item.path,
@@ -1004,6 +1277,10 @@ void DesktopSurfaceWindow::RefreshIconCache() {
     }
 }
 
+void DesktopSurfaceWindow::SetIconCacheCapacity(size_t capacity) {
+    iconCache_.SetCapacity(capacity);
+}
+
 bool DesktopSurfaceWindow::IsDesktopHosted() const noexcept {
     return hwnd_ != nullptr &&
         snapshot_.desktopHost != nullptr &&
@@ -1074,6 +1351,11 @@ LRESULT DesktopSurfaceWindow::HandleMessage(
     if (message == WM_INITMENUPOPUP || message == WM_DRAWITEM ||
         message == WM_MEASUREITEM || message == WM_MENUCHAR) {
         LRESULT menuResult = 0;
+        if (shellMenuForwardHandler_ != nullptr &&
+            shellMenuForwardHandler_(
+                message, wParam, lParam, menuResult)) {
+            return menuResult;
+        }
         if (launcher_.ForwardContextMenuMessage(
                 message, wParam, lParam, menuResult)) {
             return menuResult;
@@ -1081,7 +1363,43 @@ LRESULT DesktopSurfaceWindow::HandleMessage(
     }
     switch (message) {
         case WM_MOUSEACTIVATE:
-            return MA_NOACTIVATE;
+        {
+            POINT point{};
+            GetCursorPos(&point);
+            ScreenToClient(hwnd_, &point);
+            return HostedWidgetIndexAt(point) >= 0
+                ? MA_ACTIVATE
+                : MA_NOACTIVATE;
+        }
+        case WM_GETDLGCODE:
+            return DLGC_WANTARROWS | DLGC_WANTCHARS |
+                DLGC_WANTALLKEYS;
+        case WM_SETCURSOR:
+            if (LOWORD(lParam) == HTCLIENT) {
+                POINT point{};
+                if (GetCursorPos(&point) != FALSE &&
+                    ScreenToClient(hwnd_, &point) != FALSE) {
+                    const int index = HostedWidgetIndexAt(point);
+                    if (index >= 0) {
+                        const WidgetViewHit hit = hostedWidgets_[
+                            static_cast<size_t>(index)]->view.
+                                HitTestHostPoint(point);
+                        if (hit.kind == WidgetViewHitKind::ResizeBorder) {
+                            const int edges = hit.resizeEdges;
+                            LPCWSTR cursor = IDC_SIZEWE;
+                            if (edges & kWidgetResizeBottom) {
+                                cursor = (edges & kWidgetResizeLeft)
+                                    ? IDC_SIZENESW
+                                    : (edges & kWidgetResizeRight)
+                                        ? IDC_SIZENWSE : IDC_SIZENS;
+                            }
+                            SetCursor(LoadCursorW(nullptr, cursor));
+                            return TRUE;
+                        }
+                    }
+                }
+            }
+            break;
         case WM_ERASEBKGND:
             return 1;
         case WM_PAINT:
@@ -1123,6 +1441,49 @@ LRESULT DesktopSurfaceWindow::HandleMessage(
             }
             break;
         case WM_KEYDOWN:
+            if (activeHostedWidgetIndex_ >= 0 &&
+                static_cast<size_t>(activeHostedWidgetIndex_) <
+                    hostedWidgets_.size() &&
+                hostedWidgets_[static_cast<size_t>(
+                    activeHostedWidgetIndex_)] != nullptr) {
+                const bool controlPressed =
+                    (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+                const bool shiftPressed =
+                    (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+                if (controlPressed &&
+                    (wParam == L'C' || wParam == L'X')) {
+                    HostedWidgetCommand command;
+                    command.type = wParam == L'C'
+                        ? HostedWidgetCommandType::CopySelection
+                        : HostedWidgetCommandType::CutSelection;
+                    command.categoryId = hostedWidgets_[
+                        static_cast<size_t>(activeHostedWidgetIndex_)]->
+                            descriptor.categoryId;
+                    command.itemIds = hostedWidgets_[
+                        static_cast<size_t>(activeHostedWidgetIndex_)]->
+                            view.SelectedItemIds();
+                    if (!command.itemIds.empty() &&
+                        hostedWidgetCommandHandler_ != nullptr) {
+                        hostedWidgetCommandHandler_(command);
+                    }
+                    return 0;
+                }
+                const bool routed =
+                    (controlPressed && wParam == L'A') ||
+                    wParam == VK_ESCAPE || wParam == VK_LEFT ||
+                    wParam == VK_UP || wParam == VK_RIGHT ||
+                    wParam == VK_DOWN || wParam == VK_RETURN ||
+                    wParam == VK_F2 || wParam == VK_DELETE ||
+                    wParam == VK_APPS ||
+                    (shiftPressed && wParam == VK_F10);
+                if (routed) {
+                    DispatchHostedWidgetKey(
+                        static_cast<UINT>(wParam),
+                        controlPressed,
+                        shiftPressed);
+                    return 0;
+                }
+            }
             if (wParam == VK_F2 &&
                 renameEdit_ == nullptr &&
                 selectedIdentities_.size() == 1) {
@@ -1131,8 +1492,47 @@ LRESULT DesktopSurfaceWindow::HandleMessage(
             }
             break;
         case WM_MOUSEMOVE: {
-            const POINT current{
+            POINT current{
                 GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+            if (GetCapture() == hwnd_ &&
+                (hostedPointerGesture_ != HostedPointerGesture::None ||
+                 pointerGesture_ != PointerGesture::None) &&
+                (wParam & MK_LBUTTON) != 0) {
+                POINT cursor{};
+                if (GetCursorPos(&cursor) != FALSE &&
+                    ScreenToClient(hwnd_, &cursor) != FALSE) {
+                    current = cursor;
+                }
+            }
+            if (hostedPointerGesture_ != HostedPointerGesture::None) {
+                if ((wParam & MK_LBUTTON) == 0) {
+                    ResetHostedPointerGesture();
+                    if (GetCapture() == hwnd_) {
+                        ReleaseCapture();
+                    }
+                } else {
+                    ContinueHostedPointerGesture(current);
+                }
+                InvalidateRect(hwnd_, nullptr, FALSE);
+                return 0;
+            }
+            const int hostedIndex = HostedWidgetIndexAt(current);
+            for (size_t index = 0; index < hostedWidgets_.size(); ++index) {
+                if (hostedWidgets_[index] != nullptr) {
+                    hostedWidgets_[index]->view.SetVisualPointerState(
+                        static_cast<int>(index) == hostedIndex
+                            ? current
+                            : POINT{LONG_MIN, LONG_MIN});
+                }
+            }
+            if (hostedIndex >= 0) {
+                hoverIndex_ = -1;
+                TRACKMOUSEEVENT track{
+                    sizeof(track), TME_LEAVE, hwnd_, HOVER_DEFAULT};
+                TrackMouseEvent(&track);
+                InvalidateRect(hwnd_, nullptr, FALSE);
+                return 0;
+            }
             if (pointerGesture_ != PointerGesture::None &&
                 (wParam & MK_LBUTTON) == 0) {
                 CancelPointerCapture();
@@ -1187,9 +1587,19 @@ LRESULT DesktopSurfaceWindow::HandleMessage(
         }
         case WM_MOUSELEAVE:
             hoverIndex_ = -1;
+            for (const auto& hosted : hostedWidgets_) {
+                if (hosted != nullptr) {
+                    hosted->view.SetVisualPointerState(
+                        POINT{LONG_MIN, LONG_MIN});
+                }
+            }
             InvalidateRect(hwnd_, nullptr, FALSE);
             return 0;
         case WM_LBUTTONDOWN: {
+#ifndef NDEBUG
+            ++leftDownMessageCountForSmoke_;
+#endif
+            const bool hadRenameEditor = renameEdit_ != nullptr;
             if (renameEdit_ != nullptr) {
                 FinishRename(true);
                 if (renameEdit_ != nullptr) {
@@ -1202,6 +1612,61 @@ LRESULT DesktopSurfaceWindow::HandleMessage(
             const bool controlPressed =
                 (wParam & MK_CONTROL) != 0 ||
                 (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+            std::wstring clickedIdentity;
+            std::wstring clickedCategoryId;
+            const int clickedWidget = HostedWidgetIndexAt(clientPoint);
+            if (clickedWidget >= 0 &&
+                static_cast<size_t>(clickedWidget) < hostedWidgets_.size() &&
+                hostedWidgets_[static_cast<size_t>(clickedWidget)] != nullptr) {
+                const HostedWidgetEntry& widget =
+                    *hostedWidgets_[static_cast<size_t>(clickedWidget)];
+                const WidgetViewHit hit =
+                    widget.view.HitTestHostPoint(clientPoint);
+                if (!widget.descriptor.singleClickOpen &&
+                    (hit.kind == WidgetViewHitKind::ItemIcon ||
+                     hit.kind == WidgetViewHitKind::ItemCellGap) &&
+                    hit.itemIndex >= 0) {
+                    if (const DesktopItem* item = widget.view.ItemAt(
+                            static_cast<size_t>(hit.itemIndex));
+                        item != nullptr) {
+                        clickedIdentity = item->id;
+                        clickedCategoryId = widget.descriptor.categoryId;
+                    }
+                }
+            } else if (const int index = HitTest(clientPoint);
+                       index >= 0) {
+                clickedIdentity =
+                    visibleItems_[static_cast<size_t>(index)].path;
+            }
+            const DWORD clickTime = static_cast<DWORD>(GetMessageTime());
+            const bool repeatedCompletedClick =
+                !hadRenameEditor && !controlPressed &&
+                !clickedIdentity.empty() &&
+                !lastCompletedClickIdentity_.empty() &&
+                IdentitiesEqual(
+                    clickedIdentity, lastCompletedClickIdentity_) &&
+                IdentitiesEqual(
+                    clickedCategoryId, lastCompletedClickCategoryId_) &&
+                clickTime - lastCompletedClickTime_ <=
+                    GetDoubleClickTime() &&
+                std::abs(clientPoint.x - lastCompletedClickPoint_.x) <=
+                    (std::max)(1, GetSystemMetrics(SM_CXDOUBLECLK) / 2) &&
+                std::abs(clientPoint.y - lastCompletedClickPoint_.y) <=
+                    (std::max)(1, GetSystemMetrics(SM_CYDOUBLECLK) / 2);
+            lastCompletedClickIdentity_.clear();
+            lastCompletedClickCategoryId_.clear();
+            if (repeatedCompletedClick) {
+                swallowDoubleClickRelease_ = true;
+                return HandleMessage(
+                    WM_LBUTTONDBLCLK, wParam, lParam);
+            }
+            if (HostedWidgetIndexAt(clientPoint) >= 0) {
+                SetFocus(hwnd_);
+                BeginHostedPointerGesture(
+                    clientPoint, controlPressed);
+                return 0;
+            }
+            activeHostedWidgetIndex_ = -1;
             const int index = HitTest(clientPoint);
             if (index >= 0 && !controlPressed) {
                 const DesktopViewItem& item =
@@ -1230,6 +1695,66 @@ LRESULT DesktopSurfaceWindow::HandleMessage(
             return 0;
         }
         case WM_LBUTTONUP: {
+#ifndef NDEBUG
+            ++leftUpMessageCountForSmoke_;
+#endif
+            if (swallowDoubleClickRelease_) {
+                swallowDoubleClickRelease_ = false;
+                return 0;
+            }
+            const POINT clientPoint{
+                GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+            if (hostedPointerGesture_ ==
+                    HostedPointerGesture::ItemPressed &&
+                !hostedPointerControlPressed_ &&
+                hostedPointerWidgetIndex_ >= 0 &&
+                static_cast<size_t>(hostedPointerWidgetIndex_) <
+                    hostedWidgets_.size() &&
+                hostedWidgets_[static_cast<size_t>(
+                    hostedPointerWidgetIndex_)] != nullptr) {
+                const HostedWidgetEntry& widget = *hostedWidgets_[
+                    static_cast<size_t>(hostedPointerWidgetIndex_)];
+                const WidgetViewHit released =
+                    widget.view.HitTestHostPoint(clientPoint);
+                if (!widget.descriptor.singleClickOpen &&
+                    released.itemIndex == hostedPointerHit_.itemIndex &&
+                    released.itemIndex >= 0 &&
+                    (released.kind == WidgetViewHitKind::ItemIcon ||
+                     released.kind == WidgetViewHitKind::ItemCellGap)) {
+                    if (const DesktopItem* item = widget.view.ItemAt(
+                            static_cast<size_t>(released.itemIndex));
+                        item != nullptr) {
+                        lastCompletedClickIdentity_ = item->id;
+                        lastCompletedClickCategoryId_ =
+                            widget.descriptor.categoryId;
+                    }
+                }
+            } else if (pointerGesture_ == PointerGesture::ItemPressed &&
+                       !controlAtPointerDown_ &&
+                       !pressedIdentity_.empty()) {
+                const int releasedIndex = HitTest(clientPoint);
+                if (releasedIndex >= 0 &&
+                    IdentitiesEqual(
+                        visibleItems_[static_cast<size_t>(
+                            releasedIndex)].path,
+                        pressedIdentity_)) {
+                    lastCompletedClickIdentity_ = pressedIdentity_;
+                    lastCompletedClickCategoryId_.clear();
+                }
+            }
+            if (!lastCompletedClickIdentity_.empty()) {
+                lastCompletedClickPoint_ = clientPoint;
+                lastCompletedClickTime_ =
+                    static_cast<DWORD>(GetMessageTime());
+            }
+            if (hostedPointerGesture_ != HostedPointerGesture::None) {
+                CompleteHostedPointerGesture(
+                    clientPoint);
+                if (GetCapture() == hwnd_) {
+                    ReleaseCapture();
+                }
+                return 0;
+            }
             const bool scheduleRename =
                 renameClickCandidate_ &&
                 pointerGesture_ == PointerGesture::ItemPressed &&
@@ -1256,29 +1781,89 @@ LRESULT DesktopSurfaceWindow::HandleMessage(
             return 0;
         }
         case WM_CAPTURECHANGED:
+            if (hostedPointerGesture_ != HostedPointerGesture::None) {
+                ResetHostedPointerGesture();
+                InvalidateRect(hwnd_, nullptr, FALSE);
+                return 0;
+            }
             ResetPointerGesture();
             SynchronizeExplorerSelection();
             InvalidateRect(hwnd_, nullptr, FALSE);
             return 0;
         case WM_CANCELMODE:
+            lastCompletedClickIdentity_.clear();
+            lastCompletedClickCategoryId_.clear();
             CancelPendingRename();
+            ResetHostedPointerGesture();
             CancelPointerCapture();
             SynchronizeExplorerSelection();
             InvalidateRect(hwnd_, nullptr, FALSE);
             return 0;
         case WM_LBUTTONDBLCLK: {
+#ifndef NDEBUG
+            ++doubleClickMessageCountForSmoke_;
+            doubleClickPointForSmoke_ = POINT{
+                GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+#endif
+            lastCompletedClickIdentity_.clear();
+            lastCompletedClickCategoryId_.clear();
+            swallowDoubleClickRelease_ = true;
             CancelPendingRename();
             desktopKeyboardSelectionArmed_ = false;
+            const POINT clientPoint{
+                GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+            const int hostedIndex = HostedWidgetIndexAt(clientPoint);
+            if (hostedIndex >= 0 &&
+                static_cast<size_t>(hostedIndex) < hostedWidgets_.size() &&
+                hostedWidgets_[static_cast<size_t>(hostedIndex)] != nullptr) {
+                const int raisedIndex = RaiseHostedWidget(hostedIndex);
+                HostedWidgetEntry& hosted = *hostedWidgets_[
+                    static_cast<size_t>(raisedIndex)];
+                const WidgetViewHit hit =
+                    hosted.view.HitTestHostPoint(clientPoint);
+                activeHostedWidgetIndex_ = raisedIndex;
+                if (hit.kind == WidgetViewHitKind::Header) {
+                    DispatchHostedHeaderButton(
+                        static_cast<size_t>(raisedIndex),
+                        1,
+                        POINT{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)});
+                } else if ((hit.kind == WidgetViewHitKind::ItemIcon ||
+                            hit.kind == WidgetViewHitKind::ItemCellGap) &&
+                           hit.itemIndex >= 0) {
+                    hosted.view.SelectItem(
+                        static_cast<size_t>(hit.itemIndex), false);
+                    WidgetViewAction action;
+                    action.type = WidgetViewActionType::OpenSelection;
+                    action.itemIds = hosted.view.SelectedItemIds();
+                    DispatchHostedWidgetAction(
+                        static_cast<size_t>(raisedIndex), action);
+                }
+                InvalidateRect(hwnd_, nullptr, FALSE);
+                return 0;
+            }
             const int index = HitTest(
-                POINT{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)});
+                clientPoint);
             if (index >= 0) {
                 SelectOnly(
                     visibleItems_[static_cast<size_t>(index)].path);
                 SynchronizeExplorerSelection();
                 CancelPointerCapture();
                 InvalidateRect(hwnd_, nullptr, FALSE);
-                launcher_.OpenPath(
-                    visibleItems_[static_cast<size_t>(index)].path);
+#ifndef NDEBUG
+                if (suppressDesktopOpenForSmoke_) {
+                    ++desktopOpenRequestCountForSmoke_;
+                    desktopOpenPathForSmoke_ =
+                        visibleItems_[static_cast<size_t>(index)].path;
+                    return 0;
+                }
+#endif
+                if (!launcher_.OpenPath(
+                        visibleItems_[static_cast<size_t>(index)].path)) {
+                    MessageDialog::Show(
+                        instance_, hwnd_,
+                        L"无法打开此桌面项目，请检查文件或默认关联应用。",
+                        L"打开项目失败", MB_OK | MB_ICONWARNING);
+                }
             }
             return 0;
         }
@@ -1298,6 +1883,49 @@ LRESULT DesktopSurfaceWindow::HandleMessage(
             }
             POINT clientPoint = screenPoint;
             ScreenToClient(hwnd_, &clientPoint);
+            const int hostedIndex = HostedWidgetIndexAt(clientPoint);
+            if (hostedIndex >= 0 &&
+                static_cast<size_t>(hostedIndex) < hostedWidgets_.size() &&
+                hostedWidgets_[static_cast<size_t>(hostedIndex)] != nullptr) {
+                const int raisedIndex = RaiseHostedWidget(hostedIndex);
+                activeHostedWidgetIndex_ = raisedIndex;
+                HostedWidgetEntry& hosted = *hostedWidgets_[
+                    static_cast<size_t>(raisedIndex)];
+                const WidgetViewHit hit =
+                    hosted.view.HitTestHostPoint(clientPoint);
+                if ((hit.kind == WidgetViewHitKind::ItemIcon ||
+                     hit.kind == WidgetViewHitKind::ItemCellGap) &&
+                    hit.itemIndex >= 0) {
+                    const DesktopItem* clicked = hosted.view.ItemAt(
+                        static_cast<size_t>(hit.itemIndex));
+                    if (clicked != nullptr &&
+                        std::find(
+                            hosted.view.SelectedItemIds().begin(),
+                            hosted.view.SelectedItemIds().end(),
+                            clicked->id) ==
+                            hosted.view.SelectedItemIds().end()) {
+                        hosted.view.SelectItem(
+                            static_cast<size_t>(hit.itemIndex), false);
+                    }
+                    WidgetViewAction action;
+                    action.type =
+                        WidgetViewActionType::ShowSelectionMenu;
+                    action.itemIds = hosted.view.SelectedItemIds();
+                    DispatchHostedWidgetAction(
+                        static_cast<size_t>(raisedIndex),
+                        action,
+                        screenPoint);
+                } else if (hostedWidgetCommandHandler_ != nullptr) {
+                    HostedWidgetCommand command;
+                    command.type =
+                        HostedWidgetCommandType::ShowBackgroundMenu;
+                    command.categoryId = hosted.descriptor.categoryId;
+                    command.screenPoint = screenPoint;
+                    hostedWidgetCommandHandler_(command);
+                }
+                InvalidateRect(hwnd_, nullptr, FALSE);
+                return 0;
+            }
             const int index = HitTest(clientPoint);
             if (index >= 0) {
                 const std::wstring& identity =
@@ -1343,6 +1971,25 @@ LRESULT DesktopSurfaceWindow::HandleMessage(
                 }
             }
             return 0;
+        }
+        case WM_MOUSEWHEEL: {
+            POINT screenPoint{
+                GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+            POINT clientPoint = screenPoint;
+            ScreenToClient(hwnd_, &clientPoint);
+            const int hostedIndex = HostedWidgetIndexAt(clientPoint);
+            if (hostedIndex >= 0 &&
+                static_cast<size_t>(hostedIndex) < hostedWidgets_.size() &&
+                hostedWidgets_[static_cast<size_t>(hostedIndex)] != nullptr) {
+                const int delta = GET_WHEEL_DELTA_WPARAM(wParam);
+                if (hostedWidgets_[static_cast<size_t>(hostedIndex)]->
+                        view.ScrollBy(
+                            -(delta / WHEEL_DELTA) * 84)) {
+                    InvalidateRect(hwnd_, nullptr, FALSE);
+                }
+                return 0;
+            }
+            break;
         }
         case WM_DISPLAYCHANGE:
         case WM_SETTINGCHANGE: {
@@ -1562,11 +2209,817 @@ void DesktopSurfaceWindow::Render() {
             D2D1_DRAW_TEXT_OPTIONS_CLIP);
         target->PopAxisAlignedClip();
     }
+    for (const auto& hosted : hostedWidgets_) {
+        if (hosted != nullptr && hosted->descriptor.visible) {
+            hosted->view.Draw(d2d_, iconCache_);
+        }
+    }
+#ifndef NDEBUG
+    if (hostedWidgetSlice_ != nullptr) {
+        hostedWidgetSlice_->Draw(d2d_, iconCache_);
+    }
+#endif
     const HRESULT result = d2d_.EndDraw();
     EndPaint(hwnd_, &paint);
     if (FAILED(result)) {
         RecoverWallpaperAfterRenderFailure();
     }
+}
+
+void DesktopSurfaceWindow::SetHostedWidgetCommandHandler(
+    HostedWidgetCommandHandler handler) {
+    hostedWidgetCommandHandler_ = std::move(handler);
+}
+
+void DesktopSurfaceWindow::SetShellMenuForwardHandler(
+    ShellMenuForwardHandler handler) {
+    shellMenuForwardHandler_ = std::move(handler);
+}
+
+bool DesktopSurfaceWindow::ApplyHostedWidgets(
+    const std::vector<HostedWidgetDescriptor>& widgets,
+    std::wstring& errorMessage) {
+    errorMessage.clear();
+    std::vector<std::unique_ptr<HostedWidgetEntry>> candidate;
+    candidate.reserve(widgets.size());
+    std::vector<std::wstring> categoryIds;
+    categoryIds.reserve(widgets.size());
+
+    RECT hostScreen{};
+    if (hwnd_ != nullptr && IsWindow(hwnd_) != FALSE) {
+        GetWindowRect(hwnd_, &hostScreen);
+    }
+    for (size_t index = 0; index < widgets.size(); ++index) {
+#ifndef NDEBUG
+        if (hostedWidgetPublishFailureIndex_ >= 0 &&
+            static_cast<int>(index) == hostedWidgetPublishFailureIndex_) {
+            errorMessage = L"统一宿主候选故障注入。";
+            return false;
+        }
+#endif
+        const HostedWidgetDescriptor& descriptor = widgets[index];
+        if (descriptor.categoryId.empty() ||
+            descriptor.config.width <= 0 ||
+            descriptor.config.height <= 0 ||
+            std::find_if(
+                categoryIds.begin(), categoryIds.end(),
+                [&](const std::wstring& value) {
+                    return CompareStringOrdinal(
+                        value.c_str(), -1,
+                        descriptor.categoryId.c_str(), -1,
+                        TRUE) == CSTR_EQUAL;
+                }) != categoryIds.end()) {
+            errorMessage = L"统一宿主格子候选包含无效或重复身份。";
+            return false;
+        }
+        categoryIds.push_back(descriptor.categoryId);
+        auto entry = std::make_unique<HostedWidgetEntry>();
+        entry->descriptor = descriptor;
+        WindowConfig viewConfig = descriptor.config;
+        const int physicalHeight = viewConfig.collapsed
+            ? MulDiv(32, std::max(96, viewConfig.dpi), 96)
+            : viewConfig.height;
+        const RECT bounds{
+            viewConfig.x - hostScreen.left,
+            viewConfig.y - hostScreen.top,
+            viewConfig.x - hostScreen.left + viewConfig.width,
+            viewConfig.y - hostScreen.top + physicalHeight};
+        entry->view.Configure(
+            descriptor.categoryId,
+            descriptor.title,
+            viewConfig,
+            descriptor.theme,
+            bounds,
+            descriptor.items);
+        const auto previous = std::find_if(
+            hostedWidgets_.begin(), hostedWidgets_.end(),
+            [&](const std::unique_ptr<HostedWidgetEntry>& value) {
+                return value != nullptr &&
+                    IdentitiesEqual(
+                        value->descriptor.categoryId,
+                        descriptor.categoryId);
+            });
+        if (previous != hostedWidgets_.end() && *previous != nullptr) {
+            entry->view.SetSelectedItemIds(
+                (*previous)->view.SelectedItemIds());
+            const int scrollOffset = (*previous)->view.ScrollOffset();
+            if (scrollOffset != 0) {
+                entry->view.ScrollBy(scrollOffset);
+            }
+        }
+        candidate.push_back(std::move(entry));
+    }
+
+    std::wstring activeCategory;
+    if (activeHostedWidgetIndex_ >= 0 &&
+        static_cast<size_t>(activeHostedWidgetIndex_) <
+            hostedWidgets_.size() &&
+        hostedWidgets_[static_cast<size_t>(activeHostedWidgetIndex_)] !=
+            nullptr) {
+        activeCategory = hostedWidgets_[
+            static_cast<size_t>(activeHostedWidgetIndex_)]->
+                descriptor.categoryId;
+    }
+    ResetHostedPointerGesture();
+    hostedWidgets_.swap(candidate);
+    activeHostedWidgetIndex_ = -1;
+    if (!activeCategory.empty()) {
+        for (size_t index = 0; index < hostedWidgets_.size(); ++index) {
+            if (hostedWidgets_[index] != nullptr &&
+                CompareStringOrdinal(
+                    hostedWidgets_[index]->descriptor.categoryId.c_str(),
+                    -1, activeCategory.c_str(), -1, TRUE) == CSTR_EQUAL) {
+                activeHostedWidgetIndex_ = static_cast<int>(index);
+                break;
+            }
+        }
+    }
+    if (hwnd_ != nullptr && IsWindow(hwnd_) != FALSE) {
+        InvalidateRect(hwnd_, nullptr, FALSE);
+    }
+    return true;
+}
+
+void DesktopSurfaceWindow::ClearHostedWidgets() {
+    ResetHostedPointerGesture();
+    hostedWidgets_.clear();
+    activeHostedWidgetIndex_ = -1;
+    if (hwnd_ != nullptr && IsWindow(hwnd_) != FALSE) {
+        InvalidateRect(hwnd_, nullptr, FALSE);
+    }
+}
+
+size_t DesktopSurfaceWindow::HostedWidgetCount() const noexcept {
+    return hostedWidgets_.size();
+}
+
+int DesktopSurfaceWindow::HostedWidgetIndexAt(POINT clientPoint) const {
+    for (size_t reverse = hostedWidgets_.size(); reverse > 0; --reverse) {
+        const size_t index = reverse - 1;
+        const auto& hosted = hostedWidgets_[index];
+        if (hosted == nullptr || !hosted->descriptor.visible) {
+            continue;
+        }
+        if (hosted->view.ContainsHostPoint(clientPoint)) {
+            return static_cast<int>(index);
+        }
+    }
+    return -1;
+}
+
+int DesktopSurfaceWindow::RaiseHostedWidget(int index) {
+    if (index < 0 ||
+        static_cast<size_t>(index) >= hostedWidgets_.size() ||
+        hostedWidgets_[static_cast<size_t>(index)] == nullptr) {
+        return -1;
+    }
+    const std::wstring categoryId =
+        hostedWidgets_[static_cast<size_t>(index)]->descriptor.categoryId;
+    if (static_cast<size_t>(index) + 1 < hostedWidgets_.size()) {
+        std::rotate(
+            hostedWidgets_.begin() + index,
+            hostedWidgets_.begin() + index + 1,
+            hostedWidgets_.end());
+        if (activeHostedWidgetIndex_ > index) {
+            --activeHostedWidgetIndex_;
+        }
+    }
+    const int raisedIndex = static_cast<int>(hostedWidgets_.size() - 1);
+    activeHostedWidgetIndex_ = raisedIndex;
+    if (hostedWidgetCommandHandler_ != nullptr) {
+        HostedWidgetCommand command;
+        command.type = HostedWidgetCommandType::BringToFront;
+        command.categoryId = categoryId;
+        hostedWidgetCommandHandler_(command);
+    }
+    InvalidateRect(hwnd_, nullptr, FALSE);
+    return raisedIndex;
+}
+
+bool DesktopSurfaceWindow::ActivateHostedWidgetAt(
+    POINT clientPoint,
+    bool controlPressed) {
+    const int index = HostedWidgetIndexAt(clientPoint);
+    if (index < 0) {
+        activeHostedWidgetIndex_ = -1;
+        return false;
+    }
+    const int raisedIndex = RaiseHostedWidget(index);
+    WidgetView& view = hostedWidgets_[static_cast<size_t>(raisedIndex)]->view;
+    const WidgetViewHit hit = view.HitTestHostPoint(clientPoint);
+    if ((hit.kind == WidgetViewHitKind::ItemIcon ||
+         hit.kind == WidgetViewHitKind::ItemCellGap) &&
+        hit.itemIndex >= 0) {
+        view.SelectItem(static_cast<size_t>(hit.itemIndex), controlPressed);
+    } else if (!controlPressed && hit.kind != WidgetViewHitKind::Header &&
+               hit.kind != WidgetViewHitKind::HeaderButton &&
+               hit.kind != WidgetViewHitKind::ResizeBorder) {
+        view.ClearSelection();
+    }
+    if (hwnd_ != nullptr && IsWindow(hwnd_) != FALSE) {
+        InvalidateRect(hwnd_, nullptr, FALSE);
+    }
+    return true;
+}
+
+bool DesktopSurfaceWindow::DispatchHostedWidgetKey(
+    UINT virtualKey,
+    bool controlPressed,
+    bool shiftPressed) {
+    if (activeHostedWidgetIndex_ < 0 ||
+        static_cast<size_t>(activeHostedWidgetIndex_) >=
+            hostedWidgets_.size()) {
+        return false;
+    }
+    const size_t index = static_cast<size_t>(activeHostedWidgetIndex_);
+    WidgetViewAction action = hostedWidgets_[index]->view.HandleKey(
+        virtualKey, controlPressed, shiftPressed);
+    if (hwnd_ != nullptr && IsWindow(hwnd_) != FALSE) {
+        InvalidateRect(hwnd_, nullptr, FALSE);
+    }
+    return DispatchHostedWidgetAction(index, action);
+}
+
+bool DesktopSurfaceWindow::DispatchHostedWidgetAction(
+    size_t widgetIndex,
+    const WidgetViewAction& action,
+    POINT screenPoint) {
+    if (widgetIndex >= hostedWidgets_.size() ||
+        hostedWidgets_[widgetIndex] == nullptr) {
+        return false;
+    }
+    if (action.type == WidgetViewActionType::None) {
+        return true;
+    }
+    HostedWidgetCommand command;
+    command.categoryId =
+        hostedWidgets_[widgetIndex]->descriptor.categoryId;
+    command.itemIds = action.itemIds;
+    command.targetItemId = action.targetItemId;
+    command.insertionIndex = action.insertionIndex;
+    command.screenPoint = screenPoint;
+    if (action.type == WidgetViewActionType::ShowSelectionMenu &&
+        command.screenPoint.x == 0 && command.screenPoint.y == 0 &&
+        !action.itemIds.empty()) {
+        const WidgetView& view = hostedWidgets_[widgetIndex]->view;
+        for (size_t index = 0;; ++index) {
+            const DesktopItem* item = view.ItemAt(index);
+            if (item == nullptr) {
+                break;
+            }
+            if (!IdentitiesEqual(item->id, action.itemIds.front())) {
+                continue;
+            }
+            const RECT cell = view.ItemHostCell(index);
+            command.screenPoint = POINT{
+                (cell.left + cell.right) / 2,
+                (cell.top + cell.bottom) / 2};
+            ClientToScreen(hwnd_, &command.screenPoint);
+            break;
+        }
+    }
+    switch (action.type) {
+        case WidgetViewActionType::OpenSelection:
+            command.type = HostedWidgetCommandType::OpenSelection;
+            break;
+        case WidgetViewActionType::RenameSelection:
+            command.type = HostedWidgetCommandType::RenameSelection;
+            break;
+        case WidgetViewActionType::DeleteSelection:
+            command.type = HostedWidgetCommandType::DeleteSelection;
+            break;
+        case WidgetViewActionType::ShowSelectionMenu:
+            command.type = HostedWidgetCommandType::ShowSelectionMenu;
+            break;
+        case WidgetViewActionType::ShellDropTarget:
+            command.type = HostedWidgetCommandType::ShellDropTarget;
+            break;
+        case WidgetViewActionType::ReorderSelection:
+            command.type = HostedWidgetCommandType::ReorderSelection;
+            break;
+        case WidgetViewActionType::None:
+            break;
+    }
+    return command.type == HostedWidgetCommandType::None ||
+        (hostedWidgetCommandHandler_ != nullptr &&
+         hostedWidgetCommandHandler_(command));
+}
+
+bool DesktopSurfaceWindow::BeginHostedPointerGesture(
+    POINT clientPoint,
+    bool controlPressed) {
+    ResetHostedPointerGesture();
+    const int index = HostedWidgetIndexAt(clientPoint);
+    if (index < 0 || static_cast<size_t>(index) >= hostedWidgets_.size() ||
+        hostedWidgets_[static_cast<size_t>(index)] == nullptr) {
+        return false;
+    }
+    const int raisedIndex = RaiseHostedWidget(index);
+    hostedPointerWidgetIndex_ = raisedIndex;
+    hostedPointerTargetWidgetIndex_ = raisedIndex;
+    hostedPointerStart_ = clientPoint;
+    hostedPointerCurrent_ = clientPoint;
+    hostedPointerControlPressed_ = controlPressed;
+    HostedWidgetEntry& entry =
+        *hostedWidgets_[static_cast<size_t>(raisedIndex)];
+    hostedPointerOriginalBounds_ = entry.view.HostPixelBounds();
+    hostedPointerOriginalLayout_ = entry.descriptor.config;
+    hostedPointerHit_ = entry.view.HitTestHostPoint(clientPoint);
+
+    if ((hostedPointerHit_.kind == WidgetViewHitKind::ItemIcon ||
+         hostedPointerHit_.kind == WidgetViewHitKind::ItemCellGap) &&
+        hostedPointerHit_.itemIndex >= 0) {
+        const DesktopItem* pressedItem = entry.view.ItemAt(
+            static_cast<size_t>(hostedPointerHit_.itemIndex));
+        hostedPointerPressedWasSelected_ = pressedItem != nullptr &&
+            std::any_of(
+                entry.view.SelectedItemIds().begin(),
+                entry.view.SelectedItemIds().end(),
+                [&](const std::wstring& itemId) {
+                    return IdentitiesEqual(itemId, pressedItem->id);
+                });
+        if (!hostedPointerPressedWasSelected_) {
+            entry.view.SelectItem(
+                static_cast<size_t>(hostedPointerHit_.itemIndex),
+                controlPressed);
+        }
+        hostedDraggingItemIds_ = entry.view.SelectedItemIds();
+        if (const DesktopItem* item = entry.view.ItemAt(
+                static_cast<size_t>(hostedPointerHit_.itemIndex));
+            item != nullptr) {
+            const bool shortcut =
+                item->kind == DesktopItemKind::Shortcut ||
+                item->kind == DesktopItemKind::UrlShortcut;
+            DragGhostWindow::Instance().Stage(
+                instance_, hwnd_, item->path,
+                iconCache_.CopyReadyIconForDrag(item->path),
+                item->displayName,
+                shortcut,
+                entry.descriptor.config.iconSize,
+                entry.view.SlotSize());
+        }
+        hostedPointerGesture_ = HostedPointerGesture::ItemPressed;
+    } else if (hostedPointerHit_.kind ==
+                   WidgetViewHitKind::HeaderButton) {
+        hostedPointerGesture_ =
+            HostedPointerGesture::HeaderButtonPressed;
+        entry.view.SetVisualPointerState(
+            clientPoint, hostedPointerHit_.headerButton);
+    } else if (hostedPointerHit_.kind == WidgetViewHitKind::Header &&
+               !entry.descriptor.config.locked) {
+        hostedPointerGesture_ = HostedPointerGesture::Moving;
+    } else if (hostedPointerHit_.kind == WidgetViewHitKind::ResizeBorder &&
+               !entry.descriptor.config.locked &&
+               !entry.descriptor.config.collapsed) {
+        hostedPointerGesture_ = HostedPointerGesture::Resizing;
+    } else if (!entry.descriptor.config.collapsed) {
+        if (!controlPressed) {
+            entry.view.ClearSelection();
+        }
+        hostedPointerSelectionBaseline_ = controlPressed
+            ? entry.view.SelectedItemIds()
+            : std::vector<std::wstring>{};
+        hostedPointerGesture_ = HostedPointerGesture::MarqueePending;
+    }
+
+    selectedIdentities_.clear();
+    if (hostedPointerGesture_ == HostedPointerGesture::Moving ||
+        hostedPointerGesture_ == HostedPointerGesture::Resizing) {
+        RECT hostScreen{};
+        GetWindowRect(hwnd_, &hostScreen);
+        hostedAlignmentRects_.clear();
+        for (const auto& hosted : hostedWidgets_) {
+            if (hosted == nullptr || !hosted->descriptor.visible ||
+                hosted.get() == &entry) {
+                continue;
+            }
+            RECT other = hosted->view.HostPixelBounds();
+            OffsetRect(&other, hostScreen.left, hostScreen.top);
+            hostedAlignmentRects_.push_back(other);
+        }
+    }
+    desktopKeyboardSelectionArmed_ = false;
+    SynchronizeExplorerSelection();
+    if (hostedPointerGesture_ != HostedPointerGesture::None) {
+        SetCapture(hwnd_);
+    }
+    InvalidateRect(hwnd_, nullptr, FALSE);
+    return true;
+}
+
+void DesktopSurfaceWindow::ClearHostedDragFeedback() noexcept {
+    for (const auto& hosted : hostedWidgets_) {
+        if (hosted != nullptr) {
+            hosted->view.SetInsertionIndex(-1);
+        }
+    }
+    hostedPointerTargetWidgetIndex_ = -1;
+    hostedDragInsertionIndex_ = -1;
+}
+
+void DesktopSurfaceWindow::ContinueHostedPointerGesture(
+    POINT clientPoint) {
+    if (hostedPointerGesture_ == HostedPointerGesture::None ||
+        hostedPointerWidgetIndex_ < 0 ||
+        static_cast<size_t>(hostedPointerWidgetIndex_) >=
+            hostedWidgets_.size() ||
+        hostedWidgets_[static_cast<size_t>(hostedPointerWidgetIndex_)] ==
+            nullptr) {
+        return;
+    }
+    hostedPointerCurrent_ = clientPoint;
+    HostedWidgetEntry& source = *hostedWidgets_[
+        static_cast<size_t>(hostedPointerWidgetIndex_)];
+
+    if (hostedPointerGesture_ == HostedPointerGesture::Moving) {
+        RECT bounds = hostedPointerOriginalBounds_;
+        OffsetRect(
+            &bounds,
+            clientPoint.x - hostedPointerStart_.x,
+            clientPoint.y - hostedPointerStart_.y);
+        RECT hostScreen{};
+        GetWindowRect(hwnd_, &hostScreen);
+        OffsetRect(&bounds, hostScreen.left, hostScreen.top);
+        const WidgetAlignmentGuides guides = SnapMovingWidget(
+            bounds, source.descriptor.config.dpi,
+            hostedAlignmentRects_);
+        WidgetAlignmentGuideOverlay::Update(instance_, guides);
+        OffsetRect(&bounds, -hostScreen.left, -hostScreen.top);
+        source.view.SetHostPixelBounds(bounds);
+    } else if (hostedPointerGesture_ ==
+                   HostedPointerGesture::Resizing) {
+        RECT bounds = hostedPointerOriginalBounds_;
+        const int minWidth = MulDiv(
+            260, std::max(96, source.descriptor.config.dpi), 96);
+        const int minHeight = MulDiv(
+            120, std::max(96, source.descriptor.config.dpi), 96);
+        const int edges = hostedPointerHit_.resizeEdges;
+        if (edges & kWidgetResizeLeft) {
+            bounds.left = std::min(
+                bounds.right - minWidth,
+                hostedPointerOriginalBounds_.left +
+                    clientPoint.x - hostedPointerStart_.x);
+        } else if (edges & kWidgetResizeRight) {
+            bounds.right = std::max(
+                bounds.left + minWidth,
+                hostedPointerOriginalBounds_.right +
+                    clientPoint.x - hostedPointerStart_.x);
+        }
+        if (edges & kWidgetResizeBottom) {
+            bounds.bottom = std::max(
+                bounds.top + minHeight,
+                hostedPointerOriginalBounds_.bottom +
+                    clientPoint.y - hostedPointerStart_.y);
+        }
+        RECT hostScreen{};
+        GetWindowRect(hwnd_, &hostScreen);
+        OffsetRect(&bounds, hostScreen.left, hostScreen.top);
+        const WPARAM sizingEdge = (edges & kWidgetResizeBottom)
+            ? (edges & kWidgetResizeLeft) ? WMSZ_BOTTOMLEFT
+                : (edges & kWidgetResizeRight) ? WMSZ_BOTTOMRIGHT
+                : WMSZ_BOTTOM
+            : (edges & kWidgetResizeLeft) ? WMSZ_LEFT : WMSZ_RIGHT;
+        const WidgetAlignmentGuides guides = SnapSizingWidget(
+            bounds, sizingEdge, source.descriptor.config.dpi,
+            hostedAlignmentRects_);
+        WidgetAlignmentGuideOverlay::Update(instance_, guides);
+        OffsetRect(&bounds, -hostScreen.left, -hostScreen.top);
+        source.view.SetHostPixelBounds(bounds);
+    } else if (hostedPointerGesture_ ==
+                   HostedPointerGesture::MarqueePending ||
+               hostedPointerGesture_ ==
+                   HostedPointerGesture::MarqueeActive) {
+        if (hostedPointerGesture_ ==
+                HostedPointerGesture::MarqueePending &&
+            HasExceededDragThreshold(hostedPointerStart_, clientPoint)) {
+            hostedPointerGesture_ = HostedPointerGesture::MarqueeActive;
+        }
+        if (hostedPointerGesture_ == HostedPointerGesture::MarqueeActive) {
+            RECT marquee = NormalizeMarqueeRect(
+                hostedPointerStart_, clientPoint,
+                source.view.HostPixelBounds());
+            source.view.SelectItemsIntersectingHostRect(
+                marquee, hostedPointerSelectionBaseline_);
+            const POINT topLeft = source.view.HostPixelsToLocalDips(
+                POINT{marquee.left, marquee.top});
+            const POINT bottomRight = source.view.HostPixelsToLocalDips(
+                POINT{marquee.right, marquee.bottom});
+            source.view.SetMarquee(
+                RECT{topLeft.x, topLeft.y,
+                     bottomRight.x, bottomRight.y},
+                true);
+        }
+    } else if (hostedPointerGesture_ ==
+                   HostedPointerGesture::ItemPressed ||
+               hostedPointerGesture_ ==
+                   HostedPointerGesture::ItemDragging) {
+        if (hostedPointerGesture_ == HostedPointerGesture::ItemPressed &&
+            HasExceededDragThreshold(hostedPointerStart_, clientPoint)) {
+#ifndef NDEBUG
+            hostedDragActivationPointForSmoke_ = clientPoint;
+#endif
+            hostedPointerGesture_ = HostedPointerGesture::ItemDragging;
+            const DesktopItem* item = hostedPointerHit_.itemIndex < 0
+                ? nullptr
+                : source.view.ItemAt(
+                    static_cast<size_t>(hostedPointerHit_.itemIndex));
+            if (item != nullptr) {
+                POINT screenPoint = clientPoint;
+                ClientToScreen(hwnd_, &screenPoint);
+                const RECT sourceCell = source.view.ItemHostCell(
+                    static_cast<size_t>(hostedPointerHit_.itemIndex));
+                const int dpi = std::max(
+                    96, source.descriptor.config.dpi);
+                hostedDragGhostGeneration_ =
+                    DragGhostWindow::Instance().Begin(
+                        instance_, hwnd_, item->path,
+                        item->displayName,
+                        item->kind == DesktopItemKind::Shortcut ||
+                            item->kind == DesktopItemKind::UrlShortcut,
+                        source.descriptor.config.iconSize,
+                        source.view.SlotSize(),
+                        POINT{
+                            MulDiv(
+                                hostedPointerStart_.x - sourceCell.left,
+                                96, dpi),
+                            MulDiv(
+                                hostedPointerStart_.y - sourceCell.top,
+                                96, dpi)},
+                        screenPoint);
+            }
+        }
+        if (hostedPointerGesture_ == HostedPointerGesture::ItemDragging) {
+            POINT screenPoint = clientPoint;
+            ClientToScreen(hwnd_, &screenPoint);
+            DragGhostWindow::Instance().Update(screenPoint);
+            ClearHostedDragFeedback();
+            const int targetIndex = HostedWidgetIndexAt(clientPoint);
+            if (targetIndex >= 0 &&
+                static_cast<size_t>(targetIndex) < hostedWidgets_.size() &&
+                hostedWidgets_[static_cast<size_t>(targetIndex)] != nullptr) {
+                hostedPointerTargetWidgetIndex_ = targetIndex;
+                HostedWidgetEntry& target = *hostedWidgets_[
+                    static_cast<size_t>(targetIndex)];
+                const WidgetViewAction action = target.view.BuildDropAction(
+                    clientPoint, hostedDraggingItemIds_);
+                if (action.type ==
+                    WidgetViewActionType::ReorderSelection) {
+                    hostedDragInsertionIndex_ = action.insertionIndex;
+                    target.view.SetInsertionIndex(action.insertionIndex);
+                }
+                target.view.SetVisualPointerState(clientPoint);
+            }
+        }
+    }
+
+    const int hoveredHostedIndex = HostedWidgetIndexAt(clientPoint);
+    for (size_t index = 0; index < hostedWidgets_.size(); ++index) {
+        if (hostedWidgets_[index] == nullptr) {
+            continue;
+        }
+        if (hostedPointerGesture_ !=
+                HostedPointerGesture::HeaderButtonPressed ||
+            static_cast<int>(index) != hostedPointerWidgetIndex_) {
+            hostedWidgets_[index]->view.SetVisualPointerState(
+                static_cast<int>(index) == hoveredHostedIndex
+                    ? clientPoint
+                    : POINT{LONG_MIN, LONG_MIN});
+        }
+    }
+    InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+void DesktopSurfaceWindow::DispatchHostedHeaderButton(
+    size_t widgetIndex,
+    int button,
+    POINT screenPoint) {
+    if (widgetIndex >= hostedWidgets_.size() ||
+        hostedWidgets_[widgetIndex] == nullptr ||
+        hostedWidgetCommandHandler_ == nullptr) {
+        return;
+    }
+    HostedWidgetCommand command;
+    command.categoryId =
+        hostedWidgets_[widgetIndex]->descriptor.categoryId;
+    command.screenPoint = screenPoint;
+    if (button == 1) {
+        command.type = HostedWidgetCommandType::ToggleCollapsed;
+    } else if (button == 2) {
+        command.type = HostedWidgetCommandType::ToggleLocked;
+    } else if (button == 3) {
+        command.type = HostedWidgetCommandType::OpenCategoryLocation;
+    } else if (button == 4) {
+        command.type = HostedWidgetCommandType::ToggleContentView;
+    } else if (button == 5) {
+        command.type = HostedWidgetCommandType::ShowSortMenu;
+    } else if (button == 6) {
+        command.type = HostedWidgetCommandType::ShowBackgroundMenu;
+    }
+    if (command.type != HostedWidgetCommandType::None) {
+        hostedWidgetCommandHandler_(command);
+    }
+}
+
+void DesktopSurfaceWindow::CompleteHostedPointerGesture(
+    POINT clientPoint) {
+    if (hostedPointerGesture_ == HostedPointerGesture::None ||
+        hostedPointerWidgetIndex_ < 0 ||
+        static_cast<size_t>(hostedPointerWidgetIndex_) >=
+            hostedWidgets_.size() ||
+        hostedWidgets_[static_cast<size_t>(hostedPointerWidgetIndex_)] ==
+            nullptr) {
+        ResetHostedPointerGesture();
+        return;
+    }
+    HostedWidgetEntry& source = *hostedWidgets_[
+        static_cast<size_t>(hostedPointerWidgetIndex_)];
+    POINT screenPoint = clientPoint;
+    ClientToScreen(hwnd_, &screenPoint);
+
+    if (hostedPointerGesture_ ==
+            HostedPointerGesture::HeaderButtonPressed) {
+        const WidgetViewHit released =
+            source.view.HitTestHostPoint(clientPoint);
+        const bool invoke =
+            released.kind == WidgetViewHitKind::HeaderButton &&
+            released.headerButton == hostedPointerHit_.headerButton;
+        const size_t widgetIndex = static_cast<size_t>(
+            hostedPointerWidgetIndex_);
+        const int button = released.headerButton;
+        ResetHostedPointerGesture();
+        if (GetCapture() == hwnd_) {
+            ReleaseCapture();
+        }
+        InvalidateRect(hwnd_, nullptr, FALSE);
+        if (invoke) {
+            DispatchHostedHeaderButton(
+                widgetIndex,
+                button,
+                screenPoint);
+        }
+        return;
+    } else if (hostedPointerGesture_ == HostedPointerGesture::Moving ||
+               hostedPointerGesture_ == HostedPointerGesture::Resizing) {
+        const RECT bounds = source.view.HostPixelBounds();
+        RECT hostScreen{};
+        GetWindowRect(hwnd_, &hostScreen);
+        HostedWidgetCommand command;
+        command.type = HostedWidgetCommandType::CommitLayout;
+        command.categoryId = source.descriptor.categoryId;
+        command.layout = hostedPointerOriginalLayout_;
+        command.layout.x = hostScreen.left + bounds.left;
+        command.layout.y = hostScreen.top + bounds.top;
+        if (hostedPointerGesture_ == HostedPointerGesture::Resizing) {
+            command.layout.width = bounds.right - bounds.left;
+            command.layout.height = bounds.bottom - bounds.top;
+            command.layout.normalHeight = command.layout.height;
+        }
+        if (hostedWidgetCommandHandler_ == nullptr ||
+            !hostedWidgetCommandHandler_(command)) {
+            source.view.SetHostPixelBounds(hostedPointerOriginalBounds_);
+        }
+    } else if (hostedPointerGesture_ ==
+                   HostedPointerGesture::ItemPressed) {
+        if (hostedPointerPressedWasSelected_ &&
+            hostedPointerHit_.itemIndex >= 0) {
+            source.view.SelectItem(
+                static_cast<size_t>(hostedPointerHit_.itemIndex),
+                hostedPointerControlPressed_);
+        }
+        if (source.descriptor.singleClickOpen &&
+            !hostedPointerControlPressed_ &&
+            !source.view.SelectedItemIds().empty()) {
+            HostedWidgetCommand command;
+            command.type = HostedWidgetCommandType::OpenSelection;
+            command.categoryId = source.descriptor.categoryId;
+            command.itemIds = source.view.SelectedItemIds();
+            if (hostedWidgetCommandHandler_ != nullptr) {
+                hostedWidgetCommandHandler_(command);
+            }
+        }
+    } else if (hostedPointerGesture_ ==
+                   HostedPointerGesture::ItemDragging) {
+        DragGhostWindow::Instance().Commit(screenPoint);
+        const POINT primaryDropPoint =
+            DragGhostWindow::Instance().IsCommitted()
+            ? DragGhostWindow::Instance().TopLeftScreenPoint()
+            : screenPoint;
+        const int targetIndex = HostedWidgetIndexAt(clientPoint);
+        if (targetIndex >= 0 &&
+            static_cast<size_t>(targetIndex) < hostedWidgets_.size() &&
+            hostedWidgets_[static_cast<size_t>(targetIndex)] != nullptr) {
+            HostedWidgetEntry& target = *hostedWidgets_[
+                static_cast<size_t>(targetIndex)];
+            const WidgetViewAction action = target.view.BuildDropAction(
+                clientPoint, hostedDraggingItemIds_);
+            if (action.type == WidgetViewActionType::ShellDropTarget) {
+                DispatchHostedWidgetAction(
+                    static_cast<size_t>(targetIndex), action, screenPoint);
+            } else if (action.type ==
+                       WidgetViewActionType::ReorderSelection) {
+                if (IdentitiesEqual(
+                        target.descriptor.categoryId,
+                        source.descriptor.categoryId)) {
+                    DispatchHostedWidgetAction(
+                        static_cast<size_t>(targetIndex),
+                        action, screenPoint);
+                } else if (hostedWidgetCommandHandler_ != nullptr) {
+                    HostedWidgetCommand command;
+                    command.type =
+                        HostedWidgetCommandType::MoveSelectionToCategory;
+                    command.categoryId = source.descriptor.categoryId;
+                    command.targetCategoryId =
+                        target.descriptor.categoryId;
+                    command.itemIds = hostedDraggingItemIds_;
+                    command.insertionIndex = action.insertionIndex;
+                    command.screenPoint = screenPoint;
+                    hostedWidgetCommandHandler_(command);
+                }
+            }
+        } else if (hostedWidgetCommandHandler_ != nullptr) {
+            HostedWidgetCommand command;
+            command.type = HostedWidgetCommandType::MoveSelectionOut;
+            command.categoryId = source.descriptor.categoryId;
+            command.itemIds = hostedDraggingItemIds_;
+            command.screenPoint = primaryDropPoint;
+            if (hostedPointerHit_.itemIndex >= 0) {
+                const RECT primaryCell = source.view.ItemHostCell(
+                    static_cast<size_t>(hostedPointerHit_.itemIndex));
+                for (const std::wstring& itemId : hostedDraggingItemIds_) {
+                    POINT itemPoint = primaryDropPoint;
+                    for (size_t index = 0;; ++index) {
+                        const DesktopItem* item = source.view.ItemAt(index);
+                        if (item == nullptr) {
+                            break;
+                        }
+                        if (IdentitiesEqual(item->id, itemId)) {
+                            const RECT cell = source.view.ItemHostCell(index);
+                            itemPoint.x += cell.left - primaryCell.left;
+                            itemPoint.y += cell.top - primaryCell.top;
+                            break;
+                        }
+                    }
+                    command.itemScreenPoints.push_back(itemPoint);
+                }
+            }
+            hostedWidgetCommandHandler_(command);
+        }
+    }
+
+    if ((hostedPointerGesture_ == HostedPointerGesture::Moving ||
+         hostedPointerGesture_ == HostedPointerGesture::Resizing) &&
+        hostedPointerWidgetIndex_ >= 0 &&
+        static_cast<size_t>(hostedPointerWidgetIndex_) <
+            hostedWidgets_.size() &&
+        hostedWidgets_[static_cast<size_t>(hostedPointerWidgetIndex_)] !=
+            nullptr) {
+        hostedPointerOriginalBounds_ = hostedWidgets_[
+            static_cast<size_t>(hostedPointerWidgetIndex_)]->
+                view.HostPixelBounds();
+    }
+    ResetHostedPointerGesture();
+    InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+void DesktopSurfaceWindow::ResetHostedPointerGesture() noexcept {
+    WidgetAlignmentGuideOverlay::Hide();
+    if ((hostedPointerGesture_ == HostedPointerGesture::Moving ||
+         hostedPointerGesture_ == HostedPointerGesture::Resizing) &&
+        hostedPointerWidgetIndex_ >= 0 &&
+        static_cast<size_t>(hostedPointerWidgetIndex_) <
+            hostedWidgets_.size() &&
+        hostedWidgets_[static_cast<size_t>(hostedPointerWidgetIndex_)] !=
+            nullptr) {
+        hostedWidgets_[static_cast<size_t>(hostedPointerWidgetIndex_)]->
+            view.SetHostPixelBounds(hostedPointerOriginalBounds_);
+    }
+    if (hostedPointerWidgetIndex_ >= 0 &&
+        static_cast<size_t>(hostedPointerWidgetIndex_) <
+            hostedWidgets_.size() &&
+        hostedWidgets_[static_cast<size_t>(hostedPointerWidgetIndex_)] !=
+            nullptr) {
+        hostedWidgets_[static_cast<size_t>(hostedPointerWidgetIndex_)]->
+            view.SetMarquee(RECT{}, false);
+        hostedWidgets_[static_cast<size_t>(hostedPointerWidgetIndex_)]->
+            view.SetVisualPointerState(
+                POINT{std::numeric_limits<LONG>::min(),
+                      std::numeric_limits<LONG>::min()},
+                -1);
+    }
+    ClearHostedDragFeedback();
+    if (hostedDragGhostGeneration_ != 0) {
+        DragGhostWindow::Instance().EndIfGeneration(
+            hostedDragGhostGeneration_);
+    }
+    hostedDragGhostGeneration_ = 0;
+    hostedPointerGesture_ = HostedPointerGesture::None;
+    hostedPointerWidgetIndex_ = -1;
+    hostedPointerControlPressed_ = false;
+    hostedPointerPressedWasSelected_ = false;
+    hostedPointerHit_ = {};
+    hostedPointerSelectionBaseline_.clear();
+    hostedDraggingItemIds_.clear();
+    hostedAlignmentRects_.clear();
 }
 
 void DesktopSurfaceWindow::UpdateViewMetrics() {
@@ -1599,15 +3052,18 @@ void DesktopSurfaceWindow::ConfigurePixelRenderTarget() {
 }
 
 int DesktopSurfaceWindow::HitTest(POINT clientPoint) const {
+    // The Lattice display point can differ from Explorer's native point.
+    // Choose the item actually painted under the pointer before asking the
+    // native ListView, and keep empty cell gaps outside this hit region.
+    for (size_t reverse = visibleItems_.size(); reverse > 0; --reverse) {
+        const size_t index = reverse - 1;
+        if (IsInFallbackHitRegion(visibleItems_[index], clientPoint)) {
+            return static_cast<int>(index);
+        }
+    }
     int nativeIndex = -1;
     if (TryNativeHitTest(clientPoint, nativeIndex)) {
         return nativeIndex;
-    }
-    for (size_t index = 0; index < visibleItems_.size(); ++index) {
-        if (IsInFallbackHitRegion(
-                visibleItems_[index], clientPoint)) {
-            return static_cast<int>(index);
-        }
     }
     return -1;
 }
@@ -2248,6 +3704,28 @@ bool DesktopSurfaceWindow::TryShellDropTargetAtScreenPoint(
     POINT clientPoint = screenPoint;
     if (ScreenToClient(hwnd_, &clientPoint) == FALSE) {
         return false;
+    }
+    const int hostedIndex = HostedWidgetIndexAt(clientPoint);
+    if (hostedIndex >= 0) {
+        const WidgetView& view = hostedWidgets_[
+            static_cast<size_t>(hostedIndex)]->view;
+        const WidgetViewHit hit = view.HitTestHostPoint(clientPoint);
+        if (hit.kind != WidgetViewHitKind::ItemIcon ||
+            hit.itemIndex < 0) {
+            return false;
+        }
+        const DesktopItem* item = view.ItemAt(
+            static_cast<size_t>(hit.itemIndex));
+        if (item == nullptr || item->path.empty() ||
+            std::any_of(
+                excludedItems.begin(), excludedItems.end(),
+                [&](const ShellItemReference& source) {
+                    return IdentitiesEqual(source.path, item->path);
+                })) {
+            return false;
+        }
+        return SUCCEEDED(CreateDesktopShellItemReference(
+            item->path, targetItem));
     }
     const int targetIndex = HitTest(clientPoint);
     if (targetIndex < 0 ||
@@ -2992,8 +4470,212 @@ bool DesktopSurfaceWindow::IsAssigned(
         });
 }
 
-void DesktopSurfaceWindow::RebuildVisibleItems() {
+std::vector<DesktopPosition>
+DesktopSurfaceWindow::ResolveVisiblePositionCollisions(
+    const std::vector<DesktopPosition>& nativePositions,
+    const std::vector<DesktopPosition>& displayOverrides,
+    const RECT& viewBounds,
+    int cellWidth,
+    int cellHeight,
+    const std::vector<std::wstring>& newlyObserved) {
+    std::vector<DesktopPosition> resolved = nativePositions;
+    if (nativePositions.empty() || cellWidth <= 0 || cellHeight <= 0 ||
+        viewBounds.right <= viewBounds.left ||
+        viewBounds.bottom <= viewBounds.top) {
+        return resolved;
+    }
+    const auto overrideFor = [&](const std::wstring& identity) {
+        return std::find_if(
+            displayOverrides.begin(), displayOverrides.end(),
+            [&](const DesktopPosition& position) {
+                return IdentitiesEqual(position.path, identity);
+            });
+    };
+    const auto isNew = [&](const std::wstring& identity) {
+        return std::any_of(
+            newlyObserved.begin(), newlyObserved.end(),
+            [&](const std::wstring& candidate) {
+                return IdentitiesEqual(candidate, identity);
+            });
+    };
+    const auto inside = [&](POINT point) {
+        return point.x >= viewBounds.left && point.x < viewBounds.right &&
+            point.y >= viewBounds.top && point.y < viewBounds.bottom;
+    };
+    const auto nativeAnchor = std::find_if(
+        nativePositions.begin(), nativePositions.end(),
+        [&](const DesktopPosition& position) {
+            return inside(position.point);
+        });
+    if (nativeAnchor == nativePositions.end()) return resolved;
+    const auto remainder = [](int coordinate, int spacing) {
+        return (coordinate % spacing + spacing) % spacing;
+    };
+    const int firstX = viewBounds.left + remainder(
+        nativeAnchor->point.x - viewBounds.left, cellWidth);
+    const int firstY = viewBounds.top + remainder(
+        nativeAnchor->point.y - viewBounds.top, cellHeight);
+    std::vector<POINT> occupied;
+    occupied.reserve(nativePositions.size());
+    std::vector<bool> placed(nativePositions.size(), false);
+    const auto collides = [&](POINT point) {
+        return std::any_of(
+            occupied.begin(), occupied.end(),
+            [&](POINT used) {
+                return std::abs(static_cast<long long>(point.x) - used.x) <
+                        cellWidth &&
+                    std::abs(static_cast<long long>(point.y) - used.y) <
+                        cellHeight;
+            });
+    };
+    const auto place = [&](size_t index, bool preferFirstFree = false) {
+        placed[index] = true;
+        POINT point = nativePositions[index].point;
+        const auto preferred = overrideFor(nativePositions[index].path);
+        if (preferred != displayOverrides.end()) {
+            point = preferred->point;
+        }
+        if (preferFirstFree || (inside(point) && collides(point))) {
+            bool freeFound = false;
+            for (int x = firstX;
+                 !freeFound && x + cellWidth <= viewBounds.right;
+                 x += cellWidth) {
+                for (int y = firstY;
+                     y + cellHeight <= viewBounds.bottom;
+                     y += cellHeight) {
+                    POINT candidate{x, y};
+                    if (!collides(candidate)) {
+                        point = candidate;
+                        freeFound = true;
+                        break;
+                    }
+                }
+            }
+        }
+        resolved[index].point = point;
+        if (inside(point)) occupied.push_back(point);
+    };
+    // Existing Lattice and Explorer positions win. A newly observed desktop
+    // item uses the first free visible cell independently of Explorer's
+    // native placement, which still counts items hidden inside widgets.
+    for (size_t index = 0; index < nativePositions.size(); ++index) {
+        if (overrideFor(nativePositions[index].path) !=
+            displayOverrides.end()) {
+            place(index);
+        }
+    }
+    for (size_t index = 0; index < nativePositions.size(); ++index) {
+        if (!placed[index] && !isNew(nativePositions[index].path) &&
+            (!inside(nativePositions[index].point) ||
+             !collides(nativePositions[index].point))) {
+            place(index);
+        }
+    }
+    for (size_t index = 0; index < nativePositions.size(); ++index) {
+        if (!placed[index] && !isNew(nativePositions[index].path)) {
+            place(index);
+        }
+    }
+    for (size_t index = 0; index < nativePositions.size(); ++index) {
+        if (!placed[index]) {
+            place(index, true);
+        }
+    }
+    return resolved;
+}
+
+void DesktopSurfaceWindow::RebuildVisibleItems(
+    const std::vector<std::wstring>& newlyObserved) {
     CancelPointerCapture();
+    std::vector<DesktopPosition> nativePositions;
+    std::vector<DesktopPosition> displayOverrides;
+    nativePositions.reserve(snapshot_.items.size());
+    displayOverrides.reserve(positionOverrides_.size());
+    for (const DesktopViewItem& item : snapshot_.items) {
+        if (IsAssigned(item.path)) continue;
+        POINT nativePoint = item.viewPoint;
+        const auto existing = std::find_if(
+            positionOverrides_.begin(), positionOverrides_.end(),
+            [&](const PositionOverride& value) {
+                return IdentitiesEqual(value.identity, item.path);
+            });
+        if (existing != positionOverrides_.end()) {
+            nativePoint = existing->nativeScreenPoint;
+            if (snapshot_.listViewWindow != nullptr &&
+                IsWindow(snapshot_.listViewWindow) != FALSE) {
+                ScreenToClient(snapshot_.listViewWindow, &nativePoint);
+            } else {
+                nativePoint.x -= snapshot_.screenRect.left;
+                nativePoint.y -= snapshot_.screenRect.top;
+            }
+            displayOverrides.push_back(
+                DesktopPosition{item.path, existing->viewPoint});
+        }
+        nativePositions.push_back(
+            DesktopPosition{item.path, nativePoint});
+    }
+    const RECT viewBounds{
+        0, 0,
+        snapshot_.screenRect.right - snapshot_.screenRect.left,
+        snapshot_.screenRect.bottom - snapshot_.screenRect.top};
+    auto resolved = ResolveVisiblePositionCollisions(
+        nativePositions, displayOverrides, viewBounds,
+        cellWidth_, cellHeight_, newlyObserved);
+    std::vector<DesktopPosition> newDisplayPositions;
+    for (size_t index = 0; index < nativePositions.size(); ++index) {
+        if (std::any_of(
+                newlyObserved.begin(), newlyObserved.end(),
+                [&](const std::wstring& identity) {
+                    return IdentitiesEqual(
+                        identity, nativePositions[index].path);
+                }) &&
+            (resolved[index].point.x != nativePositions[index].point.x ||
+             resolved[index].point.y != nativePositions[index].point.y)) {
+            newDisplayPositions.push_back(resolved[index]);
+        }
+    }
+    if (!newDisplayPositions.empty() &&
+        (!displayPositionCommitHandler_ ||
+         !displayPositionCommitHandler_(newDisplayPositions))) {
+        resolved = ResolveVisiblePositionCollisions(
+            nativePositions, displayOverrides, viewBounds,
+            cellWidth_, cellHeight_);
+    }
+    for (size_t index = 0; index < resolved.size(); ++index) {
+        const DesktopPosition& position = resolved[index];
+        const auto item = std::find_if(
+            snapshot_.items.begin(), snapshot_.items.end(),
+            [&](const DesktopViewItem& value) {
+                return IdentitiesEqual(value.path, position.path);
+            });
+        if (item == snapshot_.items.end() ||
+            (item->viewPoint.x == position.point.x &&
+             item->viewPoint.y == position.point.y)) {
+            continue;
+        }
+        POINT screenPoint = position.point;
+        if (snapshot_.listViewWindow != nullptr &&
+            IsWindow(snapshot_.listViewWindow) != FALSE) {
+            ClientToScreen(snapshot_.listViewWindow, &screenPoint);
+        } else {
+            screenPoint.x += snapshot_.screenRect.left;
+            screenPoint.y += snapshot_.screenRect.top;
+        }
+        const auto existing = std::find_if(
+            positionOverrides_.begin(), positionOverrides_.end(),
+            [&](const PositionOverride& value) {
+                return IdentitiesEqual(value.identity, position.path);
+            });
+        if (existing == positionOverrides_.end()) {
+            positionOverrides_.push_back(PositionOverride{
+                position.path, screenPoint, item->screenPoint,
+                position.point});
+        } else {
+            existing->screenPoint = screenPoint;
+            existing->viewPoint = position.point;
+        }
+        SetItemScreenPoint(position.path, screenPoint);
+    }
     visibleItems_.clear();
     visibleItems_.reserve(snapshot_.items.size());
     for (const DesktopViewItem& item : snapshot_.items) {

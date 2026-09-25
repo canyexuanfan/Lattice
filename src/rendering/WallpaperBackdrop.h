@@ -49,6 +49,14 @@ public:
     bool HasBitmap() const noexcept { return bitmap_ != nullptr; }
     bool CoversPixels(int width, int height) const noexcept;
     unsigned long long Generation() const noexcept { return generation_; }
+    void Release() noexcept;
+#ifndef NDEBUG
+    bool SetSolidForSmoke(
+        ID2D1RenderTarget* renderTarget,
+        int width,
+        int height,
+        COLORREF color);
+#endif
 
 private:
     Microsoft::WRL::ComPtr<ID2D1Bitmap> bitmap_;

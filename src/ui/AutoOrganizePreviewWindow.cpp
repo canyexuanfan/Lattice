@@ -141,15 +141,18 @@ bool AutoOrganizePreviewWindow::Create() {
 
 void AutoOrganizePreviewWindow::ShowOrActivate() {
     if (!Create()) return;
+    const bool rebuild = resourcesSuspended_;
+    RestoreVisibleResources();
     ShowWindow(hwnd_, IsIconic(hwnd_) != FALSE ? SW_RESTORE : SW_SHOWNORMAL);
     SetForegroundWindow(hwnd_);
-    if (plan_.decisions.empty() && state_ != ViewState::Scanning) StartScan();
+    if (rebuild ||
+        (plan_.decisions.empty() && state_ != ViewState::Scanning)) {
+        StartScan();
+    }
 }
 
 void AutoOrganizePreviewWindow::Close() {
-    cancelRequested_.store(true);
-    if (scanThread_.joinable()) scanThread_.join();
-    EndDecisionDragVisual();
+    DeactivateAndRelease();
     if (IsOpen()) DestroyWindow(hwnd_);
     hwnd_ = nullptr;
 }
@@ -297,6 +300,7 @@ LRESULT AutoOrganizePreviewWindow::HandleMessage(
     LPARAM lParam) {
     switch (message) {
         case WM_CREATE:
+            resourcesSuspended_ = false;
             dpi_ = GetDpiForWindow(hwnd_);
             d2d_.Initialize(hwnd_);
             iconCache_.SetCapacity(128);
@@ -307,15 +311,11 @@ LRESULT AutoOrganizePreviewWindow::HandleMessage(
             StartScan();
             return 0;
         case WM_CLOSE:
-            CancelScan(false);
-            EndDecisionDragVisual();
-            ShowWindow(hwnd_, SW_HIDE);
+            DeactivateAndRelease();
             return 0;
         case WM_DESTROY:
-            KillTimer(hwnd_, kTooltipTimer);
-            EndDecisionDragVisual();
+            DeactivateAndRelease();
             iconCache_.SetInvalidateCallback(nullptr);
-            cancelRequested_.store(true);
             hwnd_ = nullptr;
             return 0;
         case WM_NCCALCSIZE:
@@ -351,16 +351,23 @@ LRESULT AutoOrganizePreviewWindow::HandleMessage(
                 suggested->right - suggested->left,
                 suggested->bottom - suggested->top,
                 SWP_NOZORDER | SWP_NOACTIVATE);
-            d2d_.RecreateTarget(hwnd_);
+            if (!resourcesSuspended_) {
+                d2d_.RecreateTarget(hwnd_);
+            }
             textFormat_.Reset(); smallFormat_.Reset(); tinyFormat_.Reset();
             titleFormat_.Reset(); headingFormat_.Reset();
             windowActionFormat_.Reset();
-            EnsureTextFormats();
+            dashedStroke_.Reset();
+            if (!resourcesSuspended_) {
+                EnsureTextFormats();
+            }
             return 0;
         }
         case WM_SIZE:
-            d2d_.Resize(LOWORD(lParam), HIWORD(lParam));
-            InvalidateRect(hwnd_, nullptr, FALSE);
+            if (!resourcesSuspended_) {
+                d2d_.Resize(LOWORD(lParam), HIWORD(lParam));
+                InvalidateRect(hwnd_, nullptr, FALSE);
+            }
             return 0;
         case WM_GETMINMAXINFO: {
             auto* limits = reinterpret_cast<MINMAXINFO*>(lParam);
@@ -577,8 +584,7 @@ LRESULT AutoOrganizePreviewWindow::HandleMessage(
                 } else if (state_ == ViewState::Scanning) {
                     CancelScan(true);
                 } else {
-                    EndDecisionDragVisual();
-                    ShowWindow(hwnd_, SW_HIDE);
+                    DeactivateAndRelease();
                 }
                 return 0;
             }
@@ -612,6 +618,9 @@ LRESULT AutoOrganizePreviewWindow::HandleMessage(
 }
 
 void AutoOrganizePreviewWindow::StartScan() {
+    if (resourcesSuspended_) {
+        return;
+    }
     CancelScan(false);
     EndDecisionDragVisual();
     if (!inputProvider_) {
@@ -681,6 +690,73 @@ void AutoOrganizePreviewWindow::CancelScan(bool showCancelledState) {
         stateMessage_ = L"扫描已取消。桌面、格子和配置保持原样。";
         InvalidateRect(hwnd_, nullptr, FALSE);
     }
+}
+
+void AutoOrganizePreviewWindow::DeactivateAndRelease() {
+    if (hwnd_ != nullptr && IsWindow(hwnd_) != FALSE &&
+        IsWindowVisible(hwnd_) != FALSE) {
+        ShowWindow(hwnd_, SW_HIDE);
+    }
+    CancelScan(false);
+    if (hwnd_ != nullptr) {
+        MSG pending{};
+        while (PeekMessageW(
+                &pending,
+                hwnd_,
+                kScanCompleteMessage,
+                kScanCompleteMessage,
+                PM_REMOVE) != FALSE) {
+            delete reinterpret_cast<ScanResult*>(pending.lParam);
+        }
+    }
+    EndDecisionDragVisual();
+    if (GetCapture() == hwnd_) {
+        ReleaseCapture();
+    }
+    if (hwnd_ != nullptr) {
+        KillTimer(hwnd_, kTooltipTimer);
+    }
+    input_ = {};
+    plan_ = {};
+    layoutPlan_ = {};
+    state_ = ViewState::Scanning;
+    stateMessage_.clear();
+    hitTargets_.clear();
+    hoverHit_ = -1;
+    pressedHit_ = -1;
+    focusedHit_ = -1;
+    selectedDecision_ = -1;
+    navigationFilter_ = 0;
+    monitorFilter_ = 0;
+    dragOriginPixels_ = {};
+    draggingPosition_ = -1;
+    draggingDecision_ = -1;
+    draggingDecisionMoved_ = false;
+    dragGhostGrabOffsetDips_ = {};
+    groupScrollOffset_ = 0;
+    manualGroupSequence_ = 0;
+    groupRowOffsets_.clear();
+    desktopChangeBlocksApply_ = false;
+    trackingMouse_ = false;
+    iconCache_.Clear();
+    textFormat_.Reset();
+    smallFormat_.Reset();
+    tinyFormat_.Reset();
+    titleFormat_.Reset();
+    headingFormat_.Reset();
+    windowActionFormat_.Reset();
+    dashedStroke_.Reset();
+    d2d_.ReleaseTarget();
+    resourcesSuspended_ = true;
+}
+
+void AutoOrganizePreviewWindow::RestoreVisibleResources() {
+    if (!resourcesSuspended_ || hwnd_ == nullptr || IsWindow(hwnd_) == FALSE) {
+        return;
+    }
+    resourcesSuspended_ = false;
+    d2d_.RecreateTarget(hwnd_);
+    EnsureTextFormats();
 }
 
 void AutoOrganizePreviewWindow::AdoptScanResult(ScanResult* rawResult) {
@@ -1673,6 +1749,10 @@ void AutoOrganizePreviewWindow::RebuildHitTargets() {
 void AutoOrganizePreviewWindow::Render() {
     PAINTSTRUCT paint{};
     BeginPaint(hwnd_, &paint);
+    if (resourcesSuspended_) {
+        EndPaint(hwnd_, &paint);
+        return;
+    }
     if (d2d_.Target() == nullptr) d2d_.RecreateTarget(hwnd_);
     EnsureTextFormats();
     d2d_.BeginDraw();
@@ -1741,7 +1821,7 @@ void AutoOrganizePreviewWindow::ActivateHit(const HitTarget& hit) {
     switch (hit.kind) {
         case HitKind::Close:
         case HitKind::Cancel:
-            ShowWindow(hwnd_, SW_HIDE);
+            DeactivateAndRelease();
             break;
         case HitKind::Minimize:
             ShowWindow(hwnd_, SW_MINIMIZE);
@@ -1805,10 +1885,10 @@ void AutoOrganizePreviewWindow::ActivateHit(const HitTarget& hit) {
                     stateMessage_ = L"正在逐字段撤销仍安全的调整；之后手动修改的内容会保留。";
                     undoHandler_(hwnd_);
                 } else {
-                    ShowWindow(hwnd_, SW_HIDE);
+                    DeactivateAndRelease();
                 }
             } else if (state_ == ViewState::UndoSuccess) {
-                ShowWindow(hwnd_, SW_HIDE);
+                DeactivateAndRelease();
             } else if (state_ == ViewState::UndoConflict ||
                        state_ == ViewState::UndoError) {
                 state_ = ViewState::Success;

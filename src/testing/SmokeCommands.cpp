@@ -32,6 +32,7 @@
 #include <string>
 #include <tuple>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 #include "app/App.h"
@@ -39,7 +40,9 @@
 #include "app/StartupManager.h"
 #include "app/UpdateService.h"
 #include "config/ConfigStore.h"
+#include "config/LayoutSnapshot.h"
 #include "desktop/DesktopScanner.h"
+#include "desktop/DesktopSnapshot.h"
 #include "desktop/DesktopWatcher.h"
 #include "desktop/DesktopLayout.h"
 #include "desktop/LegacyStorageMigrator.h"
@@ -62,9 +65,40 @@
 #include "ui/MessageDialog.h"
 #include "ui/SettingsDialog.h"
 #include "ui/WidgetWindow.h"
+#include "ui/WidgetView.h"
 #include "testing/SmokeCommands.h"
 
 #pragma comment(lib, "dwmapi.lib")
+
+struct DragGhostWindowSmokeAccess {
+    static bool CaptureStagedPixels(
+        DragGhostWindow& ghost,
+        HINSTANCE instance,
+        HICON icon,
+        bool shortcut,
+        std::vector<COLORREF>& pixels) {
+        if (icon == nullptr) return false;
+        ghost.Stage(
+            instance, nullptr, L"shortcut-overlay-smoke", icon,
+            L"Lattice smoke", shortcut, 48, SIZE{96, 104});
+        if (ghost.surfaceDc_ == nullptr ||
+            ghost.windowSizePixels_.cx <= 0 ||
+            ghost.windowSizePixels_.cy <= 0) {
+            ghost.End();
+            return false;
+        }
+        pixels.clear();
+        pixels.reserve(static_cast<size_t>(ghost.windowSizePixels_.cx) *
+            ghost.windowSizePixels_.cy);
+        for (int y = 0; y < ghost.windowSizePixels_.cy; ++y) {
+            for (int x = 0; x < ghost.windowSizePixels_.cx; ++x) {
+                pixels.push_back(GetPixel(ghost.surfaceDc_, x, y));
+            }
+        }
+        ghost.End();
+        return true;
+    }
+};
 
 namespace {
 
@@ -341,6 +375,11 @@ struct AutoOrganizePreviewWindowSmokeAccess {
         window.Render();
     }
 
+    static size_t PendingIconRequests(
+        const AutoOrganizePreviewWindow& window) {
+        return window.iconCache_.PendingCountForTesting();
+    }
+
     static void MarkDesktopChanged(AutoOrganizePreviewWindow& window) {
         window.MarkDesktopChanged();
     }
@@ -534,6 +573,29 @@ struct AutoOrganizePreviewWindowSmokeAccess {
     static bool UndoSucceeded(const AutoOrganizePreviewWindow& window) {
         return window.state_ == AutoOrganizePreviewWindow::ViewState::UndoSuccess;
     }
+
+    static bool InvisibleResourcesReleased(
+        const AutoOrganizePreviewWindow& window) {
+        return !window.scanThread_.joinable() &&
+            window.input_.snapshot.items.empty() &&
+            window.input_.snapshot.categories.empty() &&
+            window.input_.layoutContext.monitors.empty() &&
+            window.input_.layoutContext.existingWidgets.empty() &&
+            window.plan_.decisions.empty() &&
+            window.plan_.groups.empty() &&
+            window.layoutPlan_.placements.empty() &&
+            window.hitTargets_.empty() &&
+            window.groupRowOffsets_.empty() &&
+            window.iconCache_.Size() == 0 &&
+            window.d2d_.Target() == nullptr &&
+            window.textFormat_ == nullptr &&
+            window.smallFormat_ == nullptr &&
+            window.tinyFormat_ == nullptr &&
+            window.titleFormat_ == nullptr &&
+            window.headingFormat_ == nullptr &&
+            window.windowActionFormat_ == nullptr &&
+            window.dashedStroke_ == nullptr;
+    }
 };
 
 struct WidgetWindowSmokeAccess {
@@ -557,6 +619,54 @@ struct WidgetWindowSmokeAccess {
         return GetClientRect(widget.hwnd_, &client) &&
             widget.wallpaperBackdrop_.CoversPixels(
                 client.right, client.bottom);
+    }
+
+    static bool HasVisibleResources(const WidgetWindow& widget) {
+        return widget.d2d_.Target() != nullptr &&
+            widget.wallpaperBackdrop_.HasBitmap();
+    }
+
+    static bool InvisibleResourcesReleased(const WidgetWindow& widget) {
+        return widget.d2d_.Target() == nullptr &&
+            !widget.wallpaperBackdrop_.HasBitmap() &&
+            widget.iconCache_.Size() == 0;
+    }
+
+    static bool PrimeIconCache(WidgetWindow& widget) {
+        wchar_t modulePath[32768]{};
+        if (GetModuleFileNameW(nullptr, modulePath, ARRAYSIZE(modulePath)) == 0 ||
+            widget.d2d_.Target() == nullptr) {
+            return false;
+        }
+        const ULONGLONG deadline = GetTickCount64() + 3000;
+        do {
+            widget.iconCache_.GetIcon(widget.d2d_.Target(), modulePath);
+            if (widget.iconCache_.Size() != 0) {
+                return true;
+            }
+            MSG message{};
+            while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+                TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
+            Sleep(5);
+        } while (GetTickCount64() < deadline);
+        return false;
+    }
+
+    static bool CollapsedResourcesAreBounded(const WidgetWindow& widget) {
+        RECT client{};
+        if (!GetClientRect(widget.hwnd_, &client) ||
+            client.right <= 0 || client.bottom <= 0 ||
+            widget.d2d_.Target() == nullptr ||
+            !widget.wallpaperBackdrop_.CoversPixels(
+                client.right, client.bottom) ||
+            widget.iconCache_.Size() != 0) {
+            return false;
+        }
+        return widget.windowConfig_.normalHeight <= client.bottom ||
+            !widget.wallpaperBackdrop_.CoversPixels(
+                client.right, widget.windowConfig_.normalHeight);
     }
 
     static constexpr WallpaperBackdropDrawMode
@@ -840,21 +950,8 @@ struct WidgetWindowSmokeAccess {
     static std::wstring LoadedItemIdForPath(
         const WidgetWindow& widget,
         const std::wstring& path) {
-        const auto found = std::find_if(
-            widget.items_.begin(),
-            widget.items_.end(),
-            [&](const DesktopItem& item) {
-                return CompareStringOrdinal(
-                           item.path.c_str(), -1, path.c_str(), -1, TRUE) ==
-                       CSTR_EQUAL;
-            });
-        return found == widget.items_.end() ? L"" : found->id;
-    }
-
-    static void AddLoadedItem(
-        WidgetWindow& widget,
-        const DesktopItem& item) {
-        widget.items_.push_back(item);
+        const DesktopItem* item = widget.FindItemByPath(path);
+        return item == nullptr ? L"" : item->id;
     }
 
     static void AliasIcon(
@@ -863,12 +960,405 @@ struct WidgetWindowSmokeAccess {
         const std::wstring& destinationPath) {
         widget.iconCache_.Alias(sourcePath, destinationPath);
     }
+
+    static bool SetSolidWallpaper(WidgetWindow& widget, COLORREF color) {
+        RECT client{};
+        if (widget.hwnd_ != nullptr) {
+            // Mirrors the private WidgetWindow backdrop timer used by the
+            // fixed-pixel smoke oracle; production scheduling is unchanged.
+            constexpr UINT_PTR kWidgetBackdropRefreshTimerId = 4;
+            KillTimer(widget.hwnd_, kWidgetBackdropRefreshTimerId);
+        }
+        return widget.hwnd_ != nullptr &&
+            widget.d2d_.Target() != nullptr &&
+            GetClientRect(widget.hwnd_, &client) != FALSE &&
+            widget.wallpaperBackdrop_.SetSolidForSmoke(
+                widget.d2d_.Target(),
+                client.right - client.left,
+                client.bottom - client.top,
+                color);
+    }
+
+    static void ConfigureVisualState(
+        WidgetWindow& widget,
+        bool headerHovered,
+        int hoverHeaderButton,
+        int hoverItemIndex,
+        int pressedHeaderButton,
+        RECT marqueeRect,
+        bool marqueeActive,
+        int insertionIndex) {
+        widget.headerHovered_ = headerHovered;
+        widget.hoverHeaderButton_ = hoverHeaderButton;
+        widget.pressedHeaderButton_ = pressedHeaderButton;
+        widget.iconGrid_.SetHoverIndex(hoverItemIndex);
+        widget.pointerSelectionGesture_ = marqueeActive
+            ? WidgetWindow::PointerSelectionGesture::MarqueeActive
+            : WidgetWindow::PointerSelectionGesture::None;
+        widget.selectionMarqueeRect_ = marqueeRect;
+        widget.dragVisualActive_ = insertionIndex >= 0;
+        widget.dragInsertionIndex_ = insertionIndex;
+        widget.shellDropPreviewActive_ = false;
+        widget.shellDropInsertionIndex_ = -1;
+    }
+
+    static bool RenderNow(WidgetWindow& widget) {
+        if (widget.hwnd_ == nullptr || IsWindow(widget.hwnd_) == FALSE) {
+            return false;
+        }
+        InvalidateRect(widget.hwnd_, nullptr, FALSE);
+        widget.Render();
+        return SUCCEEDED(widget.lastRenderResult_);
+    }
+
+    static ID2D1HwndRenderTarget* RenderTarget(WidgetWindow& widget) {
+        return widget.d2d_.Target();
+    }
 };
 
 struct DesktopSurfaceWindowSmokeAccess {
     static constexpr WallpaperBackdropDrawMode
     WallpaperDrawMode() {
         return DesktopSurfaceWindow::kWallpaperDrawMode;
+    }
+
+    static bool ConfigureProductionHost(
+        DesktopSurfaceWindow& surface,
+        HWND hostWindow,
+        COLORREF wallpaperColor) {
+        RECT client{};
+        if (hostWindow == nullptr ||
+            GetClientRect(hostWindow, &client) == FALSE ||
+            client.right <= client.left || client.bottom <= client.top) {
+            return false;
+        }
+        surface.hwnd_ = hostWindow;
+        if (!surface.d2d_.Initialize(hostWindow)) {
+            surface.hwnd_ = nullptr;
+            return false;
+        }
+        surface.ConfigurePixelRenderTarget();
+        if (!surface.wallpaper_.SetSolidForSmoke(
+                surface.d2d_.Target(),
+                client.right - client.left,
+                client.bottom - client.top,
+                wallpaperColor)) {
+            surface.d2d_.ReleaseTarget();
+            surface.hwnd_ = nullptr;
+            return false;
+        }
+        surface.wallpaperReadyForTarget_ = true;
+        surface.snapshot_.screenRect = client;
+        return true;
+    }
+
+    static void ReleaseProductionHost(
+        DesktopSurfaceWindow& surface) {
+        surface.ClearHostedWidgets();
+        surface.hostedWidgetCommandHandler_ = nullptr;
+        surface.desktopDropTarget_.Reset();
+        surface.iconCache_.Clear();
+        surface.wallpaper_.Release();
+        surface.wallpaperReadyForTarget_ = false;
+        surface.d2d_.ReleaseTarget();
+        surface.hwnd_ = nullptr;
+    }
+
+    static size_t HostedWidgetCount(
+        const DesktopSurfaceWindow& surface) {
+        return surface.hostedWidgets_.size();
+    }
+
+    static bool AttachProductionDropTarget(
+        DesktopSurfaceWindow& surface,
+        IDropTarget* explorerTarget) {
+        return surface.AttachDropTargetForSmoke(explorerTarget);
+    }
+
+    static WidgetView* HostedWidgetAt(
+        DesktopSurfaceWindow& surface,
+        size_t index) {
+        return index < surface.hostedWidgets_.size() &&
+                surface.hostedWidgets_[index] != nullptr
+            ? &surface.hostedWidgets_[index]->view
+            : nullptr;
+    }
+
+    static std::wstring HostedWidgetCategory(
+        const DesktopSurfaceWindow& surface,
+        size_t index) {
+        return index < surface.hostedWidgets_.size() &&
+                surface.hostedWidgets_[index] != nullptr
+            ? surface.hostedWidgets_[index]->descriptor.categoryId
+            : std::wstring{};
+    }
+
+    static std::wstring HostedCategoryAtPoint(
+        const DesktopSurfaceWindow& surface,
+        POINT point) {
+        const int index = surface.HostedWidgetIndexAt(point);
+        return index < 0
+            ? std::wstring{}
+            : HostedWidgetCategory(surface, static_cast<size_t>(index));
+    }
+
+    static size_t IndependentWidgetWindowCount(
+        const DesktopSurfaceWindow&) {
+        return 0;
+    }
+
+    static size_t SharedRenderTargetCount(
+        const DesktopSurfaceWindow& surface) {
+        return surface.d2d_.Target() == nullptr ? 0 : 1;
+    }
+
+    static size_t SharedWallpaperCount(
+        const DesktopSurfaceWindow& surface) {
+        return surface.wallpaper_.HasBitmap() ? 1 : 0;
+    }
+
+    static size_t SharedIconCacheCount(
+        const DesktopSurfaceWindow&) {
+        return 1;
+    }
+
+    static size_t SharedIconCacheCapacity(
+        const DesktopSurfaceWindow& surface) {
+        return surface.iconCache_.Capacity();
+    }
+
+    static void ClickHostedPoint(
+        DesktopSurfaceWindow& surface,
+        POINT point,
+        bool controlPressed) {
+        surface.ActivateHostedWidgetAt(point, controlPressed);
+    }
+
+    static void DispatchHostedMouse(
+        DesktopSurfaceWindow& surface,
+        UINT message,
+        WPARAM keys,
+        POINT point) {
+        surface.HandleMessage(
+            message, keys, MAKELPARAM(point.x, point.y));
+    }
+
+    static void DoubleClickHostedPoint(
+        DesktopSurfaceWindow& surface,
+        POINT point) {
+        surface.HandleMessage(
+            WM_LBUTTONDBLCLK, 0,
+            MAKELPARAM(point.x, point.y));
+    }
+
+    static void SuppressDesktopOpenForSmoke(
+        DesktopSurfaceWindow& surface, bool suppress) {
+        surface.suppressDesktopOpenForSmoke_ = suppress;
+        surface.desktopOpenRequestCountForSmoke_ = 0;
+        surface.desktopOpenPathForSmoke_.clear();
+    }
+
+
+    static size_t DesktopOpenRequestCountForSmoke(
+        const DesktopSurfaceWindow& surface) {
+        return surface.desktopOpenRequestCountForSmoke_;
+    }
+
+    static size_t DoubleClickMessageCountForSmoke(
+        const DesktopSurfaceWindow& surface) {
+        return surface.doubleClickMessageCountForSmoke_;
+    }
+
+    static size_t LeftDownMessageCountForSmoke(
+        const DesktopSurfaceWindow& surface) {
+        return surface.leftDownMessageCountForSmoke_;
+    }
+
+    static size_t LeftUpMessageCountForSmoke(
+        const DesktopSurfaceWindow& surface) {
+        return surface.leftUpMessageCountForSmoke_;
+    }
+
+    static std::wstring CompletedClickIdentityForSmoke(
+        const DesktopSurfaceWindow& surface) {
+        return surface.lastCompletedClickIdentity_;
+    }
+
+    static std::wstring CompletedClickCategoryForSmoke(
+        const DesktopSurfaceWindow& surface) {
+        return surface.lastCompletedClickCategoryId_;
+    }
+
+    static int HostedPointerGestureForSmoke(
+        const DesktopSurfaceWindow& surface) {
+        return static_cast<int>(surface.hostedPointerGesture_);
+    }
+
+    static POINT HostedPointerStartForSmoke(
+        const DesktopSurfaceWindow& surface) {
+        return surface.hostedPointerStart_;
+    }
+
+    static POINT HostedPointerCurrentForSmoke(
+        const DesktopSurfaceWindow& surface) {
+        return surface.hostedPointerCurrent_;
+    }
+
+    static POINT HostedDragActivationPointForSmoke(
+        const DesktopSurfaceWindow& surface) {
+        return surface.hostedDragActivationPointForSmoke_;
+    }
+
+    static std::wstring DesktopOpenPathForSmoke(
+        const DesktopSurfaceWindow& surface) {
+        return surface.desktopOpenPathForSmoke_;
+    }
+
+    static int HitTestDesktopPoint(
+        const DesktopSurfaceWindow& surface,
+        POINT point) {
+        return surface.HitTest(point);
+    }
+
+    static bool PressHostedPoint(
+        DesktopSurfaceWindow& surface,
+        POINT point,
+        bool controlPressed) {
+        return surface.BeginHostedPointerGesture(point, controlPressed);
+    }
+
+    static void MoveHostedPoint(
+        DesktopSurfaceWindow& surface,
+        POINT point) {
+        surface.ContinueHostedPointerGesture(point);
+    }
+
+    static void ReleaseHostedPoint(
+        DesktopSurfaceWindow& surface,
+        POINT point) {
+        surface.CompleteHostedPointerGesture(point);
+    }
+
+    static void CancelHostedPoint(DesktopSurfaceWindow& surface) {
+        surface.ResetHostedPointerGesture();
+    }
+
+    static void DispatchHostedKey(
+        DesktopSurfaceWindow& surface,
+        UINT virtualKey,
+        bool controlPressed,
+        bool shiftPressed) {
+        surface.DispatchHostedWidgetKey(
+            virtualKey, controlPressed, shiftPressed);
+    }
+
+    static void SetPublishFailureIndex(
+        DesktopSurfaceWindow& surface,
+        int index) {
+        surface.hostedWidgetPublishFailureIndex_ = index;
+    }
+
+    static bool RenderProductionHost(
+        DesktopSurfaceWindow& surface) {
+        if (surface.hwnd_ == nullptr ||
+            IsWindow(surface.hwnd_) == FALSE) {
+            return false;
+        }
+        InvalidateRect(surface.hwnd_, nullptr, FALSE);
+        surface.Render();
+        return surface.d2d_.Target() != nullptr &&
+            surface.wallpaperReadyForTarget_;
+    }
+
+    static bool ConfigureHostedWidgetSlice(
+        DesktopSurfaceWindow& surface,
+        HWND hostWindow,
+        const WindowConfig& config,
+        int theme,
+        const std::wstring& categoryId,
+        const std::wstring& title,
+        std::vector<DesktopItem> items,
+        COLORREF wallpaperColor) {
+        RECT client{};
+        if (hostWindow == nullptr ||
+            GetClientRect(hostWindow, &client) == FALSE ||
+            client.right <= client.left || client.bottom <= client.top) {
+            return false;
+        }
+        surface.hwnd_ = hostWindow;
+        if (!surface.d2d_.Initialize(hostWindow)) {
+            surface.hwnd_ = nullptr;
+            return false;
+        }
+        surface.ConfigurePixelRenderTarget();
+        if (!surface.wallpaper_.SetSolidForSmoke(
+                surface.d2d_.Target(),
+                client.right - client.left,
+                client.bottom - client.top,
+                wallpaperColor)) {
+            surface.d2d_.ReleaseTarget();
+            surface.hwnd_ = nullptr;
+            return false;
+        }
+        surface.wallpaperReadyForTarget_ = true;
+        surface.snapshot_.screenRect = client;
+        surface.hostedWidgetSlice_ = std::make_unique<WidgetView>();
+        surface.hostedWidgetSlice_->Configure(
+            categoryId,
+            title,
+            config,
+            theme,
+            client,
+            std::move(items));
+        return true;
+    }
+
+    static WidgetView* HostedWidgetSlice(DesktopSurfaceWindow& surface) {
+        return surface.hostedWidgetSlice_.get();
+    }
+
+    static bool RenderHostedWidgetSlice(DesktopSurfaceWindow& surface) {
+        if (surface.hwnd_ == nullptr ||
+            IsWindow(surface.hwnd_) == FALSE ||
+            surface.hostedWidgetSlice_ == nullptr) {
+            return false;
+        }
+        InvalidateRect(surface.hwnd_, nullptr, FALSE);
+        surface.Render();
+        return surface.d2d_.Target() != nullptr &&
+            surface.wallpaperReadyForTarget_;
+    }
+
+    static bool PreloadHostedIcon(
+        DesktopSurfaceWindow& surface,
+        const DesktopItem& item) {
+        if (surface.d2d_.Target() == nullptr) {
+            return false;
+        }
+        surface.iconCache_.Preload(item.path);
+        return true;
+    }
+
+    static bool IsHostedIconReady(
+        DesktopSurfaceWindow& surface,
+        const DesktopItem& item) {
+        return surface.d2d_.Target() != nullptr &&
+            surface.iconCache_.IsIconReady(
+                surface.d2d_.Target(), item.path);
+    }
+
+    static ID2D1HwndRenderTarget* RenderTarget(
+        DesktopSurfaceWindow& surface) {
+        return surface.d2d_.Target();
+    }
+
+    static void ReleaseHostedWidgetSlice(DesktopSurfaceWindow& surface) {
+        surface.hostedWidgetSlice_.reset();
+        surface.iconCache_.Clear();
+        surface.wallpaper_.Release();
+        surface.wallpaperReadyForTarget_ = false;
+        surface.d2d_.ReleaseTarget();
+        surface.hwnd_ = nullptr;
     }
 
     static bool WallpaperReady(
@@ -1237,6 +1727,22 @@ struct DesktopSurfaceWindowSmokeAccess {
         surface.RebuildInteractionRects();
     }
 
+    static void ConfigureMoveOutFixture(
+        DesktopSurfaceWindow& surface,
+        HWND desktopView,
+        const std::vector<DesktopViewItem>& items,
+        const std::vector<std::wstring>& assigned,
+        const std::vector<DesktopPosition>& oldDisplayPositions) {
+        surface.snapshot_.listViewWindow = desktopView;
+        GetWindowRect(desktopView, &surface.snapshot_.screenRect);
+        surface.snapshot_.items = items;
+        surface.assignedIdentities_ = assigned;
+        surface.cellWidth_ = 80;
+        surface.cellHeight_ = 80;
+        surface.iconSize_ = 48;
+        surface.UpdateDisplayPositions(oldDisplayPositions);
+    }
+
     static void BeginPointerGesture(
         DesktopSurfaceWindow& surface,
         POINT point,
@@ -1431,6 +1937,31 @@ struct DesktopSurfaceWindowSmokeAccess {
         return std::nullopt;
     }
 
+    static std::optional<POINT> FindExposedCenterHitPointForIdentity(
+        const DesktopSurfaceWindow& surface,
+        const std::wstring& identity) {
+        for (size_t index = 0; index < surface.visibleItems_.size(); ++index) {
+            if (CompareStringOrdinal(
+                    surface.visibleItems_[index].path.c_str(), -1,
+                    identity.c_str(), -1, TRUE) != CSTR_EQUAL) {
+                continue;
+            }
+            const RECT rect = surface.InteractionRect(index);
+            POINT client{
+                (rect.left + rect.right) / 2,
+                (rect.top + rect.bottom) / 2};
+            POINT screen = client;
+            if (surface.hwnd_ != nullptr &&
+                ClientToScreen(surface.hwnd_, &screen) != FALSE &&
+                WindowFromPoint(screen) == surface.hwnd_ &&
+                surface.HitTest(client) == static_cast<int>(index)) {
+                return screen;
+            }
+            return std::nullopt;
+        }
+        return std::nullopt;
+    }
+
     static bool BuildShellDragImage(
         DesktopSurfaceWindow& surface,
         POINT sourceClientPoint,
@@ -1473,6 +2004,84 @@ struct DesktopSurfaceWindowSmokeAccess {
             cellHeight,
             iconSize,
             plannedPositions);
+    }
+
+    static std::vector<DesktopPosition> ResolveVisiblePositionCollisions(
+        const std::vector<DesktopPosition>& nativePositions,
+        const std::vector<DesktopPosition>& overrides,
+        const RECT& bounds,
+        int cellWidth,
+        int cellHeight,
+        const std::vector<std::wstring>& newlyObserved = {}) {
+        return DesktopSurfaceWindow::ResolveVisiblePositionCollisions(
+            nativePositions, overrides, bounds, cellWidth, cellHeight,
+            newlyObserved);
+    }
+
+    static bool NewlyObservedUsesVisibleFirstFree(
+        DesktopSurfaceWindow& surface) {
+        surface.snapshot_.screenRect = RECT{0, 0, 1000, 336};
+        surface.cellWidth_ = 76;
+        surface.cellHeight_ = 84;
+        surface.iconSize_ = 48;
+        const std::vector<DesktopPosition> native{
+            {L"existing-a", POINT{16, 0}},
+            {L"existing-b", POINT{92, 0}},
+            {L"existing-c", POINT{16, 84}},
+            {L"new-shortcut", POINT{852, 0}}};
+        for (const DesktopPosition& position : native) {
+            surface.snapshot_.items.push_back(DesktopViewItem{
+                position.path, position.path,
+                position.point, position.point});
+        }
+        std::vector<DesktopPosition> committed;
+        surface.SetDisplayPositionCommitHandler(
+            [&](const std::vector<DesktopPosition>& positions) {
+                committed = positions;
+                return true;
+            });
+        surface.RebuildVisibleItems({L"new-shortcut"});
+        const bool firstFree = committed.size() == 1 &&
+            committed.front().path == L"new-shortcut" &&
+            committed.front().point.x == 16 &&
+            committed.front().point.y == 168 &&
+            surface.snapshot_.items.back().screenPoint.x == 16 &&
+            surface.snapshot_.items.back().screenPoint.y == 168 &&
+            surface.positionOverrides_.size() == 1 &&
+            surface.positionOverrides_.front().nativeScreenPoint.x == 852;
+        surface.RebuildVisibleItems();
+        const bool stable = firstFree &&
+            surface.snapshot_.items.back().screenPoint.x == 16 &&
+            surface.snapshot_.items.back().screenPoint.y == 168 &&
+            surface.positionOverrides_.front().nativeScreenPoint.x == 852;
+        surface.SetDisplayPositionCommitHandler({});
+        return stable;
+    }
+
+    static bool RebuildPreservesIndependentNativePositions(
+        DesktopSurfaceWindow& surface,
+        const std::vector<DesktopPosition>& nativePositions) {
+        surface.snapshot_.screenRect = RECT{0, 0, 320, 336};
+        surface.cellWidth_ = 76;
+        surface.cellHeight_ = 84;
+        for (const DesktopPosition& position : nativePositions) {
+            surface.snapshot_.items.push_back(DesktopViewItem{
+                position.path, position.path,
+                position.point, position.point});
+        }
+        surface.positionOverrides_.push_back(
+            DesktopSurfaceWindow::PositionOverride{
+                nativePositions[0].path, POINT{16, 0},
+                nativePositions[0].point, POINT{16, 0}});
+        surface.RebuildVisibleItems();
+        surface.RebuildVisibleItems();
+        return surface.visibleItems_.size() == nativePositions.size() &&
+            surface.visibleItems_[0].viewPoint.x == 16 &&
+            surface.visibleItems_[0].viewPoint.y == 0 &&
+            surface.visibleItems_[1].viewPoint.x == 16 &&
+            surface.visibleItems_[1].viewPoint.y == 168 &&
+            surface.positionOverrides_[0].nativeScreenPoint.x == 168 &&
+            surface.positionOverrides_[0].nativeScreenPoint.y == 0;
     }
 
     static std::optional<std::pair<POINT, POINT>>
@@ -1594,6 +2203,40 @@ struct DesktopSurfaceWindowSmokeAccess {
 };
 
 struct MainWindowSmokeAccess {
+    static void SetWindowForMoveOut(MainWindow& window, HWND hwnd) {
+        window.hwnd_ = hwnd;
+    }
+
+    static int HostedRuntimeDpiForCategory(
+        MainWindow& window, const std::wstring& categoryId) {
+        const auto previous = window.hostedWidgetCategoryIds_;
+        window.hostedWidgetCategoryIds_ = {categoryId};
+        const auto descriptors = window.BuildHostedWidgets();
+        window.hostedWidgetCategoryIds_ = previous;
+        return descriptors.size() == 1
+            ? descriptors.front().config.dpi : 0;
+    }
+
+    static bool ExecuteHostedCommand(
+        MainWindow& window,
+        const HostedWidgetCommand& command) {
+        return window.ExecuteHostedWidgetCommand(command);
+    }
+
+    static std::vector<std::wstring> SnapshotItemIdsForCategory(
+        const MainWindow& window,
+        const std::wstring& categoryId) {
+        std::vector<std::wstring> ids;
+        if (window.desktopSnapshot_ == nullptr) {
+            return ids;
+        }
+        for (const DesktopItem& item :
+             window.desktopSnapshot_->CopyItemsForCategory(categoryId)) {
+            ids.push_back(item.id);
+        }
+        return ids;
+    }
+
     static DesktopSurfaceWindow* AttachCachedDesktopFixture(
         MainWindow& window,
         const std::vector<DesktopViewItem>& items) {
@@ -1609,7 +2252,8 @@ struct MainWindowSmokeAccess {
     static WidgetWindow* AttachWidgetFixture(
         MainWindow& window, const std::wstring& categoryId) {
         auto widget = std::make_unique<WidgetWindow>(
-            GetModuleHandleW(nullptr), window.Window(), categoryId, 0);
+            GetModuleHandleW(nullptr), window.Window(), categoryId, 0,
+            window.desktopSnapshot_);
         if (!widget->Create()) {
             return nullptr;
         }
@@ -1645,6 +2289,13 @@ struct MainWindowSmokeAccess {
             return false;
         }
         window.ApplyLiveSettings(publicDesktopChanged);
+        // The legacy windows exist only as Debug oracles in this smoke.
+        // Production no longer owns or broadcasts settings to them.
+        for (const auto& oracle : window.widgetWindows_) {
+            if (oracle != nullptr) {
+                oracle->RefreshFromConfig();
+            }
+        }
         return true;
     }
 
@@ -1685,14 +2336,22 @@ struct MainWindowSmokeAccess {
         const MainWindow& window,
         const std::wstring& path) {
         return std::any_of(
-            window.items_.begin(),
-            window.items_.end(),
+            window.DesktopItems().begin(),
+            window.DesktopItems().end(),
             [&](const DesktopItem& item) {
                 return CompareStringOrdinal(
                            item.path.c_str(), -1,
                            path.c_str(), -1,
                            TRUE) == CSTR_EQUAL;
             });
+    }
+
+    static std::wstring DesktopItemIdAtPath(
+        const MainWindow& window,
+        const std::wstring& path) {
+        const DesktopItem* item = window.desktopSnapshot_ == nullptr
+            ? nullptr : window.desktopSnapshot_->FindUniqueByPath(path);
+        return item == nullptr ? std::wstring{} : item->id;
     }
 
     static bool HasRegisteredItem(
@@ -1741,6 +2400,31 @@ struct MainWindowSmokeAccess {
         return window.autoOrganizeOperation_ ==
             MainWindow::AutoOrganizeOperation::None;
     }
+
+    static void SaveLayoutProfile(MainWindow& window) {
+        window.SaveLayoutProfile();
+    }
+
+    static void RestoreLayoutProfile(MainWindow& window) {
+        window.RestoreLayoutProfile();
+    }
+
+    static bool LayoutRestoreIdle(const MainWindow& window) {
+        return window.layoutOperation_ == MainWindow::LayoutOperation::None;
+    }
+
+    static bool PublishLayout(
+        MainWindow& window,
+        const AppConfig& config,
+        const std::vector<LayoutMonitorSnapshot>& expectedMonitors,
+        bool enforceGuards) {
+        return window.PublishLayoutConfig(
+            config,
+            expectedMonitors,
+            window.desktopSnapshot_ == nullptr
+                ? 0 : window.desktopSnapshot_->Revision(),
+            enforceGuards);
+    }
 };
 
 namespace {
@@ -1753,6 +2437,58 @@ std::optional<std::string> ReadFileBytes(const std::wstring& path) {
     return std::string(
         std::istreambuf_iterator<char>(input),
         std::istreambuf_iterator<char>());
+}
+
+UINT SmokeMonitorDpi(HMONITOR monitor) {
+    using GetDpiForMonitorFunction = HRESULT(WINAPI*)(
+        HMONITOR, int, UINT*, UINT*);
+    HMODULE shcore = LoadLibraryExW(
+        L"shcore.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (shcore != nullptr) {
+        const auto getDpiForMonitor =
+            reinterpret_cast<GetDpiForMonitorFunction>(
+                GetProcAddress(shcore, "GetDpiForMonitor"));
+        UINT x = 96;
+        UINT y = 96;
+        const HRESULT result = getDpiForMonitor == nullptr
+            ? E_NOINTERFACE : getDpiForMonitor(monitor, 0, &x, &y);
+        FreeLibrary(shcore);
+        if (SUCCEEDED(result) && x > 0) return x;
+    }
+    return GetDpiForSystem();
+}
+
+std::vector<LayoutMonitorSnapshot> SmokeLayoutMonitors() {
+    std::vector<LayoutMonitorSnapshot> monitors;
+    EnumDisplayMonitors(
+        nullptr, nullptr,
+        [](HMONITOR monitor, HDC, LPRECT, LPARAM context) -> BOOL {
+            auto* result = reinterpret_cast<
+                std::vector<LayoutMonitorSnapshot>*>(context);
+            MONITORINFOEXW info{};
+            info.cbSize = sizeof(info);
+            if (GetMonitorInfoW(monitor, &info)) {
+                result->push_back(LayoutMonitorSnapshot{
+                    info.szDevice,
+                    LayoutRect{
+                        info.rcWork.left, info.rcWork.top,
+                        info.rcWork.right, info.rcWork.bottom},
+                    static_cast<int>(SmokeMonitorDpi(monitor)),
+                    (info.dwFlags & MONITORINFOF_PRIMARY) != 0});
+            }
+            return TRUE;
+        },
+        reinterpret_cast<LPARAM>(&monitors));
+    std::sort(
+        monitors.begin(), monitors.end(),
+        [](const LayoutMonitorSnapshot& left,
+           const LayoutMonitorSnapshot& right) {
+            return std::tie(
+                       left.workArea.left, left.workArea.top, left.id) <
+                   std::tie(
+                       right.workArea.left, right.workArea.top, right.id);
+        });
+    return monitors;
 }
 
 struct StableFileIdentity {
@@ -2068,6 +2804,79 @@ bool SaveCapturedPixelsBmp(
     return output.good();
 }
 
+bool CaptureWindowClientPixels(
+    HWND window,
+    std::vector<std::uint32_t>& pixels,
+    SIZE& pixelSize) {
+    pixels.clear();
+    pixelSize = {};
+    RECT client{};
+    if (window == nullptr ||
+        GetClientRect(window, &client) == FALSE) {
+        return false;
+    }
+    const int width = client.right - client.left;
+    const int height = client.bottom - client.top;
+    if (width <= 0 || height <= 0) {
+        return false;
+    }
+    HDC windowDc = GetDC(window);
+    HDC memoryDc = windowDc == nullptr
+        ? nullptr
+        : CreateCompatibleDC(windowDc);
+    BITMAPINFO bitmapInfo{};
+    bitmapInfo.bmiHeader.biSize = sizeof(bitmapInfo.bmiHeader);
+    bitmapInfo.bmiHeader.biWidth = width;
+    bitmapInfo.bmiHeader.biHeight = -height;
+    bitmapInfo.bmiHeader.biPlanes = 1;
+    bitmapInfo.bmiHeader.biBitCount = 32;
+    bitmapInfo.bmiHeader.biCompression = BI_RGB;
+    void* bitmapPixels = nullptr;
+    HBITMAP bitmap = memoryDc == nullptr
+        ? nullptr
+        : CreateDIBSection(
+            windowDc,
+            &bitmapInfo,
+            DIB_RGB_COLORS,
+            &bitmapPixels,
+            nullptr,
+            0);
+    HGDIOBJ previous = bitmap == nullptr
+        ? nullptr
+        : SelectObject(memoryDc, bitmap);
+    const BOOL captured = previous != nullptr
+        ? BitBlt(
+            memoryDc,
+            0,
+            0,
+            width,
+            height,
+            windowDc,
+            0,
+            0,
+            SRCCOPY)
+        : FALSE;
+    if (captured != FALSE && bitmapPixels != nullptr) {
+        const auto* first = static_cast<const std::uint32_t*>(bitmapPixels);
+        pixels.assign(
+            first,
+            first + static_cast<size_t>(width) * height);
+        pixelSize = SIZE{width, height};
+    }
+    if (previous != nullptr) {
+        SelectObject(memoryDc, previous);
+    }
+    if (bitmap != nullptr) {
+        DeleteObject(bitmap);
+    }
+    if (memoryDc != nullptr) {
+        DeleteDC(memoryDc);
+    }
+    if (windowDc != nullptr) {
+        ReleaseDC(window, windowDc);
+    }
+    return !pixels.empty();
+}
 
 bool SaveWindowClientBmp(
     HWND window,
@@ -2477,6 +3286,23 @@ LRESULT CALLBACK SmokeDesktopPlacementOwnerProc(
     return DefWindowProcW(hwnd, message, wParam, lParam);
 }
 
+LRESULT CALLBACK SmokeUnifiedHostSurfaceProc(
+    HWND hwnd,
+    UINT message,
+    WPARAM wParam,
+    LPARAM lParam) {
+    if (message == WM_ERASEBKGND) {
+        return 1;
+    }
+    if (message == WM_PAINT) {
+        PAINTSTRUCT paint{};
+        BeginPaint(hwnd, &paint);
+        EndPaint(hwnd, &paint);
+        return 0;
+    }
+    return DefWindowProcW(hwnd, message, wParam, lParam);
+}
+
 int RunSmokeScan() {
     AttachParentConsole();
     DesktopScanner scanner;
@@ -2486,6 +3312,133 @@ int RunSmokeScan() {
     for (size_t index = 0; index < limit; ++index) {
         std::wcout << L"- " << items[index].displayName << L"\n";
     }
+    return 0;
+}
+
+std::shared_ptr<const DesktopSnapshot> BuildSmokeDesktopSnapshot(
+    const AppConfig& appConfig,
+    std::uint64_t revision = 1,
+    const std::vector<DesktopItem>& additionalItems = {}) {
+    OrganizerConfig organizer;
+    organizer.uncategorizedItemIds = appConfig.uncategorizedItemIds;
+    std::unordered_set<std::wstring> referencedIds(
+        appConfig.uncategorizedItemIds.begin(),
+        appConfig.uncategorizedItemIds.end());
+    for (const CategoryConfig& source : appConfig.categories) {
+        Category category;
+        category.id = source.id;
+        category.itemIds = source.itemIds;
+        organizer.categories.push_back(std::move(category));
+        referencedIds.insert(source.itemIds.begin(), source.itemIds.end());
+    }
+
+    DesktopScanner scanner;
+    std::vector<DesktopItem> items;
+    items.reserve(referencedIds.size());
+    for (const ItemConfig& source : appConfig.items) {
+        if (!referencedIds.contains(source.id)) {
+            continue;
+        }
+        DesktopItem item = scanner.CreateItemFromPath(source.path, false);
+        item.id = source.id;
+        if (!source.displayName.empty()) {
+            item.displayName = source.displayName;
+        }
+        items.push_back(std::move(item));
+    }
+    items.insert(items.end(), additionalItems.begin(), additionalItems.end());
+    return BuildDesktopSnapshot(revision, std::move(items), organizer);
+}
+
+int RunSmokeDesktopSnapshot(HINSTANCE instance) {
+    AttachParentConsole();
+
+    std::vector<DesktopItem> items;
+    const auto makeItem = [](
+        const std::wstring& id,
+        const std::wstring& path,
+        const std::wstring& name) {
+        DesktopItem item;
+        item.id = id;
+        item.path = path;
+        item.displayName = name;
+        return item;
+    };
+    items.push_back(makeItem(L"alpha", L"C:\\Snapshot\\Alpha.lnk", L"Alpha"));
+    items.push_back(makeItem(L"beta", L"C:\\Snapshot\\Beta.txt", L"Beta"));
+    items.push_back(makeItem(L"collision", L"C:\\Snapshot\\First.lnk", L"First"));
+    items.push_back(makeItem(L"collision", L"C:\\Snapshot\\Second.lnk", L"Second"));
+    items.push_back(makeItem(L"shared", L"C:\\Snapshot\\Shared.url", L"Shared"));
+
+    OrganizerConfig config;
+    config.uncategorizedItemIds = {L"alpha", L"collision", L"shared"};
+    Category first;
+    first.id = L"first";
+    first.itemIds = {L"beta", L"shared", L"missing"};
+    Category second;
+    second.id = L"second";
+    second.itemIds = {L"shared"};
+    config.categories = {first, second};
+
+    const auto snapshot = BuildDesktopSnapshot(41, items, config);
+    const DesktopSnapshotMembership* sharedMembership =
+        snapshot->MembershipForItem(L"SHARED");
+    const auto& firstItems = snapshot->OrderedItemsForCategory(L"FIRST");
+    if (snapshot->Revision() != 41 ||
+        snapshot->Items().size() != items.size() ||
+        snapshot->FindUniqueById(L"ALPHA") == nullptr ||
+        snapshot->FindUniqueByPath(L"c:\\snapshot\\alpha.lnk") == nullptr ||
+        snapshot->FindUniqueById(L"COLLISION") != nullptr ||
+        snapshot->ItemIndicesById(L"collision").size() != 2 ||
+        !snapshot->MembershipMatches(config) ||
+        sharedMembership == nullptr || sharedMembership->matchCount != 3 ||
+        firstItems.size() != 1 ||
+        snapshot->Items()[firstItems.front()].id != L"beta" ||
+        snapshot->CopyItemsForCategory(kUncategorizedCategoryId).size() != 1) {
+        std::wcerr << L"Desktop snapshot identity, membership, or ordering invariant failed\n";
+        return 1;
+    }
+
+    OrganizerConfig nextConfig = config;
+    nextConfig.uncategorizedItemIds = {L"alpha", L"beta"};
+    nextConfig.categories.clear();
+    const auto nextSnapshot = BuildDesktopSnapshot(42, items, nextConfig);
+    if (snapshot->Revision() != 41 || nextSnapshot->Revision() != 42 ||
+        snapshot->MembershipMatches(nextConfig) ||
+        !nextSnapshot->MembershipMatches(nextConfig) ||
+        snapshot->CopyItemsForCategory(L"first").size() != 1 ||
+        nextSnapshot->CopyItemsForCategory(kUncategorizedCategoryId).size() != 2) {
+        std::wcerr << L"Desktop snapshot revision isolation failed\n";
+        return 2;
+    }
+
+#ifndef NDEBUG
+    DesktopScanner::ResetScanCountForTesting();
+    DesktopScanner scanner;
+    const auto scannedItems = scanner.Scan(false);
+    const auto scannedSnapshot = BuildDesktopSnapshot(43, scannedItems, config);
+    std::vector<std::unique_ptr<WidgetWindow>> widgets;
+    widgets.reserve(30);
+    for (const int expectedCount : {1, 10, 30}) {
+        while (static_cast<int>(widgets.size()) < expectedCount) {
+            auto widget = std::make_unique<WidgetWindow>(
+                instance, nullptr, first.id, 0, scannedSnapshot);
+            widget->ApplySnapshot(scannedSnapshot);
+            if (widget->SnapshotRevision() != scannedSnapshot->Revision()) {
+                std::wcerr << L"Widget did not retain the shared snapshot revision\n";
+                return 3;
+            }
+            widgets.push_back(std::move(widget));
+        }
+        if (DesktopScanner::ScanCountForTesting() != 1) {
+            std::wcerr << L"Widget snapshot fan-out performed a duplicate desktop scan at "
+                       << expectedCount << L" widgets\n";
+            return 4;
+        }
+    }
+#endif
+
+    std::wcout << L"Desktop snapshot identity, revision, ordering, and single-scan fan-out passed\n";
     return 0;
 }
 
@@ -2957,17 +3910,340 @@ int RunSmokeConfig() {
         std::wcerr << L"Category import failed\n";
         return 1;
     }
-    WindowConfig profile = loaded;
-    profile.viewMode = 1;
-    profile.tabSide = 3;
+    const auto sameWindowConfig = [](
+        const WindowConfig& left,
+        const WindowConfig& right) {
+        return left.x == right.x && left.y == right.y &&
+            left.width == right.width && left.height == right.height &&
+            left.opacity == right.opacity &&
+            left.normalHeight == right.normalHeight &&
+            left.iconSize == right.iconSize &&
+            left.density == right.density &&
+            left.viewMode == right.viewMode &&
+            left.contentViewMode == right.contentViewMode &&
+            left.sortMode == right.sortMode &&
+            left.tabSide == right.tabSide &&
+            left.titleOpacity == right.titleOpacity &&
+            left.dpi == right.dpi &&
+            left.monitorId == right.monitorId &&
+            left.collapsed == right.collapsed &&
+            left.locked == right.locked &&
+            left.showBorder == right.showBorder &&
+            left.autoArrange == right.autoArrange &&
+            left.fixedExpanded == right.fixedExpanded;
+    };
+    AppConfig layoutConfig;
+    layoutConfig.settings.lastVisible = false;
+    layoutConfig.window.x = 220;
+    layoutConfig.window.y = 140;
+    layoutConfig.window.width = 640;
+    layoutConfig.window.height = 510;
+    layoutConfig.window.normalHeight = 630;
+    layoutConfig.window.opacity = 207;
+    layoutConfig.window.iconSize = 56;
+    layoutConfig.window.density = 2;
+    layoutConfig.window.viewMode = 1;
+    layoutConfig.window.contentViewMode = 1;
+    layoutConfig.window.sortMode = 3;
+    layoutConfig.window.tabSide = 2;
+    layoutConfig.window.titleOpacity = 177;
+    layoutConfig.window.dpi = 144;
+    layoutConfig.window.monitorId = L"DISPLAY-B";
+    layoutConfig.window.collapsed = false;
+    layoutConfig.window.locked = true;
+    layoutConfig.window.showBorder = false;
+    layoutConfig.window.autoArrange = true;
+    layoutConfig.window.fixedExpanded = true;
+    for (const wchar_t* id : {L"item-a", L"item-b", L"item-c"}) {
+        ItemConfig item;
+        item.id = id;
+        item.path = L"C:\\Desktop\\" + std::wstring(id) + L".lnk";
+        layoutConfig.items.push_back(std::move(item));
+    }
+    layoutConfig.uncategorizedItemIds = {L"item-a"};
+    CategoryConfig savedCategoryA;
+    savedCategoryA.id = L"category-a";
+    savedCategoryA.name = L"Saved name must not restore";
+    savedCategoryA.color = L"#111111";
+    savedCategoryA.itemIds = {L"item-b", L"item-c"};
+    savedCategoryA.layout = layoutConfig.window;
+    savedCategoryA.layout.x = -1700;
+    savedCategoryA.layout.y = 90;
+    savedCategoryA.layout.width = 430;
+    savedCategoryA.layout.height = 48;
+    savedCategoryA.layout.normalHeight = 520;
+    savedCategoryA.layout.dpi = 96;
+    savedCategoryA.layout.monitorId = L"DISPLAY-A";
+    savedCategoryA.layout.collapsed = true;
+    CategoryConfig deletedCategory;
+    deletedCategory.id = L"category-deleted";
+    deletedCategory.name = L"Deleted";
+    deletedCategory.layout = savedCategoryA.layout;
+    layoutConfig.categories = {savedCategoryA, deletedCategory};
+    layoutConfig.desktopDisplayLayout = {
+        {layoutConfig.items[0].path, 101, 202},
+        {layoutConfig.items[1].path, 303, 404}};
+    const std::vector<LayoutMonitorSnapshot> savedMonitors{
+        {L"DISPLAY-A", LayoutRect{-1920, 0, 0, 1080}, 96, false},
+        {L"DISPLAY-B", LayoutRect{0, 0, 2560, 1400}, 144, true}};
+    LayoutSnapshot profile = BuildLayoutSnapshot(
+        layoutConfig, savedMonitors, 123456789ull);
     if (!store.SaveLayoutProfile(profile)) {
         std::wcerr << L"Layout profile save failed\n";
         return 1;
     }
-    WindowConfig loadedProfile;
-    if (!store.LoadLayoutProfile(loadedProfile) || loadedProfile.viewMode != 1 || loadedProfile.tabSide != 3) {
+    {
+        std::ifstream layoutProfile(
+            configDirectory + L"\\layout.profile.ini",
+            std::ios::binary);
+        std::ostringstream layoutProfileContent;
+        layoutProfileContent << layoutProfile.rdbuf();
+        const std::string serialized = layoutProfileContent.str();
+        if (!layoutProfile ||
+            serialized.find("schemaVersion=2\n") == std::string::npos ||
+            serialized.find("category.count=") == std::string::npos ||
+            serialized.find("desktopDisplay.count=") ==
+                std::string::npos ||
+            serialized.find("monitor.count=") == std::string::npos) {
+            std::wcerr << L"Complete layout schema 2 save failed\n";
+            return 1;
+        }
+    }
+    LayoutSnapshot loadedProfile;
+    bool recoveredFromBackup = true;
+    if (!store.LoadLayoutProfile(
+            loadedProfile, &recoveredFromBackup) ||
+        recoveredFromBackup || loadedProfile.schemaVersion != 2 ||
+        loadedProfile.timestamp != profile.timestamp ||
+        loadedProfile.globalVisible != profile.globalVisible ||
+        loadedProfile.viewMode != profile.viewMode ||
+        !sameWindowConfig(loadedProfile.main, profile.main) ||
+        loadedProfile.categories.size() != profile.categories.size() ||
+        loadedProfile.categories.front().categoryId !=
+            profile.categories.front().categoryId ||
+        !sameWindowConfig(
+            loadedProfile.categories.front().layout,
+            profile.categories.front().layout) ||
+        loadedProfile.categories.front().itemOrder !=
+            profile.categories.front().itemOrder ||
+        loadedProfile.desktopDisplayLayout.size() != 2 ||
+        loadedProfile.monitors.size() != savedMonitors.size()) {
         std::wcerr << L"Layout profile load failed\n";
         return 1;
+    }
+
+    AppConfig currentLayout = layoutConfig;
+    currentLayout.settings.lastVisible = true;
+    currentLayout.window.x = 12;
+    currentLayout.window.y = 34;
+    currentLayout.items.push_back(ItemConfig{
+        L"item-d", L"C:\\Desktop\\item-d.lnk"});
+    currentLayout.uncategorizedItemIds = {L"item-a"};
+    CategoryConfig currentCategoryA = savedCategoryA;
+    currentCategoryA.name = L"Current name";
+    currentCategoryA.color = L"#ABCDEF";
+    currentCategoryA.icon = L"current-icon";
+    currentCategoryA.itemIds = {L"item-d", L"item-b"};
+    currentCategoryA.layout.x = 999;
+    CategoryConfig newCategory;
+    newCategory.id = L"category-new";
+    newCategory.name = L"New category";
+    newCategory.itemIds = {L"item-c"};
+    newCategory.layout.x = 777;
+    currentLayout.categories = {newCategory, currentCategoryA};
+    currentLayout.desktopDisplayLayout = {
+        {layoutConfig.items[0].path, 900, 901},
+        {L"C:\\Desktop\\item-d.lnk", 700, 701}};
+    const LayoutIdentityIndex identityIndex{
+        {L"item-a", L"item-b", L"item-c", L"item-d"},
+        {layoutConfig.items[0].path, layoutConfig.items[1].path,
+         layoutConfig.items[2].path, L"C:\\Desktop\\item-d.lnk"}};
+    LayoutRestorePlan exactPlan;
+    std::wstring restoreError;
+    if (!BuildLayoutRestorePlan(
+            loadedProfile,
+            currentLayout,
+            savedMonitors,
+            identityIndex,
+            exactPlan,
+            restoreError) ||
+        !exactPlan.exactMonitorTopology ||
+        exactPlan.candidate.settings.lastVisible ||
+        !sameWindowConfig(exactPlan.candidate.window, profile.main) ||
+        exactPlan.candidate.categories.size() != 2 ||
+        exactPlan.candidate.categories[0].id != L"category-a" ||
+        exactPlan.candidate.categories[0].name != L"Current name" ||
+        exactPlan.candidate.categories[0].color != L"#ABCDEF" ||
+        exactPlan.candidate.categories[0].icon != L"current-icon" ||
+        exactPlan.candidate.categories[0].itemIds !=
+            std::vector<std::wstring>{L"item-b", L"item-d"} ||
+        exactPlan.candidate.categories[1].id != L"category-new" ||
+        exactPlan.candidate.categories[1].itemIds !=
+            std::vector<std::wstring>{L"item-c"} ||
+        exactPlan.candidate.categories[1].layout.x != 777 ||
+        exactPlan.candidate.desktopDisplayLayout.size() != 3 ||
+        exactPlan.candidate.desktopDisplayLayout[0].x != 101 ||
+        exactPlan.candidate.desktopDisplayLayout[0].y != 202 ||
+        exactPlan.candidate.desktopDisplayLayout[1].x != 700 ||
+        exactPlan.candidate.desktopDisplayLayout[1].y != 701 ||
+        exactPlan.candidate.desktopDisplayLayout[2].x != 303 ||
+        exactPlan.candidate.desktopDisplayLayout[2].y != 404) {
+        std::wcerr << L"Layout restore intersection plan failed: "
+                   << restoreError << L"\n";
+        return 1;
+    }
+
+    const std::vector<LayoutMonitorSnapshot> changedMonitors{
+        {L"DISPLAY-B", LayoutRect{-2560, 0, 0, 1440}, 120, true}};
+    LayoutRestorePlan mappedPlan;
+    if (!BuildLayoutRestorePlan(
+            loadedProfile,
+            currentLayout,
+            changedMonitors,
+            identityIndex,
+            mappedPlan,
+            restoreError) ||
+        mappedPlan.exactMonitorTopology ||
+        mappedPlan.candidate.window.monitorId != L"DISPLAY-B" ||
+        mappedPlan.candidate.window.dpi != 120 ||
+        mappedPlan.candidate.categories.front().layout.monitorId !=
+            L"DISPLAY-B" ||
+        mappedPlan.candidate.window.x < -2560 ||
+        mappedPlan.candidate.window.x +
+                mappedPlan.candidate.window.width > 0) {
+        std::wcerr << L"Layout monitor remap failed: "
+                   << restoreError << L"\n";
+        return 1;
+    }
+
+    const AppConfig configBeforeAsyncLayoutSmoke = store.LoadAppConfig();
+    if (!store.SaveAppConfig(currentLayout)) {
+        std::wcerr << L"Layout async restore fixture save failed\n";
+        return 231;
+    }
+    LayoutRestoreRequest restoreRequest;
+    restoreRequest.snapshot = loadedProfile;
+    restoreRequest.currentMonitors = savedMonitors;
+    restoreRequest.identities = identityIndex;
+    restoreRequest.desktopSnapshotRevision = 42;
+    if (!store.RestoreLayoutAsync(
+            restoreRequest, nullptr, WM_APP + 219, 77) ||
+        !ConfigStore::DrainPendingWrites(5000)) {
+        std::wcerr << L"Layout async restore writer failed\n";
+        return 232;
+    }
+    const AppConfig asynchronouslyRestored = store.LoadAppConfig();
+    if (!sameWindowConfig(
+            asynchronouslyRestored.window, exactPlan.candidate.window) ||
+        asynchronouslyRestored.settings.lastVisible ||
+        asynchronouslyRestored.categories.size() != 2 ||
+        asynchronouslyRestored.categories.front().id != L"category-a" ||
+        asynchronouslyRestored.categories.front().name != L"Current name" ||
+        asynchronouslyRestored.categories.front().itemIds !=
+            std::vector<std::wstring>{L"item-b", L"item-d"}) {
+        std::wcerr << L"Layout async restore did not persist the plan\n";
+        return 233;
+    }
+    if (!store.RollbackLayoutRestoreAsync(
+            currentLayout, nullptr, WM_APP + 220, 78) ||
+        !ConfigStore::DrainPendingWrites(5000)) {
+        std::wcerr << L"Layout async rollback writer failed\n";
+        return 234;
+    }
+    const AppConfig asynchronouslyRolledBack = store.LoadAppConfig();
+    if (asynchronouslyRolledBack.window.x != currentLayout.window.x ||
+        asynchronouslyRolledBack.categories.size() !=
+            currentLayout.categories.size() ||
+        asynchronouslyRolledBack.categories.front().id !=
+            currentLayout.categories.front().id) {
+        std::wcerr << L"Layout async rollback did not restore the old config\n";
+        return 235;
+    }
+
+    const auto configBeforeAsyncFailure =
+        ReadFileBytes(store.ConfigPath());
+    SetEnvironmentVariableW(L"LATTICE_SMOKE_FAIL_CONFIG_WRITE", L"1");
+    const bool queuedFailedRestore = store.RestoreLayoutAsync(
+        restoreRequest, nullptr, WM_APP + 221, 79);
+    const bool failedRestoreDrained =
+        ConfigStore::DrainPendingWrites(5000);
+    SetEnvironmentVariableW(L"LATTICE_SMOKE_FAIL_CONFIG_WRITE", nullptr);
+    if (!queuedFailedRestore || failedRestoreDrained ||
+        ReadFileBytes(store.ConfigPath()) != configBeforeAsyncFailure) {
+        std::wcerr << L"Layout async write failure changed the config\n";
+        return 236;
+    }
+    if (!store.RollbackLayoutRestoreAsync(
+            currentLayout, nullptr, WM_APP + 222, 80) ||
+        !ConfigStore::DrainPendingWrites(5000) ||
+        !store.SaveAppConfig(configBeforeAsyncLayoutSmoke)) {
+        std::wcerr << L"Layout async smoke cleanup failed\n";
+        return 237;
+    }
+
+    LayoutSnapshot invalidProfile = loadedProfile;
+    invalidProfile.categories.push_back(
+        invalidProfile.categories.front());
+    if (ValidateLayoutSnapshot(invalidProfile, restoreError)) {
+        std::wcerr << L"Duplicate layout category was accepted\n";
+        return 241;
+    }
+
+    const std::wstring profilePath =
+        configDirectory + L"\\layout.profile.ini";
+    const auto profileBeforeFailure = ReadFileBytes(profilePath);
+    SetEnvironmentVariableW(L"LATTICE_SMOKE_FAIL_CONFIG_WRITE", L"1");
+    LayoutSnapshot failedWriteProfile = loadedProfile;
+    ++failedWriteProfile.timestamp;
+    const bool injectedWriteSucceeded =
+        store.SaveLayoutProfile(failedWriteProfile);
+    SetEnvironmentVariableW(L"LATTICE_SMOKE_FAIL_CONFIG_WRITE", nullptr);
+    if (injectedWriteSucceeded ||
+        ReadFileBytes(profilePath) != profileBeforeFailure) {
+        std::wcerr << L"Layout profile write failure changed the file\n";
+        return 242;
+    }
+
+    LayoutSnapshot backupProfile = loadedProfile;
+    ++backupProfile.timestamp;
+    if (!store.SaveLayoutProfile(backupProfile)) {
+        std::wcerr << L"Layout profile backup fixture failed\n";
+        return 243;
+    }
+    {
+        std::ofstream corrupt(profilePath, std::ios::binary | std::ios::trunc);
+        corrupt << "schemaVersion=2\ncategory.count=broken\n";
+    }
+    LayoutSnapshot recoveredProfile;
+    recoveredFromBackup = false;
+    if (!store.LoadLayoutProfile(
+            recoveredProfile, &recoveredFromBackup) ||
+        !recoveredFromBackup ||
+        recoveredProfile.timestamp != loadedProfile.timestamp) {
+        std::wcerr << L"Layout profile backup recovery failed\n";
+        return 244;
+    }
+
+    {
+        std::ofstream legacy(profilePath, std::ios::binary | std::ios::trunc);
+        legacy << "schemaVersion=1\n"
+               << "window.x=321\n"
+               << "window.y=123\n"
+               << "window.width=640\n"
+               << "window.height=480\n"
+               << "window.normalHeight=480\n"
+               << "window.dpi=96\n"
+               << "window.viewMode=1\n";
+    }
+    LayoutSnapshot legacyProfile;
+    recoveredFromBackup = true;
+    if (!store.LoadLayoutProfile(
+            legacyProfile, &recoveredFromBackup) ||
+        recoveredFromBackup || !legacyProfile.legacyMainOnly ||
+        legacyProfile.schemaVersion != 1 ||
+        legacyProfile.main.x != 321 || legacyProfile.main.y != 123) {
+        std::wcerr << L"Legacy layout profile compatibility failed\n";
+        return 245;
     }
 
     const DWORD fixtureRootRequired = GetEnvironmentVariableW(
@@ -3015,6 +4291,8 @@ int RunSmokeConfig() {
         desktopRoot / L"added-before-start.txt";
     const std::filesystem::path addedWhileRunningPath =
         desktopRoot / L"added-while-running.txt";
+    const std::filesystem::path replacementPath =
+        desktopRoot / L"replace-while-updating.txt";
     const std::filesystem::path deletedBeforeStartPath =
         desktopRoot / L"deleted-before-start.txt";
     const std::filesystem::path unavailableParentPath =
@@ -3037,9 +4315,12 @@ int RunSmokeConfig() {
         std::ofstream existing(existingPath, std::ios::binary);
         std::ofstream addedBeforeStart(
             addedBeforeStartPath, std::ios::binary);
+        std::ofstream replacement(
+            replacementPath, std::ios::binary);
         existing << "existing";
         addedBeforeStart << "added-before-start";
-        if (!existing || !addedBeforeStart) {
+        replacement << "original";
+        if (!existing || !addedBeforeStart || !replacement) {
             std::wcerr << L"Desktop filesystem consistency fixture files failed\n";
             return 1;
         }
@@ -3049,6 +4330,8 @@ int RunSmokeConfig() {
         L"consistency-deleted-before-start";
     constexpr wchar_t kDeletedWhileRunningId[] =
         L"consistency-deleted-while-running";
+    constexpr wchar_t kReplacedWhileRunningId[] =
+        L"consistency-replaced-while-running";
     constexpr wchar_t kOutsideReferenceId[] =
         L"consistency-outside-reference";
     constexpr wchar_t kUnavailableReferenceId[] =
@@ -3078,6 +4361,10 @@ int RunSmokeConfig() {
             existingPath,
             L"Deleted While Running"),
         makeItem(
+            kReplacedWhileRunningId,
+            replacementPath,
+            L"Replaced While Running"),
+        makeItem(
             kOutsideReferenceId,
             outsideMissingPath,
             L"Outside Reference"),
@@ -3098,7 +4385,8 @@ int RunSmokeConfig() {
     consistencyCategory.name = L"Consistency";
     consistencyCategory.itemIds = {
         kDeletedBeforeStartId,
-        kDeletedWhileRunningId};
+        kDeletedWhileRunningId,
+        kReplacedWhileRunningId};
     consistencyConfig.categories.push_back(consistencyCategory);
     for (const ItemConfig& item : consistencyConfig.items) {
         consistencyConfig.desktopLayout.push_back(
@@ -3211,6 +4499,41 @@ int RunSmokeConfig() {
         return 1;
     }
 
+    // App updaters commonly remove a shortcut and recreate the same path
+    // after the watcher's first coalesced scan. Membership must survive.
+    if (!std::filesystem::remove(replacementPath, consistencyError) ||
+        consistencyError) {
+        std::wcerr << L"Desktop replacement fixture delete failed\n";
+        return 1;
+    }
+    MainWindowSmokeAccess::LoadDesktopItems(consistencyWindow);
+    for (int refresh = 0; refresh < 3; ++refresh) {
+        MainWindowSmokeAccess::LoadDesktopItems(consistencyWindow);
+    }
+    const AppConfig duringReplacement = store.LoadAppConfig();
+    if (!containsItemId(duringReplacement, kReplacedWhileRunningId) ||
+        !containsMembership(duringReplacement, kReplacedWhileRunningId)) {
+        std::wcerr << L"Desktop replacement prematurely lost membership\n";
+        return 246;
+    }
+    {
+        std::ofstream replacement(replacementPath, std::ios::binary);
+        replacement << "updated";
+        if (!replacement) return 246;
+    }
+    MainWindowSmokeAccess::LoadDesktopItems(consistencyWindow);
+    const AppConfig afterReplacement = store.LoadAppConfig();
+    if (!containsItemId(afterReplacement, kReplacedWhileRunningId) ||
+        !containsMembership(afterReplacement, kReplacedWhileRunningId) ||
+        afterReplacement.categories.front().itemIds !=
+            duringReplacement.categories.front().itemIds ||
+        MainWindowSmokeAccess::DesktopItemIdAtPath(
+            consistencyWindow, replacementPath.wstring()) !=
+                kReplacedWhileRunningId) {
+        std::wcerr << L"Desktop replacement did not regain stable ID\n";
+        return 247;
+    }
+
     if (!store.SaveInteractionStateAsync(
             consistencyCategory.id,
             consistencyCategory.layout,
@@ -3228,13 +4551,30 @@ int RunSmokeConfig() {
         return 1;
     }
     MainWindowSmokeAccess::LoadDesktopItems(consistencyWindow);
+    if (!MainWindowSmokeAccess::HasRegisteredItem(
+            consistencyWindow, kDeletedWhileRunningId) ||
+        MainWindowSmokeAccess::HasDesktopPath(
+            consistencyWindow, existingPath.wstring())) {
+        std::wcerr << L"Desktop deletion was not deferred without a ghost\n";
+        return 249;
+    }
     const AppConfig pendingDeleteConfig = store.LoadAppConfig();
+    if (!containsItemId(pendingDeleteConfig, kDeletedWhileRunningId) ||
+        !containsMembership(pendingDeleteConfig, kDeletedWhileRunningId) ||
+        !ConfigStore::DrainPendingWrites(5000)) {
+        std::wcerr << L"Desktop runtime deletion did not retain hidden membership\n";
+        return 249;
+    }
+    MainWindow restartedConsistencyWindow(
+        GetModuleHandleW(nullptr), {}, false);
+    MainWindowSmokeAccess::LoadDesktopItems(restartedConsistencyWindow);
+    const AppConfig afterRestartDeleteConfig = store.LoadAppConfig();
     if (!verifyRemoved(
-            pendingDeleteConfig,
+            afterRestartDeleteConfig,
             kDeletedWhileRunningId,
             existingPath) ||
         MainWindowSmokeAccess::HasRegisteredItem(
-            consistencyWindow, kDeletedWhileRunningId) ||
+            restartedConsistencyWindow, kDeletedWhileRunningId) ||
         MainWindowSmokeAccess::HasDesktopPath(
             consistencyWindow, existingPath.wstring()) ||
         !MainWindowSmokeAccess::HasDesktopPath(
@@ -3319,13 +4659,6 @@ int RunSmokeConfig() {
     cachedItems.push_back(virtualItem);
     auto* cachedSurface = MainWindowSmokeAccess::AttachCachedDesktopFixture(
         runtimeWindow, cachedItems);
-    auto* categoryWidget = MainWindowSmokeAccess::AttachWidgetFixture(
-        runtimeWindow, runtimeConfig.categories.front().id);
-    auto* uncategorizedWidget = MainWindowSmokeAccess::AttachWidgetFixture(
-        runtimeWindow, kUncategorizedCategoryId);
-    if (!categoryWidget || !uncategorizedWidget) {
-        return 1;
-    }
     const auto pump = [](DWORD duration) {
         const ULONGLONG deadline = GetTickCount64() + duration;
         do {
@@ -3354,10 +4687,21 @@ int RunSmokeConfig() {
         writing.close();
         pump(50);
     }
-    const bool bounded = verifyRemoved(store.LoadAppConfig(), L"runtime-dwl2", dwl2) &&
-        verifyRemoved(store.LoadAppConfig(), L"runtime-temp", transient) &&
+    const AppConfig duringRuntimeDeletion = store.LoadAppConfig();
+    const bool graceRetained =
+        containsMembership(duringRuntimeDeletion, L"runtime-dwl2") &&
+        containsMembership(duringRuntimeDeletion, L"runtime-temp") &&
         !MainWindowSmokeAccess::HasDesktopPath(runtimeWindow, dwl.wstring()) &&
+        !MainWindowSmokeAccess::HasDesktopPath(runtimeWindow, dwl2.wstring()) &&
+        !MainWindowSmokeAccess::HasDesktopPath(runtimeWindow, transient.wstring()) &&
         MainWindowSmokeAccess::HasDesktopPath(runtimeWindow, newName.wstring());
+    if (!ConfigStore::DrainPendingWrites(5000)) return 1;
+    MainWindow restartedRuntimeWindow(GetModuleHandleW(nullptr), {}, false);
+    MainWindowSmokeAccess::LoadDesktopItems(restartedRuntimeWindow);
+    runtimeWindow.ReloadPersistedState();
+    const bool bounded = graceRetained &&
+        verifyRemoved(store.LoadAppConfig(), L"runtime-dwl2", dwl2) &&
+        verifyRemoved(store.LoadAppConfig(), L"runtime-temp", transient);
     pump(900);
     const auto cachedHas = [&](const std::filesystem::path& path) {
         return std::any_of(cachedSurface->Snapshot().items.begin(),
@@ -3368,9 +4712,15 @@ int RunSmokeConfig() {
     const bool cacheConverged = !cachedHas(dwl) && !cachedHas(dwl2) &&
         !cachedHas(transient) && !cachedHas(folder) && !cachedHas(oldName) &&
         !DesktopSurfaceWindowSmokeAccess::IsSelected(*cachedSurface, dwl.wstring());
-    const auto uncategorizedIds = WidgetWindowSmokeAccess::CurrentItemIds(*uncategorizedWidget);
+    const auto categoryIds =
+        MainWindowSmokeAccess::SnapshotItemIdsForCategory(
+            runtimeWindow, runtimeConfig.categories.front().id);
+    const auto uncategorizedIds =
+        MainWindowSmokeAccess::SnapshotItemIdsForCategory(
+            runtimeWindow, kUncategorizedCategoryId);
     const bool widgetDeletion =
-        WidgetWindowSmokeAccess::CurrentItemIds(*categoryWidget).empty() &&
+        categoryIds.size() == 1 &&
+        categoryIds.front() == kReplacedWhileRunningId &&
         std::find(uncategorizedIds.begin(), uncategorizedIds.end(), L"runtime-temp") ==
             uncategorizedIds.end();
     const bool preserved = cachedHas(dwg) && cachedHas(outsideMissingPath) &&
@@ -3415,6 +4765,341 @@ int RunSmokeConfig() {
     runtimeDiagnostics << "SAME_PATH_RECREATION_AND_DELETE=1\n";
     runtimeDiagnostics.flush();
     std::wcout << L"Desktop runtime watcher/timer, temporary deletions, rename and recreation converged\n";
+
+    // A widget-to-desktop drop must replace the old Lattice display point,
+    // without teaching Explorer's independent native layout that point.
+    const std::filesystem::path moveOutConfigRoot =
+        consistencyRoot / L"MoveOutConfig";
+    std::filesystem::create_directories(
+        moveOutConfigRoot, consistencyError);
+    if (consistencyError || !SetEnvironmentVariableW(
+            L"DESKTOP_ORGANIZER_CONFIG_DIR",
+            moveOutConfigRoot.c_str())) {
+        return 248;
+    }
+    const std::filesystem::path movedA = desktopRoot / L"move-out-a.txt";
+    const std::filesystem::path movedB = desktopRoot / L"move-out-b.txt";
+    {
+        std::ofstream first(movedA, std::ios::binary);
+        std::ofstream second(movedB, std::ios::binary);
+        first << "a";
+        second << "b";
+        if (!first || !second) return 248;
+    }
+    constexpr wchar_t kMovedAId[] = L"move-out-a";
+    constexpr wchar_t kMovedBId[] = L"move-out-b";
+    constexpr wchar_t kMoveOutCategory[] = L"move-out-category";
+    ConfigStore moveOutStore;
+    AppConfig moveOutConfig;
+    moveOutConfig.currentCategoryId = kMoveOutCategory;
+    moveOutConfig.items = {
+        makeItem(kMovedAId, movedA, L"Move Out A"),
+        makeItem(kMovedBId, movedB, L"Move Out B")};
+    CategoryConfig moveOutCategory;
+    moveOutCategory.id = kMoveOutCategory;
+    moveOutCategory.name = L"Move Out";
+    moveOutCategory.itemIds = {kMovedAId, kMovedBId};
+    moveOutConfig.categories = {moveOutCategory};
+    moveOutConfig.desktopLayout = {
+        {movedA.wstring(), 20, 40},
+        {movedB.wstring(), 100, 40}};
+    moveOutConfig.desktopDisplayLayout = {
+        {movedA.wstring(), 20, 40},
+        {movedB.wstring(), 100, 40}};
+    if (!moveOutStore.SaveAppConfig(moveOutConfig)) return 248;
+    runtimeDiagnostics << "MOVE_OUT_STAGE=config_saved\n";
+    runtimeDiagnostics.flush();
+    HWND fakeDesktopView = CreateWindowExW(
+        WS_EX_TOOLWINDOW, L"STATIC", L"", WS_POPUP,
+        100, 100, 800, 600, nullptr, nullptr,
+        GetModuleHandleW(nullptr), nullptr);
+    if (fakeDesktopView == nullptr) {
+        std::wcerr << L"Move-out fixture window unavailable: "
+                   << GetLastError() << L"\n";
+        return 248;
+    }
+    runtimeDiagnostics << "MOVE_OUT_STAGE=window_created\n";
+    runtimeDiagnostics.flush();
+    const std::vector<DesktopViewItem> nativeMoveOutItems{
+        {movedA.wstring(), L"Move Out A", {20, 40}, {120, 140}},
+        {movedB.wstring(), L"Move Out B", {100, 40}, {200, 140}}};
+    const std::vector<DesktopPosition> oldDisplayPositions{
+        {movedA.wstring(), {20, 40}},
+        {movedB.wstring(), {100, 40}}};
+    POINT dropA{220, 160};
+    POINT dropB{380, 240};
+    if (!ClientToScreen(fakeDesktopView, &dropA) ||
+        !ClientToScreen(fakeDesktopView, &dropB)) {
+        std::wcerr << L"Move-out fixture coordinate conversion failed: "
+                   << GetLastError() << L"\n";
+        DestroyWindow(fakeDesktopView);
+        return 248;
+    }
+    runtimeDiagnostics << "MOVE_OUT_STAGE=coordinates_mapped\n";
+    runtimeDiagnostics.flush();
+    bool movedOut = false;
+    {
+        MainWindow moveOutWindow(
+            GetModuleHandleW(nullptr), {}, false);
+        MainWindowSmokeAccess::SetWindowForMoveOut(
+            moveOutWindow, fakeDesktopView);
+        MainWindowSmokeAccess::LoadDesktopItems(moveOutWindow);
+        DesktopSurfaceWindow* moveOutSurface =
+            MainWindowSmokeAccess::AttachCachedDesktopFixture(
+                moveOutWindow, nativeMoveOutItems);
+        DesktopSurfaceWindowSmokeAccess::ConfigureMoveOutFixture(
+            *moveOutSurface, fakeDesktopView, nativeMoveOutItems,
+            {movedA.wstring(), movedB.wstring()},
+            oldDisplayPositions);
+        HostedWidgetCommand moveOutCommand;
+        moveOutCommand.type = HostedWidgetCommandType::MoveSelectionOut;
+        moveOutCommand.categoryId = kMoveOutCategory;
+        moveOutCommand.itemIds = {kMovedAId, kMovedBId};
+        moveOutCommand.itemScreenPoints = {dropA, dropB};
+        movedOut = MainWindowSmokeAccess::ExecuteHostedCommand(
+            moveOutWindow, moveOutCommand);
+        runtimeDiagnostics << "MOVE_OUT_STAGE=command_issued\n";
+        runtimeDiagnostics.flush();
+        const AppConfig afterMoveOut = moveOutStore.LoadAppConfig();
+        const auto placementAt = [](
+            const std::vector<DesktopPlacementConfig>& positions,
+            const std::wstring& path) {
+            return std::find_if(
+                positions.begin(), positions.end(),
+                [&](const DesktopPlacementConfig& candidate) {
+                    return CompareStringOrdinal(
+                        candidate.path.c_str(), -1,
+                        path.c_str(), -1, TRUE) == CSTR_EQUAL;
+                });
+        };
+        const auto displayA = placementAt(
+            afterMoveOut.desktopDisplayLayout, movedA.wstring());
+        const auto displayB = placementAt(
+            afterMoveOut.desktopDisplayLayout, movedB.wstring());
+        const auto nativeA = placementAt(
+            afterMoveOut.desktopLayout, movedA.wstring());
+        const auto nativeB = placementAt(
+            afterMoveOut.desktopLayout, movedB.wstring());
+        movedOut = movedOut &&
+            displayA != afterMoveOut.desktopDisplayLayout.end() &&
+            displayB != afterMoveOut.desktopDisplayLayout.end() &&
+            displayA->x == 220 && displayA->y == 160 &&
+            displayB->x == 380 && displayB->y == 240 &&
+            nativeA != afterMoveOut.desktopLayout.end() &&
+            nativeB != afterMoveOut.desktopLayout.end() &&
+            nativeA->x == 20 && nativeA->y == 40 &&
+            nativeB->x == 100 && nativeB->y == 40 &&
+            !containsMembership(afterMoveOut, kMovedAId) &&
+            !containsMembership(afterMoveOut, kMovedBId) &&
+            std::filesystem::exists(movedA) &&
+            std::filesystem::exists(movedB);
+        MainWindowSmokeAccess::LoadDesktopItems(moveOutWindow);
+        const auto visibleA =
+            DesktopSurfaceWindowSmokeAccess::VisibleScreenPointForIdentity(
+                *moveOutSurface, movedA.wstring());
+        const auto visibleB =
+            DesktopSurfaceWindowSmokeAccess::VisibleScreenPointForIdentity(
+                *moveOutSurface, movedB.wstring());
+        movedOut = movedOut && visibleA.has_value() && visibleB.has_value() &&
+            visibleA->x == dropA.x && visibleA->y == dropA.y &&
+            visibleB->x == dropB.x && visibleB->y == dropB.y;
+    }
+    DestroyWindow(fakeDesktopView);
+    if (!movedOut || !ConfigStore::DrainPendingWrites(5000)) {
+        std::wcerr << L"Widget move-out display position rebounded or changed native layout\n";
+        return 248;
+    }
+    const AppConfig restartedMoveOut = moveOutStore.LoadAppConfig();
+    if (restartedMoveOut.desktopDisplayLayout.size() != 2 ||
+        restartedMoveOut.desktopDisplayLayout[0].x != 220 ||
+        restartedMoveOut.desktopDisplayLayout[1].x != 380 ||
+        restartedMoveOut.desktopLayout[0].x != 20 ||
+        restartedMoveOut.desktopLayout[1].x != 100) {
+        std::wcerr << L"Widget move-out position did not survive independent load\n";
+        return 248;
+    }
+    std::wcout << L"Widget move-out display/native positions remained independent\n";
+    return 0;
+}
+
+int RunSmokeLayoutRestore(HINSTANCE instance) {
+    AttachParentConsole();
+    const std::vector<LayoutMonitorSnapshot> monitors =
+        SmokeLayoutMonitors();
+    if (monitors.empty()) return 251;
+    const auto primaryIt = std::find_if(
+        monitors.begin(), monitors.end(),
+        [](const LayoutMonitorSnapshot& monitor) {
+            return monitor.primary;
+        });
+    const LayoutMonitorSnapshot& monitor = primaryIt == monitors.end()
+        ? monitors.front() : *primaryIt;
+    const int workWidth =
+        monitor.workArea.right - monitor.workArea.left;
+    const int workHeight =
+        monitor.workArea.bottom - monitor.workArea.top;
+    const int widgetWidth = std::max(96, std::min(360, workWidth - 80));
+    const int widgetHeight = std::max(80, std::min(300, workHeight - 80));
+    const auto makeLayout = [&](int offsetX, int offsetY) {
+        WindowConfig layout;
+        layout.x = std::clamp(
+            monitor.workArea.left + offsetX,
+            monitor.workArea.left,
+            std::max(
+                monitor.workArea.left,
+                monitor.workArea.right - widgetWidth));
+        layout.y = std::clamp(
+            monitor.workArea.top + offsetY,
+            monitor.workArea.top,
+            std::max(
+                monitor.workArea.top,
+                monitor.workArea.bottom - widgetHeight));
+        layout.width = widgetWidth;
+        layout.height = widgetHeight;
+        layout.normalHeight = widgetHeight;
+        layout.viewMode = 1;
+        layout.monitorId = monitor.id;
+        layout.dpi = monitor.dpi;
+        return layout;
+    };
+
+    AppConfig saved;
+    saved.settings.lastVisible = false;
+    saved.window = makeLayout(36, 32);
+    saved.window.opacity = 211;
+    CategoryConfig categoryA;
+    categoryA.id = L"layout-live-a";
+    categoryA.name = L"Layout live A";
+    categoryA.layout = makeLayout(120, 90);
+    categoryA.layout.collapsed = true;
+    categoryA.layout.opacity = 203;
+    categoryA.layout.iconSize = 56;
+    categoryA.layout.density = 2;
+    categoryA.layout.contentViewMode = 1;
+    categoryA.layout.sortMode = 3;
+    categoryA.layout.locked = true;
+    categoryA.layout.showBorder = false;
+    categoryA.layout.autoArrange = true;
+    categoryA.layout.fixedExpanded = true;
+    CategoryConfig categoryB;
+    categoryB.id = L"layout-live-b";
+    categoryB.name = L"Layout live B";
+    categoryB.layout = makeLayout(520, 130);
+    categoryB.layout.opacity = 187;
+    saved.categories = {categoryA, categoryB};
+
+    ConfigStore store;
+    if (!store.SaveAppConfig(saved)) return 252;
+    MainWindow window(instance, {}, false);
+    if (!window.Create()) return 253;
+    struct WindowCleanup {
+        HWND hwnd = nullptr;
+        ~WindowCleanup() {
+            if (hwnd != nullptr && IsWindow(hwnd) != FALSE) {
+                DestroyWindow(hwnd);
+            }
+        }
+    } cleanup{window.Window()};
+    WidgetWindow* widgetA = MainWindowSmokeAccess::AttachWidgetFixture(
+        window, categoryA.id);
+    WidgetWindow* widgetB = MainWindowSmokeAccess::AttachWidgetFixture(
+        window, categoryB.id);
+    if (widgetA == nullptr || widgetB == nullptr) return 254;
+
+    MainWindowSmokeAccess::SaveLayoutProfile(window);
+    LayoutSnapshot savedProfile;
+    if (!store.LoadLayoutProfile(savedProfile) ||
+        savedProfile.schemaVersion != 2 ||
+        savedProfile.categories.size() != 2) {
+        return 255;
+    }
+
+    AppConfig current = saved;
+    current.window = makeLayout(12, 12);
+    current.categories[0].layout = makeLayout(28, 34);
+    current.categories[1].layout = makeLayout(64, 70);
+    if (!store.SaveAppConfig(current) ||
+        !MainWindowSmokeAccess::PublishLayout(
+            window, current, monitors, false)) {
+        return 256;
+    }
+
+    MainWindowSmokeAccess::RestoreLayoutProfile(window);
+    const ULONGLONG restoreDeadline = GetTickCount64() + 5000;
+    while (!MainWindowSmokeAccess::LayoutRestoreIdle(window) &&
+           GetTickCount64() < restoreDeadline) {
+        MSG message{};
+        while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+        Sleep(5);
+    }
+    if (!MainWindowSmokeAccess::LayoutRestoreIdle(window) ||
+        !ConfigStore::DrainPendingWrites(5000)) {
+        return 257;
+    }
+    RECT restoredMain{};
+    RECT restoredA{};
+    RECT restoredB{};
+    GetWindowRect(window.Window(), &restoredMain);
+    GetWindowRect(WidgetWindowSmokeAccess::Window(*widgetA), &restoredA);
+    GetWindowRect(WidgetWindowSmokeAccess::Window(*widgetB), &restoredB);
+    const AppConfig persistedRestore = store.LoadAppConfig();
+    if (restoredMain.left != saved.window.x ||
+        restoredMain.top != saved.window.y ||
+        restoredA.left != categoryA.layout.x ||
+        restoredA.top != categoryA.layout.y ||
+        restoredB.left != categoryB.layout.x ||
+        restoredB.top != categoryB.layout.y ||
+        persistedRestore.categories.size() != 2 ||
+        persistedRestore.categories[0].layout.viewMode !=
+            categoryA.layout.viewMode ||
+        persistedRestore.categories[0].layout.x != categoryA.layout.x) {
+        return 258;
+    }
+
+    AppConfig rejected = persistedRestore;
+    rejected.window = makeLayout(180, 190);
+    rejected.categories[0].layout = makeLayout(240, 250);
+    rejected.categories[1].layout = makeLayout(600, 280);
+    SetEnvironmentVariableW(
+        L"LATTICE_SMOKE_FAIL_LAYOUT_WIDGET_INDEX", L"1");
+    const bool partialPublishAccepted =
+        MainWindowSmokeAccess::PublishLayout(
+            window, rejected, monitors, true);
+    SetEnvironmentVariableW(
+        L"LATTICE_SMOKE_FAIL_LAYOUT_WIDGET_INDEX", nullptr);
+    RECT partiallyAppliedA{};
+    GetWindowRect(
+        WidgetWindowSmokeAccess::Window(*widgetA), &partiallyAppliedA);
+    const bool preservedWidgetLayout =
+        partiallyAppliedA.left == categoryA.layout.x &&
+        partiallyAppliedA.top == categoryA.layout.y;
+    if (partialPublishAccepted || !preservedWidgetLayout ||
+        !MainWindowSmokeAccess::PublishLayout(
+            window, persistedRestore, monitors, false)) {
+        return 259;
+    }
+    GetWindowRect(window.Window(), &restoredMain);
+    GetWindowRect(WidgetWindowSmokeAccess::Window(*widgetA), &restoredA);
+    GetWindowRect(WidgetWindowSmokeAccess::Window(*widgetB), &restoredB);
+    if (restoredMain.left != saved.window.x ||
+        restoredMain.top != saved.window.y ||
+        restoredA.left != categoryA.layout.x ||
+        restoredA.top != categoryA.layout.y ||
+        restoredB.left != categoryB.layout.x ||
+        restoredB.top != categoryB.layout.y) {
+        return 260;
+    }
+
+    std::vector<LayoutMonitorSnapshot> changedMonitors = monitors;
+    ++changedMonitors.front().workArea.right;
+    if (MainWindowSmokeAccess::PublishLayout(
+            window, rejected, changedMonitors, true)) {
+        return 261;
+    }
+    std::wcout << L"Complete layout save/restore and live rollback passed\n";
     return 0;
 }
 
@@ -4422,6 +6107,16 @@ int RunSmokeShortcutOverlay(HINSTANCE instance) {
         CaptureIconPixels(expectedIcon, expectedPixels) &&
         CaptureIconPixels(cachedIcon, cachedPixels) &&
         CaptureIconPixels(desktopSizedIcon, desktopSizedPixels);
+    std::vector<COLORREF> ghostNormalPixels;
+    std::vector<COLORREF> ghostShortcutPixels;
+    DragGhostWindow& ghost = DragGhostWindow::Instance();
+    const bool ghostCaptured =
+        DragGhostWindowSmokeAccess::CaptureStagedPixels(
+            ghost, instance, CopyIcon(expectedIcon), false,
+            ghostNormalPixels) &&
+        DragGhostWindowSmokeAccess::CaptureStagedPixels(
+            ghost, instance, CopyIcon(expectedIcon), true,
+            ghostShortcutPixels);
     DestroyIcon(baseIcon);
     DestroyIcon(expectedIcon);
     if (cachedIcon != nullptr) {
@@ -4434,6 +6129,10 @@ int RunSmokeShortcutOverlay(HINSTANCE instance) {
         basePixels == expectedPixels ||
         cachedPixels != expectedPixels) {
         std::wcerr << L"Lattice shortcut icon is not the Shell-composited icon\n";
+        return 1;
+    }
+    if (!ghostCaptured || ghostNormalPixels != ghostShortcutPixels) {
+        std::wcerr << L"Shortcut drag ghost added a second arrow\n";
         return 1;
     }
     if (desktopSizedPixels != expectedPixels) {
@@ -4961,8 +6660,11 @@ int RunSmokeWidgetAlignment(HINSTANCE instance) {
         return fail(L"Widget alignment config save failed", 13);
     }
 
-    WidgetWindow first(instance, nullptr, firstCategory.id, 0);
-    WidgetWindow second(instance, nullptr, secondCategory.id, 0);
+    const auto desktopSnapshot = BuildSmokeDesktopSnapshot(config);
+    WidgetWindow first(
+        instance, nullptr, firstCategory.id, 0, desktopSnapshot);
+    WidgetWindow second(
+        instance, nullptr, secondCategory.id, 0, desktopSnapshot);
     if (!first.Create() || !second.Create()) {
         first.Close();
         second.Close();
@@ -5288,7 +6990,8 @@ int RunSmokeWidgetDesktopLayer(HINSTANCE instance) {
     UpdateWindow(coverWindow);
 
     widget = std::make_unique<WidgetWindow>(
-        instance, nullptr, category.id, 0);
+        instance, nullptr, category.id, 0,
+        BuildSmokeDesktopSnapshot(config));
     if (!widget->Create()) {
         return fail(L"Desktop-hosted widget creation failed", 65);
     }
@@ -5332,8 +7035,42 @@ int RunSmokeWidgetDesktopLayer(HINSTANCE instance) {
         GetAncestor(overlapWindow, GA_ROOT) != coverWindow) {
         return fail(L"New widget covered an already open normal application", 68);
     }
-    widget->SetVisible(false);
-    widget->SetVisible(true);
+    if (!WidgetWindowSmokeAccess::HasVisibleResources(*widget) ||
+        !WidgetWindowSmokeAccess::PrimeIconCache(*widget)) {
+        return fail(L"Visible widget lifecycle precondition failed", 79);
+    }
+    DWORD widgetHandlesBefore = 0;
+    GetProcessHandleCount(GetCurrentProcess(), &widgetHandlesBefore);
+    const DWORD widgetGdiBefore = GetGuiResources(
+        GetCurrentProcess(), GR_GDIOBJECTS);
+    const DWORD widgetUserBefore = GetGuiResources(
+        GetCurrentProcess(), GR_USEROBJECTS);
+    for (int cycle = 0; cycle < 20; ++cycle) {
+        widget->SetVisible(false);
+        if (!WidgetWindowSmokeAccess::InvisibleResourcesReleased(*widget)) {
+            return fail(L"Hidden widget retained target, wallpaper, or icon resources", 79);
+        }
+        widget->SetVisible(true);
+        if (!WidgetWindowSmokeAccess::HasVisibleResources(*widget)) {
+            return fail(L"Visible widget resources were not restored", 79);
+        }
+    }
+    DWORD widgetHandlesAfter = 0;
+    GetProcessHandleCount(GetCurrentProcess(), &widgetHandlesAfter);
+    const DWORD widgetGdiAfter = GetGuiResources(
+        GetCurrentProcess(), GR_GDIOBJECTS);
+    const DWORD widgetUserAfter = GetGuiResources(
+        GetCurrentProcess(), GR_USEROBJECTS);
+    std::wcout << L"WIDGET_LIFECYCLE_20 handles="
+               << widgetHandlesBefore << L"->" << widgetHandlesAfter
+               << L" gdi=" << widgetGdiBefore << L"->" << widgetGdiAfter
+               << L" user=" << widgetUserBefore << L"->" << widgetUserAfter
+               << L"\n";
+    if (widgetHandlesAfter > widgetHandlesBefore + 8 ||
+        widgetGdiAfter > widgetGdiBefore + 2 ||
+        widgetUserAfter > widgetUserBefore + 2) {
+        return fail(L"Repeated widget lifecycle leaked bounded process resources", 79);
+    }
     overlapWindow = WindowFromPoint(overlapPoint);
     if (overlapWindow == nullptr ||
         GetAncestor(overlapWindow, GA_ROOT) != coverWindow) {
@@ -5506,9 +7243,15 @@ int RunSmokeWidgetDesktopLayer(HINSTANCE instance) {
     if (!captureTitle(expandedTitle)) {
         return fail(L"Expanded title pixel probe is obscured or unavailable", 78);
     }
+    if (!WidgetWindowSmokeAccess::PrimeIconCache(*widget)) {
+        return fail(L"Collapsed widget icon lifecycle precondition failed", 79);
+    }
     WidgetWindowSmokeAccess::ToggleCollapsed(*widget);
     if (!captureTitle(collapsedTitle)) {
         return fail(L"Collapsed title pixel probe is obscured or unavailable", 78);
+    }
+    if (!WidgetWindowSmokeAccess::CollapsedResourcesAreBounded(*widget)) {
+        return fail(L"Collapsed widget retained expanded wallpaper or icon resources", 79);
     }
     WidgetWindowSmokeAccess::ToggleCollapsed(*widget);
     if (!captureTitle(restoredTitle) || expandedTitle != collapsedTitle ||
@@ -5543,7 +7286,8 @@ int RunSmokeWidgetDesktopLayer(HINSTANCE instance) {
                << expandedTitle.size() << L" pixels across three states\n";
 
     siblingWidget = std::make_unique<WidgetWindow>(
-        instance, nullptr, siblingCategory.id, 0);
+        instance, nullptr, siblingCategory.id, 0,
+        BuildSmokeDesktopSnapshot(config));
     if (!siblingWidget->Create()) {
         return fail(L"Overlapping sibling widget creation failed", 75);
     }
@@ -5761,6 +7505,7 @@ int RunSmokeDesktopIconFidelity(HINSTANCE instance) {
             << L"Desktop icon fidelity left a Shell item on a placeholder\n";
         return 133;
     }
+    SendMessageW(surface.Window(), WM_MOUSELEAVE, 0, 0);
     RedrawWindow(
         surface.Window(),
         nullptr,
@@ -5796,6 +7541,7 @@ int RunSmokeDesktopIconFidelity(HINSTANCE instance) {
         MsgWaitForMultipleObjects(
             0, nullptr, FALSE, 16, QS_ALLINPUT);
     }
+    SendMessageW(surface.Window(), WM_MOUSELEAVE, 0, 0);
     RedrawWindow(
         surface.Window(),
         nullptr,
@@ -6138,47 +7884,6 @@ int RunSmokeDesktopDisplayTakeover(HINSTANCE instance) {
             }
         }
     } foregroundRestorer{originalForeground};
-    const auto withForegroundInputQueue = [&](auto&& action) {
-        const HWND foreground = GetForegroundWindow();
-        const DWORD currentThread = GetCurrentThreadId();
-        const DWORD foregroundThread = foreground == nullptr
-            ? 0
-            : GetWindowThreadProcessId(foreground, nullptr);
-        const bool needsAttachment = foregroundThread != 0 &&
-            foregroundThread != currentThread;
-        HANDLE foregroundThreadHandle = needsAttachment
-            ? OpenThread(SYNCHRONIZE, FALSE, foregroundThread)
-            : nullptr;
-        if (needsAttachment &&
-            AttachThreadInput(
-                currentThread, foregroundThread, TRUE) == FALSE) {
-            if (foregroundThreadHandle != nullptr) {
-                CloseHandle(foregroundThreadHandle);
-            }
-            return false;
-        }
-        action();
-        if (needsAttachment &&
-            AttachThreadInput(
-                currentThread, foregroundThread, FALSE) == FALSE) {
-            const bool foregroundThreadExited =
-                foregroundThreadHandle != nullptr &&
-                WaitForSingleObject(foregroundThreadHandle, 0) ==
-                    WAIT_OBJECT_0;
-            if (!foregroundThreadExited &&
-                AttachThreadInput(
-                    currentThread, foregroundThread, FALSE) == FALSE) {
-                if (foregroundThreadHandle != nullptr) {
-                    CloseHandle(foregroundThreadHandle);
-                }
-                return false;
-            }
-        }
-        if (foregroundThreadHandle != nullptr) {
-            CloseHandle(foregroundThreadHandle);
-        }
-        return true;
-    };
     std::wstring renameIdentity;
     const bool renameSelected = hasDesktopRenameFixture
         ? DesktopSurfaceWindowSmokeAccess::SelectRenameableByIdentity(
@@ -6204,20 +7909,49 @@ int RunSmokeDesktopDisplayTakeover(HINSTANCE instance) {
             << L"Desktop Shell menu did not expose canonical rename\n";
         return 201;
     }
-    // This branch directly exercises the editor UI. Unlike the separate
-    // real-input F2 smoke, SendMessage does not grant foreground activation,
-    // so temporarily share the existing foreground input queue while the
-    // activatable editor is created and focused.
-    const bool f2InputQueueRestored = withForegroundInputQueue([&]() {
-        SendMessageW(surfaceWindow, WM_KEYDOWN, VK_F2, 0);
-        pumpMessagesFor(80);
-    });
-    if (!f2InputQueueRestored) {
+    // Give this process the real last-input privilege through the already
+    // exposed desktop surface. This exercises the same foreground permission
+    // Windows grants after an actual desktop click and avoids coupling the
+    // smoke to whichever unrelated application happens to own foreground.
+    const auto activationPoint =
+        DesktopSurfaceWindowSmokeAccess::FindExposedHitPointForIdentity(
+            surface, renameIdentity);
+    POINT activationCursor{};
+    const auto injectActivationMouse = [&](POINT point, DWORD flags) {
+        INPUT input{};
+        input.type = INPUT_MOUSE;
+        input.mi.dx = MulDiv(
+            point.x - GetSystemMetrics(SM_XVIRTUALSCREEN),
+            65535,
+            (std::max)(1, GetSystemMetrics(SM_CXVIRTUALSCREEN) - 1));
+        input.mi.dy = MulDiv(
+            point.y - GetSystemMetrics(SM_YVIRTUALSCREEN),
+            65535,
+            (std::max)(1, GetSystemMetrics(SM_CYVIRTUALSCREEN) - 1));
+        input.mi.dwFlags = MOUSEEVENTF_ABSOLUTE |
+            MOUSEEVENTF_VIRTUALDESK | MOUSEEVENTF_MOVE | flags;
+        return SendInput(1, &input, sizeof(input)) == 1;
+    };
+    const bool activationReady =
+        activationPoint.has_value() &&
+        GetCursorPos(&activationCursor) != FALSE &&
+        injectActivationMouse(*activationPoint, 0);
+    pumpMessagesFor(40);
+    const bool activationRouted = activationReady &&
+        WindowFromPoint(*activationPoint) == surfaceWindow;
+    const bool activationInjected = activationRouted &&
+        injectActivationMouse(*activationPoint, MOUSEEVENTF_LEFTDOWN) &&
+        injectActivationMouse(*activationPoint, MOUSEEVENTF_LEFTUP);
+    injectActivationMouse(activationCursor, 0);
+    pumpMessagesFor(80);
+    if (!activationInjected) {
         surface.Close();
         std::wcerr
-            << L"Desktop F2 smoke could not restore the foreground input queue\n";
+            << L"Desktop F2 smoke could not route real activation input\n";
         return 217;
     }
+    SendMessageW(surfaceWindow, WM_KEYDOWN, VK_F2, 0);
+    pumpMessagesFor(80);
     HWND renameEditor =
         DesktopSurfaceWindowSmokeAccess::RenameEditor(surface);
     if (renameEditor == nullptr ||
@@ -6298,25 +8032,13 @@ int RunSmokeDesktopDisplayTakeover(HINSTANCE instance) {
             << L"Desktop rename label geometry is unavailable\n";
         return 204;
     }
-    const bool clickInputQueueRestored = withForegroundInputQueue([&]() {
-        SendMessageW(
-            surfaceWindow, WM_LBUTTONDOWN, MK_LBUTTON,
-            MAKELPARAM(labelPoint.x, labelPoint.y));
-        SendMessageW(
-            surfaceWindow, WM_LBUTTONUP, 0,
-            MAKELPARAM(labelPoint.x, labelPoint.y));
-        pumpMessagesFor(80);
-    });
-    const bool clickTimerInputQueueRestored =
-        clickInputQueueRestored && withForegroundInputQueue([&]() {
-        pumpMessagesFor(GetDoubleClickTime() + 100);
-    });
-    if (!clickInputQueueRestored || !clickTimerInputQueueRestored) {
-        surface.Close();
-        std::wcerr
-            << L"Desktop slow-click smoke could not restore the foreground input queue\n";
-        return 218;
-    }
+    SendMessageW(
+        surfaceWindow, WM_LBUTTONDOWN, MK_LBUTTON,
+        MAKELPARAM(labelPoint.x, labelPoint.y));
+    SendMessageW(
+        surfaceWindow, WM_LBUTTONUP, 0,
+        MAKELPARAM(labelPoint.x, labelPoint.y));
+    pumpMessagesFor(GetDoubleClickTime() + 180);
     renameEditor =
         DesktopSurfaceWindowSmokeAccess::RenameEditor(surface);
     if (renameEditor == nullptr ||
@@ -7059,6 +8781,49 @@ int RunSmokeDesktopDisplayTakeover(HINSTANCE instance) {
                 });
         });
     if (!sameDesktopIdentities) {
+        const DWORD required = GetEnvironmentVariableW(
+            L"DESKTOP_ORGANIZER_SMOKE_ITEMS_DIR", nullptr, 0);
+        if (required != 0) {
+            std::wstring root(required, L'\0');
+            const DWORD copied = GetEnvironmentVariableW(
+                L"DESKTOP_ORGANIZER_SMOKE_ITEMS_DIR",
+                root.data(), required);
+            if (copied != 0 && copied < required) {
+                root.resize(copied);
+                std::ofstream diagnostic(
+                    std::filesystem::path(root) /
+                        L"desktop-takeover-identity-difference.txt",
+                    std::ios::trunc);
+                for (const DesktopViewItem& expected : before.items) {
+                    const bool found = std::any_of(
+                        after.items.begin(), after.items.end(),
+                        [&](const DesktopViewItem& actual) {
+                            return CompareStringOrdinal(
+                                expected.path.c_str(), -1,
+                                actual.path.c_str(), -1,
+                                TRUE) == CSTR_EQUAL;
+                        });
+                    if (!found) {
+                        diagnostic << "before-only: "
+                            << Utf8Text(expected.path) << "\n";
+                    }
+                }
+                for (const DesktopViewItem& actual : after.items) {
+                    const bool found = std::any_of(
+                        before.items.begin(), before.items.end(),
+                        [&](const DesktopViewItem& expected) {
+                            return CompareStringOrdinal(
+                                expected.path.c_str(), -1,
+                                actual.path.c_str(), -1,
+                                TRUE) == CSTR_EQUAL;
+                        });
+                    if (!found) {
+                        diagnostic << "after-only: "
+                            << Utf8Text(actual.path) << "\n";
+                    }
+                }
+            }
+        }
         std::wcerr
             << L"Desktop takeover input changed the desktop item set\n";
         return 125;
@@ -7094,6 +8859,354 @@ int RunSmokeDesktopDisplayTakeover(HINSTANCE instance) {
         << (before.items.size() - assigned.size())
         << L", flags=" << before.viewFlags << L"\n";
     return 0;
+}
+
+int RunSmokeDesktopDoubleClick(HINSTANCE instance) {
+    AttachParentConsole();
+    SetThreadDpiAwarenessContext(
+        DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    DesktopSurfaceWindow surface(instance);
+    std::wstring errorMessage;
+    if (!surface.Create({}, errorMessage)) {
+        std::wcerr << L"Double-click surface setup failed: "
+                   << errorMessage << L"\n";
+        return 321;
+    }
+    surface.Show();
+    const auto pumpFor = [](DWORD milliseconds) {
+        const ULONGLONG deadline = GetTickCount64() + milliseconds;
+        do {
+            MSG message{};
+            while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+                TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
+            MsgWaitForMultipleObjects(
+                0, nullptr, FALSE, 10, QS_ALLINPUT);
+        } while (GetTickCount64() < deadline);
+    };
+    pumpFor(180);
+    std::wstring identity;
+    std::optional<POINT> hitPoint;
+    for (const DesktopViewItem& item : surface.Snapshot().items) {
+        hitPoint = DesktopSurfaceWindowSmokeAccess::
+            FindExposedCenterHitPointForIdentity(surface, item.path);
+        if (hitPoint.has_value()) {
+            identity = item.path;
+            break;
+        }
+    }
+    POINT savedCursor{};
+    if (!hitPoint.has_value() ||
+        GetCursorPos(&savedCursor) == FALSE ||
+        ((GetAsyncKeyState(VK_LBUTTON) |
+          GetAsyncKeyState(VK_RBUTTON) |
+          GetAsyncKeyState(VK_CONTROL) |
+          GetAsyncKeyState(VK_SHIFT)) & 0x8000) != 0) {
+        surface.Close();
+        std::wcerr << L"Double-click exposed-item input precondition failed\n";
+        return 322;
+    }
+    const auto sendMouse = [&](POINT point, DWORD flags) {
+        INPUT input{};
+        input.type = INPUT_MOUSE;
+        if (flags == 0) {
+            input.mi.dx = MulDiv(
+                point.x - GetSystemMetrics(SM_XVIRTUALSCREEN), 65535,
+                (std::max)(1, GetSystemMetrics(SM_CXVIRTUALSCREEN) - 1));
+            input.mi.dy = MulDiv(
+                point.y - GetSystemMetrics(SM_YVIRTUALSCREEN), 65535,
+                (std::max)(1, GetSystemMetrics(SM_CYVIRTUALSCREEN) - 1));
+            input.mi.dwFlags = MOUSEEVENTF_ABSOLUTE |
+                MOUSEEVENTF_VIRTUALDESK | MOUSEEVENTF_MOVE;
+        } else {
+            input.mi.dwFlags = flags;
+        }
+        const bool injected = SendInput(1, &input, sizeof(input)) == 1;
+        pumpFor(25);
+        return injected;
+    };
+    bool firstClickStillOnSurface = false;
+    int firstDownHostedGesture = -1;
+    int firstUpHostedGesture = -1;
+    bool firstDownCaptured = false;
+    POINT firstDownHostedStart{};
+    POINT firstDownHostedCurrent{};
+    POINT firstDragActivation{};
+    std::wstring firstClickCandidateIdentity;
+    std::wstring firstClickCandidateCategory;
+    const auto doubleClick = [&](POINT point) {
+        pumpFor(GetDoubleClickTime() + 40);
+        bool injected = sendMouse(point, 0);
+        for (int click = 0; click < 2; ++click) {
+            injected = sendMouse(point, MOUSEEVENTF_LEFTDOWN) &&
+                injected;
+            if (click == 0) {
+                firstDownHostedGesture =
+                    DesktopSurfaceWindowSmokeAccess::
+                        HostedPointerGestureForSmoke(surface);
+                firstDownCaptured = GetCapture() == surface.Window();
+                firstDownHostedStart =
+                    DesktopSurfaceWindowSmokeAccess::
+                        HostedPointerStartForSmoke(surface);
+                firstDownHostedCurrent =
+                    DesktopSurfaceWindowSmokeAccess::
+                        HostedPointerCurrentForSmoke(surface);
+                firstDragActivation =
+                    DesktopSurfaceWindowSmokeAccess::
+                        HostedDragActivationPointForSmoke(surface);
+            }
+            injected = sendMouse(point, MOUSEEVENTF_LEFTUP) &&
+                injected;
+            if (click == 0) {
+                firstUpHostedGesture =
+                    DesktopSurfaceWindowSmokeAccess::
+                        HostedPointerGestureForSmoke(surface);
+                firstClickStillOnSurface =
+                    WindowFromPoint(point) == surface.Window();
+                firstClickCandidateIdentity =
+                    DesktopSurfaceWindowSmokeAccess::
+                        CompletedClickIdentityForSmoke(surface);
+                firstClickCandidateCategory =
+                    DesktopSurfaceWindowSmokeAccess::
+                        CompletedClickCategoryForSmoke(surface);
+            }
+        }
+        pumpFor(80);
+        return injected;
+    };
+    DesktopSurfaceWindowSmokeAccess::SuppressDesktopOpenForSmoke(
+        surface, true);
+    const size_t messageBefore = DesktopSurfaceWindowSmokeAccess::
+        DoubleClickMessageCountForSmoke(surface);
+    const size_t desktopDownBefore = DesktopSurfaceWindowSmokeAccess::
+        LeftDownMessageCountForSmoke(surface);
+    const size_t desktopUpBefore = DesktopSurfaceWindowSmokeAccess::
+        LeftUpMessageCountForSmoke(surface);
+    const bool desktopInput = doubleClick(*hitPoint);
+    const bool desktopFirstHit = firstClickStillOnSurface;
+    const bool desktopFirstCandidate =
+        !firstClickCandidateIdentity.empty();
+    const size_t desktopDownCount = DesktopSurfaceWindowSmokeAccess::
+        LeftDownMessageCountForSmoke(surface) - desktopDownBefore;
+    const size_t desktopUpCount = DesktopSurfaceWindowSmokeAccess::
+        LeftUpMessageCountForSmoke(surface) - desktopUpBefore;
+    const size_t desktopMessageAfter =
+        DesktopSurfaceWindowSmokeAccess::
+            DoubleClickMessageCountForSmoke(surface);
+    const size_t desktopOpenCount =
+        DesktopSurfaceWindowSmokeAccess::
+            DesktopOpenRequestCountForSmoke(surface);
+    const bool desktopRoute =
+        desktopMessageAfter == messageBefore + 1 &&
+        desktopOpenCount == 1 &&
+        CompareStringOrdinal(
+            DesktopSurfaceWindowSmokeAccess::
+                DesktopOpenPathForSmoke(surface).c_str(), -1,
+            identity.c_str(), -1, TRUE) == CSTR_EQUAL;
+
+    HostedWidgetDescriptor widget;
+    widget.categoryId = L"smoke-double-click-widget";
+    widget.title = L"Double-click smoke";
+    widget.visible = true;
+    widget.config.x = hitPoint->x;
+    widget.config.y = hitPoint->y;
+    widget.config.width = 280;
+    widget.config.height = 300;
+    widget.config.normalHeight = 300;
+    widget.config.dpi = 96;
+    widget.config.iconSize = 48;
+    DesktopItem testItem;
+    testItem.id = L"smoke-double-click-item";
+    testItem.path = L"C:\\unified-host-double-click\\item.txt";
+    testItem.displayName = L"Double-click item";
+    widget.items.push_back(std::move(testItem));
+    std::vector<HostedWidgetCommand> commands;
+    surface.SetHostedWidgetCommandHandler(
+        [&](const HostedWidgetCommand& command) {
+            commands.push_back(command);
+            return true;
+        });
+    bool widgetReady = surface.ApplyHostedWidgets({widget}, errorMessage);
+    if (widgetReady) {
+        WidgetView* view = DesktopSurfaceWindowSmokeAccess::
+            HostedWidgetAt(surface, 0);
+        widgetReady = view != nullptr;
+        if (widgetReady) {
+            const RECT cell = view->ItemHostCell(0);
+            POINT itemPoint{
+                (cell.left + cell.right) / 2, cell.top + 12};
+            ClientToScreen(surface.Window(), &itemPoint);
+            widget.config.x += hitPoint->x - itemPoint.x;
+            widget.config.y += hitPoint->y - itemPoint.y;
+            widgetReady = surface.ApplyHostedWidgets(
+                {widget}, errorMessage);
+        }
+    }
+    const size_t widgetMessageBefore =
+        DesktopSurfaceWindowSmokeAccess::
+            DoubleClickMessageCountForSmoke(surface);
+    POINT widgetClientPoint = *hitPoint;
+    ScreenToClient(surface.Window(), &widgetClientPoint);
+    const WidgetView* widgetView = DesktopSurfaceWindowSmokeAccess::
+        HostedWidgetAt(surface, 0);
+    const WidgetViewHit widgetInitialHit = widgetView != nullptr
+        ? widgetView->HitTestHostPoint(widgetClientPoint)
+        : WidgetViewHit{};
+    const size_t widgetDownBefore = DesktopSurfaceWindowSmokeAccess::
+        LeftDownMessageCountForSmoke(surface);
+    const size_t widgetUpBefore = DesktopSurfaceWindowSmokeAccess::
+        LeftUpMessageCountForSmoke(surface);
+    const bool widgetInput = widgetReady &&
+        WindowFromPoint(*hitPoint) == surface.Window() &&
+        doubleClick(*hitPoint);
+    const bool widgetFirstHit = firstClickStillOnSurface;
+    const int widgetFirstDownGesture = firstDownHostedGesture;
+    const int widgetFirstUpGesture = firstUpHostedGesture;
+    const bool widgetFirstDownCaptured = firstDownCaptured;
+    const POINT widgetFirstDownStart = firstDownHostedStart;
+    const POINT widgetFirstDownCurrent = firstDownHostedCurrent;
+    const POINT widgetFirstDragActivation = firstDragActivation;
+    const std::wstring widgetFirstCandidateIdentity =
+        firstClickCandidateIdentity;
+    const std::wstring widgetFirstCandidateCategory =
+        firstClickCandidateCategory;
+    const size_t widgetDownCount = DesktopSurfaceWindowSmokeAccess::
+        LeftDownMessageCountForSmoke(surface) - widgetDownBefore;
+    const size_t widgetUpCount = DesktopSurfaceWindowSmokeAccess::
+        LeftUpMessageCountForSmoke(surface) - widgetUpBefore;
+    const size_t widgetMessageAfter =
+        DesktopSurfaceWindowSmokeAccess::
+            DoubleClickMessageCountForSmoke(surface);
+    const size_t openCount = static_cast<size_t>(std::count_if(
+        commands.begin(), commands.end(),
+        [](const HostedWidgetCommand& command) {
+            return command.type == HostedWidgetCommandType::OpenSelection;
+        }));
+    const bool widgetRoute =
+        widgetMessageAfter == widgetMessageBefore + 1 &&
+        openCount == 1 &&
+        std::any_of(
+            commands.begin(), commands.end(),
+            [](const HostedWidgetCommand& command) {
+                return command.type ==
+                        HostedWidgetCommandType::OpenSelection &&
+                    command.categoryId ==
+                        L"smoke-double-click-widget" &&
+                    command.itemIds ==
+                        std::vector<std::wstring>{
+                            L"smoke-double-click-item"};
+            });
+    size_t oracleDoubleClicks = 0;
+    WNDCLASSEXW oracleClass{};
+    oracleClass.cbSize = sizeof(oracleClass);
+    oracleClass.style = CS_DBLCLKS;
+    oracleClass.hInstance = instance;
+    oracleClass.lpszClassName = L"LatticeDoubleClickInputOracle";
+    oracleClass.lpfnWndProc = [](
+        HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) -> LRESULT {
+        if (message == WM_LBUTTONDBLCLK) {
+            auto* count = reinterpret_cast<size_t*>(
+                GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+            if (count != nullptr) {
+                ++*count;
+            }
+        }
+        return DefWindowProcW(hwnd, message, wParam, lParam);
+    };
+    RegisterClassExW(&oracleClass);
+    HWND oracle = CreateWindowExW(
+        WS_EX_TOOLWINDOW, oracleClass.lpszClassName,
+        L"Lattice double-click input oracle", WS_POPUP,
+        hitPoint->x - 16, hitPoint->y - 16, 64, 64,
+        nullptr, nullptr, instance, nullptr);
+    bool oracleInput = false;
+    if (oracle != nullptr) {
+        SetWindowLongPtrW(
+            oracle, GWLP_USERDATA,
+            reinterpret_cast<LONG_PTR>(&oracleDoubleClicks));
+        SetWindowPos(
+            oracle, HWND_TOPMOST, hitPoint->x - 16,
+            hitPoint->y - 16, 64, 64,
+            SWP_SHOWWINDOW | SWP_NOACTIVATE);
+        pumpFor(40);
+        oracleInput = WindowFromPoint(*hitPoint) == oracle &&
+            doubleClick(*hitPoint);
+        DestroyWindow(oracle);
+    }
+    const ULONG_PTR surfaceClassStyle = GetClassLongPtrW(
+        surface.Window(), GCL_STYLE);
+    sendMouse(savedCursor, 0);
+    surface.Close();
+    const DWORD required = GetEnvironmentVariableW(
+        L"DESKTOP_ORGANIZER_SMOKE_ITEMS_DIR", nullptr, 0);
+    if (required != 0) {
+        std::wstring root(required, L'\0');
+        const DWORD copied = GetEnvironmentVariableW(
+            L"DESKTOP_ORGANIZER_SMOKE_ITEMS_DIR",
+            root.data(), required);
+        if (copied != 0 && copied < required) {
+            root.resize(copied);
+            std::ofstream diagnostic(
+                std::filesystem::path(root) /
+                    L"desktop-double-click-result.txt",
+                std::ios::trunc);
+            diagnostic << "desktopInput=" << desktopInput
+                       << " desktopRoute=" << desktopRoute
+                       << " desktopFirstHit=" << desktopFirstHit
+                       << " desktopFirstCandidate="
+                       << desktopFirstCandidate
+                       << " desktopDown=" << desktopDownCount
+                       << " desktopUp=" << desktopUpCount
+                       << " desktopMessages="
+                       << desktopMessageAfter - messageBefore
+                       << " desktopOpenCount=" << desktopOpenCount
+                       << " widgetReady=" << widgetReady
+                       << " widgetInput=" << widgetInput
+                       << " widgetRoute=" << widgetRoute
+                       << " widgetInitialHit="
+                       << static_cast<int>(widgetInitialHit.kind)
+                       << " widgetInitialIndex="
+                       << widgetInitialHit.itemIndex
+                       << " widgetFirstHit=" << widgetFirstHit
+                       << " widgetFirstDownGesture="
+                       << widgetFirstDownGesture
+                       << " widgetFirstUpGesture="
+                       << widgetFirstUpGesture
+                       << " widgetFirstDownCaptured="
+                       << widgetFirstDownCaptured
+                       << " widgetStart=" << widgetFirstDownStart.x
+                       << ',' << widgetFirstDownStart.y
+                       << " widgetCurrent="
+                       << widgetFirstDownCurrent.x << ','
+                       << widgetFirstDownCurrent.y
+                       << " widgetDragActivation="
+                       << widgetFirstDragActivation.x << ','
+                       << widgetFirstDragActivation.y
+                       << " widgetFirstCandidate="
+                       << !widgetFirstCandidateIdentity.empty()
+                       << " widgetFirstCandidateCategory="
+                       << !widgetFirstCandidateCategory.empty()
+                       << " widgetDown=" << widgetDownCount
+                       << " widgetUp=" << widgetUpCount
+                       << " widgetMessages="
+                       << widgetMessageAfter - widgetMessageBefore
+                       << " widgetOpenCount=" << openCount
+                       << " oracleInput=" << oracleInput
+                       << " oracleDoubleClicks=" << oracleDoubleClicks
+                       << " classStyle="
+                       << surfaceClassStyle
+                       << '\n';
+        }
+    }
+    std::wcout << L"desktopInput=" << desktopInput
+               << L" desktopRoute=" << desktopRoute
+               << L" widgetReady=" << widgetReady
+               << L" widgetInput=" << widgetInput
+               << L" widgetRoute=" << widgetRoute
+               << L"\n";
+    return desktopInput && desktopRoute && widgetReady &&
+        widgetInput && widgetRoute ? 0 : 323;
 }
 
 HWND FindShellPocListView();
@@ -9143,6 +11256,47 @@ int RunSmokeDesktopCurrentConfigDrag(HINSTANCE instance) {
                     *surface) == nullptr;
         }
     }
+    bool doubleClickInputInjected = false;
+    bool doubleClickSurfaceStillHitAfterFirstClick = false;
+    bool doubleClickOpenedPaintedIdentityOnce = false;
+    size_t desktopDoubleClickMessageCount = 0;
+    if (focusPoint.has_value() && renameEditorClosedByRealEscape) {
+        DesktopSurfaceWindowSmokeAccess::SuppressDesktopOpenForSmoke(
+            *surface, true);
+        pumpFor(GetDoubleClickTime() + 80);
+        doubleClickInputInjected = sendMouse(*focusPoint, 0);
+        pumpFor(25);
+        doubleClickInputInjected =
+            sendMouse(*focusPoint, MOUSEEVENTF_LEFTDOWN) &&
+            doubleClickInputInjected;
+        pumpFor(25);
+        doubleClickInputInjected =
+            sendMouse(*focusPoint, MOUSEEVENTF_LEFTUP) &&
+            doubleClickInputInjected;
+        pumpFor(30);
+        doubleClickSurfaceStillHitAfterFirstClick =
+            WindowFromPoint(*focusPoint) == surface->Window();
+        doubleClickInputInjected =
+            sendMouse(*focusPoint, MOUSEEVENTF_LEFTDOWN) &&
+            doubleClickInputInjected;
+        pumpFor(25);
+        doubleClickInputInjected =
+            sendMouse(*focusPoint, MOUSEEVENTF_LEFTUP) &&
+            doubleClickInputInjected;
+        pumpFor(80);
+        doubleClickOpenedPaintedIdentityOnce =
+            DesktopSurfaceWindowSmokeAccess::
+                DesktopOpenRequestCountForSmoke(*surface) == 1 &&
+            CompareStringOrdinal(
+                DesktopSurfaceWindowSmokeAccess::
+                    DesktopOpenPathForSmoke(*surface).c_str(), -1,
+                focusIdentity.c_str(), -1, TRUE) == CSTR_EQUAL;
+        desktopDoubleClickMessageCount =
+            DesktopSurfaceWindowSmokeAccess::
+                DoubleClickMessageCountForSmoke(*surface);
+        DesktopSurfaceWindowSmokeAccess::SuppressDesktopOpenForSmoke(
+            *surface, false);
+    }
     const auto sameIdentitySet = [](std::vector<std::wstring> left,
                                     std::vector<std::wstring> right) {
         const auto normalize = [](std::vector<std::wstring>& identities) {
@@ -9378,6 +11532,104 @@ int RunSmokeDesktopCurrentConfigDrag(HINSTANCE instance) {
     const bool explorerStable = capturedAfter &&
         flagsAfter == flagsBefore &&
         sameExplorerPositions(explorerBefore, explorerAfter);
+    bool widgetDoubleClickInputInjected = false;
+    bool widgetDoubleClickOpenedPaintedIdentityOnce = false;
+    size_t widgetDoubleClickMessageCount = 0;
+    if (focusPoint.has_value() && explorerStable) {
+        HostedWidgetDescriptor doubleClickWidget;
+        doubleClickWidget.categoryId = L"smoke-double-click-widget";
+        doubleClickWidget.title = L"双击测试格子";
+        doubleClickWidget.visible = true;
+        doubleClickWidget.config.x = focusPoint->x;
+        doubleClickWidget.config.y = focusPoint->y;
+        doubleClickWidget.config.width = 280;
+        doubleClickWidget.config.height = 300;
+        doubleClickWidget.config.normalHeight = 300;
+        doubleClickWidget.config.dpi = 96;
+        doubleClickWidget.config.iconSize = 48;
+        DesktopItem doubleClickItem;
+        doubleClickItem.id = L"smoke-double-click-item";
+        doubleClickItem.path = L"C:\\unified-host-double-click\\item.txt";
+        doubleClickItem.displayName = L"双击测试项目";
+        doubleClickWidget.items.push_back(std::move(doubleClickItem));
+        std::vector<HostedWidgetCommand> doubleClickCommands;
+        surface->SetHostedWidgetCommandHandler(
+            [&](const HostedWidgetCommand& command) {
+                doubleClickCommands.push_back(command);
+                return true;
+            });
+        std::wstring widgetPublishError;
+        if (surface->ApplyHostedWidgets(
+                {doubleClickWidget}, widgetPublishError)) {
+            WidgetView* view =
+                DesktopSurfaceWindowSmokeAccess::HostedWidgetAt(
+                    *surface, 0);
+            if (view != nullptr) {
+                RECT itemCell = view->ItemHostCell(0);
+                POINT itemPoint{
+                    (itemCell.left + itemCell.right) / 2,
+                    itemCell.top + 12};
+                ClientToScreen(surface->Window(), &itemPoint);
+                doubleClickWidget.config.x +=
+                    focusPoint->x - itemPoint.x;
+                doubleClickWidget.config.y +=
+                    focusPoint->y - itemPoint.y;
+                widgetPublishError.clear();
+                if (surface->ApplyHostedWidgets(
+                        {doubleClickWidget}, widgetPublishError)) {
+                    pumpFor(GetDoubleClickTime() + 80);
+                    const size_t beforeWidgetDoubleClickCount =
+                        DesktopSurfaceWindowSmokeAccess::
+                            DoubleClickMessageCountForSmoke(*surface);
+                    widgetDoubleClickInputInjected =
+                        WindowFromPoint(*focusPoint) ==
+                            surface->Window() &&
+                        sendMouse(*focusPoint, 0);
+                    pumpFor(25);
+                    for (int click = 0; click < 2; ++click) {
+                        widgetDoubleClickInputInjected =
+                            sendMouse(
+                                *focusPoint,
+                                MOUSEEVENTF_LEFTDOWN) &&
+                            widgetDoubleClickInputInjected;
+                        pumpFor(25);
+                        widgetDoubleClickInputInjected =
+                            sendMouse(
+                                *focusPoint,
+                                MOUSEEVENTF_LEFTUP) &&
+                            widgetDoubleClickInputInjected;
+                        pumpFor(30);
+                    }
+                    const size_t openCount =
+                        static_cast<size_t>(std::count_if(
+                            doubleClickCommands.begin(),
+                            doubleClickCommands.end(),
+                            [](const HostedWidgetCommand& command) {
+                                return command.type ==
+                                    HostedWidgetCommandType::OpenSelection;
+                            }));
+                    widgetDoubleClickOpenedPaintedIdentityOnce =
+                        openCount == 1 &&
+                        std::any_of(
+                            doubleClickCommands.begin(),
+                            doubleClickCommands.end(),
+                            [](const HostedWidgetCommand& command) {
+                                return command.type ==
+                                        HostedWidgetCommandType::OpenSelection &&
+                                    command.categoryId ==
+                                        L"smoke-double-click-widget" &&
+                                    command.itemIds ==
+                                        std::vector<std::wstring>{
+                                            L"smoke-double-click-item"};
+                            });
+                    widgetDoubleClickMessageCount =
+                        DesktopSurfaceWindowSmokeAccess::
+                            DoubleClickMessageCountForSmoke(*surface) -
+                        beforeWidgetDoubleClickCount;
+                }
+            }
+        }
+    }
     const bool dragStarted =
         dragStartsAfter == dragStartsBefore + 1;
     const bool passed = widgetCount > 0 &&
@@ -9387,6 +11639,11 @@ int RunSmokeDesktopCurrentConfigDrag(HINSTANCE instance) {
         desktopF2RouteReady &&
         f2IdentityMatches && f2ForegroundRouteMatches &&
         renameEditorClosedByRealEscape &&
+        doubleClickInputInjected &&
+        doubleClickSurfaceStillHitAfterFirstClick &&
+        doubleClickOpenedPaintedIdentityOnce &&
+        widgetDoubleClickInputInjected &&
+        widgetDoubleClickOpenedPaintedIdentityOnce &&
         multiSelectionInputSucceeded &&
         latticeMultiSelectionMatches &&
         explorerMultiSelectionMatches &&
@@ -9420,6 +11677,20 @@ int RunSmokeDesktopCurrentConfigDrag(HINSTANCE instance) {
            << f2ForegroundRouteMatches << "\n"
            << "RENAME_EDITOR_CLOSED_BY_REAL_ESCAPE="
            << renameEditorClosedByRealEscape << "\n"
+           << "DOUBLE_CLICK_INPUT_INJECTED="
+           << doubleClickInputInjected << "\n"
+           << "DOUBLE_CLICK_SURFACE_STILL_HIT_AFTER_FIRST_CLICK="
+           << doubleClickSurfaceStillHitAfterFirstClick << "\n"
+           << "DOUBLE_CLICK_OPENED_PAINTED_IDENTITY_ONCE="
+           << doubleClickOpenedPaintedIdentityOnce << "\n"
+           << "DESKTOP_DOUBLE_CLICK_MESSAGE_COUNT="
+           << desktopDoubleClickMessageCount << "\n"
+           << "WIDGET_DOUBLE_CLICK_INPUT_INJECTED="
+           << widgetDoubleClickInputInjected << "\n"
+           << "WIDGET_DOUBLE_CLICK_OPENED_PAINTED_IDENTITY_ONCE="
+           << widgetDoubleClickOpenedPaintedIdentityOnce << "\n"
+           << "WIDGET_DOUBLE_CLICK_MESSAGE_COUNT="
+           << widgetDoubleClickMessageCount << "\n"
            << "MULTI_SELECTION_INPUT_SUCCEEDED="
            << multiSelectionInputSucceeded << "\n"
            << "LATTICE_MULTI_SELECTION_MATCH="
@@ -9648,9 +11919,28 @@ int RunSmokeWidgetInteraction(HINSTANCE instance) {
     HWND mainWindow = nullptr;
     HWND uncategorizedWindow = nullptr;
     HWND categoryWindow = nullptr;
+    bool oracleWidgetsAttached = false;
     const ULONGLONG windowDiscoveryDeadline = GetTickCount64() + 1000;
     do {
         mainWindow = FindCurrentProcessMainWindow();
+        if (mainWindow != nullptr && !oracleWidgetsAttached) {
+            auto* mainState = reinterpret_cast<MainWindow*>(
+                GetWindowLongPtrW(mainWindow, GWLP_USERDATA));
+            if (mainState != nullptr) {
+                WidgetWindow* uncategorizedOracle =
+                    MainWindowSmokeAccess::AttachWidgetFixture(
+                        *mainState, kUncategorizedCategoryId);
+                WidgetWindow* categoryOracle =
+                    MainWindowSmokeAccess::AttachWidgetFixture(
+                        *mainState, L"widget-category");
+                if (uncategorizedOracle != nullptr &&
+                    categoryOracle != nullptr) {
+                    uncategorizedOracle->Show(SW_SHOWNOACTIVATE);
+                    categoryOracle->Show(SW_SHOWNOACTIVATE);
+                    oracleWidgetsAttached = true;
+                }
+            }
+        }
         uncategorizedWindow = FindLatticeWidgetWindow(L"未分类");
         categoryWindow = FindLatticeWidgetWindow(L"交互测试");
         if (mainWindow != nullptr &&
@@ -10705,6 +12995,19 @@ int RunSmokeWidgetNormalExit(HINSTANCE instance) {
         return fail(L"Widget normal-exit app initialization failed", 85);
     }
     const HWND mainWindow = FindCurrentProcessMainWindow();
+    if (mainWindow != nullptr) {
+        auto* mainState = reinterpret_cast<MainWindow*>(
+            GetWindowLongPtrW(mainWindow, GWLP_USERDATA));
+        if (mainState != nullptr) {
+            // Legacy WidgetWindow is a Debug-only exit-lifecycle oracle.
+            WidgetWindow* oracle =
+                MainWindowSmokeAccess::AttachWidgetFixture(
+                    *mainState, kUncategorizedCategoryId);
+            if (oracle != nullptr) {
+                oracle->Show(SW_SHOWNOACTIVATE);
+            }
+        }
+    }
     const HWND widgetWindow = FindLatticeWidgetWindow(categoryName.c_str());
     auto* widget = reinterpret_cast<WidgetWindow*>(
         widgetWindow == nullptr
@@ -10955,7 +13258,9 @@ int RunSmokeWidgetDropLatency(HINSTANCE instance) {
         return fail(L"Widget drop latency owner window creation failed", 56);
     }
 
-    WidgetWindow widget(instance, ownerWindow, categoryId, 0);
+    WidgetWindow widget(
+        instance, ownerWindow, categoryId, 0,
+        BuildSmokeDesktopSnapshot(config));
     widgetForCleanup = &widget;
     if (!widget.Create()) {
         return fail(L"Widget drop latency widget creation failed", 57);
@@ -11522,7 +13827,9 @@ int RunSmokeWidgetDropPlacement(HINSTANCE instance) {
         return fail(L"Widget drop placement owner window creation failed", 85);
     }
 
-    WidgetWindow widget(instance, ownerWindow, categoryId, 0);
+    WidgetWindow widget(
+        instance, ownerWindow, categoryId, 0,
+        BuildSmokeDesktopSnapshot(config));
     widgetForCleanup = &widget;
     if (!widget.Create()) {
         return fail(L"Widget drop placement widget creation failed", 86);
@@ -11830,6 +14137,12 @@ int RunSmokeWidgetDropPlacement(HINSTANCE instance) {
     if (WidgetWindowSmokeAccess::CurrentItemIds(widget) != expectedIds) {
         return fail(L"Widget drop placement in-memory order mismatch", 93);
     }
+    widget.ApplySnapshot(BuildSmokeDesktopSnapshot(persisted, 2));
+    if (WidgetWindowSmokeAccess::CurrentItemIds(widget) != expectedIds) {
+        return fail(
+            L"Widget drop placement shared snapshot handoff changed committed order",
+            123);
+    }
 
     std::vector<std::wstring> destinationPaths;
     for (size_t index = 0; index < incomingIds.size(); ++index) {
@@ -11955,19 +14268,11 @@ int RunSmokeWidgetDropPlacement(HINSTANCE instance) {
     if (!configStore.SaveAppConfig(persisted)) {
         return fail(L"Widget drop placement collision setup save failed", 119);
     }
-    widget.RefreshFromConfig();
-    while (PeekMessageW(
-               &message,
-               widgetWindow,
-               kWidgetRefreshMessage,
-               kWidgetRefreshMessage,
-               PM_REMOVE)) {
-        DispatchMessageW(&message);
-    }
     DesktopItem collisionLiveItem =
         scanner.CreateItemFromPath(collisionOriginalPath.wstring(), false);
     collisionLiveItem.id = collisionLiveId;
-    WidgetWindowSmokeAccess::AddLoadedItem(widget, collisionLiveItem);
+    widget.ApplySnapshot(BuildSmokeDesktopSnapshot(
+        persisted, 3, {collisionLiveItem}));
     if (WidgetWindowSmokeAccess::LoadedItemIdForPath(
             widget,
             collisionOriginalPath.wstring()) != collisionLiveId) {
@@ -12245,7 +14550,9 @@ int RunSmokeUpdatePackages() {
         }
         return true;
     };
-    const auto oldStrictIdentityAccepted = [](const std::wstring& path) {
+    const auto oldStrictIdentityAccepted = [](
+        const std::wstring& path,
+        const std::wstring& expectedVersion) {
         DWORD handle = 0;
         const DWORD infoSize = GetFileVersionInfoSizeW(path.c_str(), &handle);
         if (infoSize == 0) return false;
@@ -12262,10 +14569,19 @@ int RunSmokeUpdatePackages() {
                 L"\\",
                 reinterpret_cast<void**>(&fixed),
                 &fixedSize) == FALSE ||
-            fixed == nullptr || fixedSize < sizeof(VS_FIXEDFILEINFO) ||
-            HIWORD(fixed->dwFileVersionMS) != 0 ||
-            LOWORD(fixed->dwFileVersionMS) != 4 ||
-            HIWORD(fixed->dwFileVersionLS) != 62) {
+            fixed == nullptr || fixedSize < sizeof(VS_FIXEDFILEINFO)) {
+            return false;
+        }
+        wchar_t actualVersion[64]{};
+        swprintf_s(
+            actualVersion,
+            L"%u.%u.%u.%u",
+            HIWORD(fixed->dwFileVersionMS),
+            LOWORD(fixed->dwFileVersionMS),
+            HIWORD(fixed->dwFileVersionLS),
+            LOWORD(fixed->dwFileVersionLS));
+        if (UpdateService::CompareVersions(
+                actualVersion, expectedVersion) != 0) {
             return false;
         }
         struct Translation {
@@ -12350,7 +14666,7 @@ int RunSmokeUpdatePackages() {
             return 3;
         }
         UpdateReleaseAsset asset;
-        asset.version = L"0.4.64";
+        asset.version = UpdateService::kCurrentVersion;
         asset.name = source.filename().wstring();
         asset.downloadUrl = L"https://example.invalid/" + asset.name;
         asset.size = std::filesystem::file_size(source, error);
@@ -12358,7 +14674,7 @@ int RunSmokeUpdatePackages() {
             std::wcerr << L"Update package digest fixture is invalid\n";
             return 4;
         }
-        if (!oldStrictIdentityAccepted(source.wstring()) ||
+        if (!oldStrictIdentityAccepted(source.wstring(), asset.version) ||
             UpdateService::ValidateDownloadedInstaller(source.wstring(), asset) !=
                 UpdateInstallerValidationFailure::None) {
             std::wcerr << L"Real update package identity validation failed\n";
@@ -12446,7 +14762,7 @@ int RunSmokeUpdatePackages() {
         if (!stream) return 14;
     }
     UpdateReleaseAsset nonPeAsset;
-    nonPeAsset.version = L"0.4.64";
+    nonPeAsset.version = UpdateService::kCurrentVersion;
     nonPeAsset.size = 3;
     if (!parseDigest(
             L"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
@@ -12473,6 +14789,18 @@ int RunSmokeUpdateAndDialog() {
     AttachParentConsole();
     std::wstring version;
     std::wstring url;
+    const std::string olderIncompleteRelease =
+        R"({"tag_name":"v0.4.57","assets":[{"name":"Lattice-Setup-0.4.57.exe"}]})";
+    if (!UpdateService::ParseReleaseVersion(
+            olderIncompleteRelease, version) ||
+        version != L"0.4.57" ||
+        UpdateService::CompareVersions(
+            version, UpdateService::kCurrentVersion) > 0 ||
+        UpdateService::ParseReleaseVersion(
+            R"({"tag_name":"not-a-version","assets":[]})", version)) {
+        std::wcerr << L"Older public release status parsing failed\n";
+        return 25;
+    }
     if (UpdateService::CompareVersions(L"0.4.29", L"0.4.28") <= 0 ||
         UpdateService::CompareVersions(L"0.4.28", L"0.4.28") != 0 ||
         UpdateService::CompareVersions(L"0.4.27", L"0.4.28") >= 0) {
@@ -12653,6 +14981,43 @@ int RunSmokeUpdateAndDialog() {
         oversized.bottom - oversized.top != 180) {
         std::wcerr << L"Message dialog work-area placement failed\n";
         return 3;
+    }
+
+    std::atomic<bool> progressVisible{false};
+    const DWORD dialogThread = GetCurrentThreadId();
+    std::thread closeProgress([&]() {
+        for (int attempt = 0; attempt < 200; ++attempt) {
+            HWND progress = FindWindowW(L"Lattice.MessageDialog", nullptr);
+            DWORD ownerProcess = 0;
+            if (progress != nullptr) {
+                GetWindowThreadProcessId(progress, &ownerProcess);
+            }
+            if (ownerProcess == GetCurrentProcessId() &&
+                IsWindowVisible(progress) != FALSE) {
+                progressVisible.store(true);
+                PostMessageW(progress, WM_CLOSE, 0, 0);
+                return;
+            }
+            Sleep(10);
+        }
+        PostThreadMessageW(dialogThread, WM_QUIT, 0, 0);
+    });
+    HWND activeProgress = nullptr;
+    MessageDialog::Show(
+        GetModuleHandleW(nullptr), nullptr, L"正在检查公开版本，请稍候。",
+        L"Lattice 更新可见性烟测", MB_OK | MB_ICONINFORMATION,
+        &activeProgress);
+    closeProgress.join();
+    if (!progressVisible.load()) {
+        std::wcerr << L"Manual update progress dialog was not visible or released: visible="
+                   << progressVisible.load() << L", active="
+                   << reinterpret_cast<std::uintptr_t>(activeProgress)
+                   << L", lastError=" << GetLastError() << L"\n";
+        return 26;
+    }
+    if (activeProgress != nullptr) {
+        std::wcerr << L"Manual update progress handle was not cleared\n";
+        return 27;
     }
 
     DesktopScanner scanner;
@@ -14024,6 +16389,43 @@ int RunSmokeResourceIdle(HINSTANCE instance) {
 
 int RunSmokeCollapseSelectionLogic(HINSTANCE instance) {
     AttachParentConsole();
+    DesktopSurfaceWindow newItemSurface(instance);
+    if (!DesktopSurfaceWindowSmokeAccess::NewlyObservedUsesVisibleFirstFree(
+            newItemSurface)) {
+        std::wcerr << L"New shortcut did not take the visible leftmost free cell\n";
+        return 174;
+    }
+    const std::vector<DesktopPosition> nativeDesktopPositions{
+        {L"shell:::ThisPC", POINT{168, 0}},
+        {L"C:\\Desktop\\DeepSeek Harness.lnk", POINT{16, 0}},
+        {L"C:\\Desktop\\Lattice.lnk", POINT{92, 0}},
+        {L"shell:::RecycleBin", POINT{16, 84}},
+    };
+    const std::vector<DesktopPosition> latticeDisplayPositions{
+        {L"shell:::ThisPC", POINT{16, 0}},
+    };
+    const auto resolvedDesktopPositions =
+        DesktopSurfaceWindowSmokeAccess::ResolveVisiblePositionCollisions(
+            nativeDesktopPositions, latticeDisplayPositions,
+            RECT{0, 0, 320, 336}, 76, 84);
+    if (resolvedDesktopPositions.size() != nativeDesktopPositions.size() ||
+        resolvedDesktopPositions[0].point.x != 16 ||
+        resolvedDesktopPositions[0].point.y != 0 ||
+        resolvedDesktopPositions[1].point.x != 16 ||
+        resolvedDesktopPositions[1].point.y != 168 ||
+        resolvedDesktopPositions[2].point.x != 92 ||
+        resolvedDesktopPositions[2].point.y != 0 ||
+        nativeDesktopPositions[0].point.x != 168 ||
+        nativeDesktopPositions[1].point.x != 16) {
+        std::wcerr << L"New desktop item overlapped an independent Lattice display position\n";
+        return 173;
+    }
+    DesktopSurfaceWindow collisionSurface(instance);
+    if (!DesktopSurfaceWindowSmokeAccess::RebuildPreservesIndependentNativePositions(
+            collisionSurface, nativeDesktopPositions)) {
+        std::wcerr << L"Desktop snapshot rebuild lost native/display separation\n";
+        return 174;
+    }
     const HRESULT wallpaperComResult = CoInitializeEx(
         nullptr, COINIT_APARTMENTTHREADED);
     if (FAILED(wallpaperComResult) &&
@@ -14269,6 +16671,19 @@ int RunSmokeCollapseSelectionLogic(HINSTANCE instance) {
             << L"Desktop cell gap was still treated as an item\n";
         return 195;
     }
+    std::vector<DesktopViewItem> overlapping = items;
+    overlapping[1].screenPoint = POINT{10, 10};
+    DesktopSurfaceWindowSmokeAccess::ConfigureSelectionFixture(
+        surface, overlapping, {});
+    if (DesktopSurfaceWindowSmokeAccess::HitTestDesktopPoint(
+            surface, POINT{20, 20}) != 1 ||
+        DesktopSurfaceWindowSmokeAccess::HitTestDesktopPoint(
+            surface, firstCellGap) != -1) {
+        std::wcerr << L"Painted desktop item must win overlap without making gaps clickable\n";
+        return 195;
+    }
+    DesktopSurfaceWindowSmokeAccess::ConfigureSelectionFixture(
+        surface, items, {});
     DesktopSurfaceWindowSmokeAccess::BeginPointerGesture(
         surface, POINT{0, 100}, false);
     const POINT belowThreshold{
@@ -15508,10 +17923,14 @@ int RunSmokeAutoOrganizePreview(HINSTANCE instance) {
     AutoOrganizePreviewInput currentInput = input;
     bool applyInvoked = false;
     bool undoInvoked = false;
+    unsigned int inputProviderCalls = 0;
     AutoOrganizePreviewWindow window(
         instance,
         nullptr,
-        [&currentInput]() { return currentInput; },
+        [&currentInput, &inputProviderCalls]() {
+            ++inputProviderCalls;
+            return currentInput;
+        },
         [&](const lattice::organize::Plan&,
             const lattice::organize::LayoutPlan&,
             HWND) { applyInvoked = true; },
@@ -15742,10 +18161,1702 @@ int RunSmokeAutoOrganizePreview(HINSTANCE instance) {
         window.Close();
         return 250;
     }
+    const auto settleVisibleResources = [&window]() {
+        AutoOrganizePreviewWindowSmokeAccess::RenderNow(window);
+        const ULONGLONG deadline = GetTickCount64() + 5000;
+        while (AutoOrganizePreviewWindowSmokeAccess::PendingIconRequests(window) != 0 &&
+               GetTickCount64() < deadline) {
+            MSG message{};
+            while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+                TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
+            Sleep(5);
+        }
+        AutoOrganizePreviewWindowSmokeAccess::RenderNow(window);
+        return AutoOrganizePreviewWindowSmokeAccess::PendingIconRequests(window) == 0;
+    };
+    if (!settleVisibleResources()) {
+        std::wcerr << L"Auto-organize preview icon requests did not settle before baseline\n";
+        window.Close();
+        return 296;
+    }
+    const unsigned int callsBeforeClose = inputProviderCalls;
+    DWORD previewHandlesBefore = 0;
+    DWORD previewGdiBefore = 0;
+    DWORD previewUserBefore = 0;
+    // Compare 20 cycles after the same preview path has warmed the shared
+    // Shell image-list workers; keep the original strict resource thresholds.
+    constexpr unsigned int kWarmupCycles = 20;
+    constexpr unsigned int kMeasuredCycles = 20;
+    for (unsigned int cycle = 0;
+         cycle < kWarmupCycles + kMeasuredCycles; ++cycle) {
+        SendMessageW(window.Window(), WM_CLOSE, 0, 0);
+        DWORD closedHandles = 0;
+        GetProcessHandleCount(GetCurrentProcess(), &closedHandles);
+        if (IsWindowVisible(window.Window()) != FALSE ||
+            !AutoOrganizePreviewWindowSmokeAccess::InvisibleResourcesReleased(window)) {
+            std::wcerr << L"Hidden auto-organize preview retained disposable resources\n";
+            window.Close();
+            return 265;
+        }
+        window.ShowOrActivate();
+        const ULONGLONG reopenDeadline = GetTickCount64() + 3000;
+        while (AutoOrganizePreviewWindowSmokeAccess::Scanning(window) &&
+               GetTickCount64() < reopenDeadline) {
+            MSG message{};
+            while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+                TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
+            Sleep(5);
+        }
+        if (inputProviderCalls != callsBeforeClose + cycle + 1 ||
+            IsWindowVisible(window.Window()) == FALSE ||
+            !AutoOrganizePreviewWindowSmokeAccess::Ready(window) ||
+            AutoOrganizePreviewWindowSmokeAccess::DecisionCount(window) !=
+                currentInput.snapshot.items.size() ||
+            AutoOrganizePreviewWindowSmokeAccess::PlacementCount(window) != 1) {
+            std::wcerr << L"Auto-organize preview did not rebuild from the current provider\n";
+            window.Close();
+            return 266;
+        }
+        DWORD reopenedHandles = 0;
+        GetProcessHandleCount(GetCurrentProcess(), &reopenedHandles);
+        std::wcout << L"PREVIEW_RESOURCE_CYCLE=" << cycle + 1
+                   << L" closed=" << closedHandles
+                   << L" reopened=" << reopenedHandles
+                   << L" gdi=" << GetGuiResources(
+                       GetCurrentProcess(), GR_GDIOBJECTS)
+                   << L" user=" << GetGuiResources(
+                       GetCurrentProcess(), GR_USEROBJECTS)
+                   << L" iconPending=" <<
+                       AutoOrganizePreviewWindowSmokeAccess::PendingIconRequests(window)
+                   << L"\n";
+        if (cycle + 1 == kWarmupCycles) {
+            if (!settleVisibleResources()) {
+                std::wcerr << L"Auto-organize preview icon requests did not settle after warmup\n";
+                window.Close();
+                return 296;
+            }
+            GetProcessHandleCount(GetCurrentProcess(), &previewHandlesBefore);
+            previewGdiBefore = GetGuiResources(
+                GetCurrentProcess(), GR_GDIOBJECTS);
+            previewUserBefore = GetGuiResources(
+                GetCurrentProcess(), GR_USEROBJECTS);
+        }
+    }
+    if (!settleVisibleResources()) {
+        std::wcerr << L"Auto-organize preview icon requests did not settle after lifecycle\n";
+        window.Close();
+        return 296;
+    }
+    DWORD previewHandlesAfter = 0;
+    GetProcessHandleCount(GetCurrentProcess(), &previewHandlesAfter);
+    const DWORD previewGdiAfter = GetGuiResources(
+        GetCurrentProcess(), GR_GDIOBJECTS);
+    const DWORD previewUserAfter = GetGuiResources(
+        GetCurrentProcess(), GR_USEROBJECTS);
+    std::wcout << L"PREVIEW_LIFECYCLE_20 handles="
+               << previewHandlesBefore << L"->" << previewHandlesAfter
+               << L" gdi=" << previewGdiBefore << L"->" << previewGdiAfter
+               << L" user=" << previewUserBefore << L"->" << previewUserAfter
+               << L"\n";
+    if (previewHandlesAfter > previewHandlesBefore + 8 ||
+        previewGdiAfter > previewGdiBefore + 2 ||
+        previewUserAfter > previewUserBefore + 2) {
+        std::wcerr << L"Repeated preview lifecycle leaked bounded process resources\n";
+        window.Close();
+        return 267;
+    }
     std::wcout << L"AUTO_ORGANIZE_PREVIEW_CAPTURE=" << capturePath.wstring() << L"\n";
     std::wcout << L"AUTO_ORGANIZE_PREVIEW_HOVER_CAPTURE="
                << hoverCapturePath.wstring() << L"\n";
     window.Close();
+    return 0;
+}
+
+int RunSmokeUnifiedHostWidgetSlice(HINSTANCE instance) {
+    AttachParentConsole();
+
+    WindowConfig config;
+    config.width = 390;
+    config.height = 360;
+    config.normalHeight = 360;
+    config.iconSize = 48;
+    config.density = 1;
+    config.dpi = 144;
+
+    std::vector<DesktopItem> items;
+    for (int index = 0; index < 4; ++index) {
+        DesktopItem item;
+        item.id = L"host-item-" + std::to_wstring(index);
+        item.path = L"C:\\host-item-" + std::to_wstring(index) + L".txt";
+        item.displayName = L"宿主项目" + std::to_wstring(index);
+        items.push_back(std::move(item));
+    }
+
+    WidgetView view;
+    const RECT hostBounds{100, 200, 685, 740};
+    view.Configure(
+        L"host-category", L"统一宿主", config, 0,
+        hostBounds, items);
+
+    const POINT local = view.HostPixelsToLocalDips(POINT{115, 215});
+    if (local.x != 10 || local.y != 10 ||
+        view.LocalDipsToHostPixels(RECT{0, 0, 390, 360}).right !=
+            hostBounds.right ||
+        view.HitTestHostPoint(POINT{118, 224}).kind !=
+            WidgetViewHitKind::HeaderButton ||
+        view.HitTestHostPoint(POINT{118, 224}).headerButton != 1) {
+        std::wcerr << L"Hosted widget DPI/header geometry regressed\n";
+        return 270;
+    }
+
+    const RECT firstCell = view.ItemHostCell(0);
+    if (IsRectEmpty(&firstCell) ||
+        firstCell.left < hostBounds.left ||
+        firstCell.top <= hostBounds.top) {
+        std::wcerr << L"Hosted widget first cell geometry missing\n";
+        return 271;
+    }
+    const POINT firstIconPoint{
+        (firstCell.left + firstCell.right) / 2,
+        firstCell.top + 12};
+    const WidgetViewHit firstHit = view.HitTestHostPoint(firstIconPoint);
+    if (firstHit.kind != WidgetViewHitKind::ItemIcon ||
+        firstHit.itemIndex != 0) {
+        std::wcerr << L"Hosted widget painted icon hit-test regressed\n";
+        return 272;
+    }
+
+    view.SelectItem(0, false);
+    view.SelectItem(1, true);
+    WidgetViewAction action = view.HandleKey(VK_DELETE, false, false);
+    if (action.type != WidgetViewActionType::DeleteSelection ||
+        action.itemIds != std::vector<std::wstring>{
+            L"host-item-0", L"host-item-1"}) {
+        std::wcerr << L"Hosted widget ordered multi-selection was lost\n";
+        return 273;
+    }
+    action = view.HandleKey(L'A', true, false);
+    if (action.type != WidgetViewActionType::None ||
+        view.SelectedItemIds().size() != 4) {
+        std::wcerr << L"Hosted widget Ctrl+A selection regressed\n";
+        return 274;
+    }
+    action = view.HandleKey(VK_F2, false, false);
+    if (action.type != WidgetViewActionType::RenameSelection ||
+        action.itemIds.size() != 1 ||
+        action.itemIds.front() != L"host-item-0") {
+        std::wcerr << L"Hosted widget F2 identity routing regressed\n";
+        return 275;
+    }
+
+    action = view.BuildDropAction(
+        firstIconPoint,
+        {L"host-item-2", L"host-item-3"});
+    if (action.type != WidgetViewActionType::ShellDropTarget ||
+        action.targetItemId != L"host-item-0" ||
+        action.itemIds != std::vector<std::wstring>{
+            L"host-item-2", L"host-item-3"}) {
+        std::wcerr << L"Hosted widget icon DropTarget identity regressed\n";
+        return 276;
+    }
+
+    const POINT gapPoint{firstCell.right - 2, firstCell.bottom - 2};
+    action = view.BuildDropAction(
+        gapPoint,
+        {L"host-item-0", L"host-item-1"});
+    if (action.type != WidgetViewActionType::ReorderSelection ||
+        action.insertionIndex < 0) {
+        std::wcerr << L"Hosted widget gap release did not route to reorder\n";
+        return 277;
+    }
+    const std::vector<std::wstring> reordered =
+        view.ReorderedItemIds(
+            {L"host-item-0", L"host-item-1"}, 4);
+    if (reordered != std::vector<std::wstring>{
+            L"host-item-2", L"host-item-3",
+            L"host-item-0", L"host-item-1"}) {
+        std::wcerr << L"Hosted widget stable group reorder regressed\n";
+        return 278;
+    }
+
+    view.SetCollapsed(true);
+    const RECT collapsedGrid = view.LocalGridBounds();
+    if (view.HitTestHostPoint(firstIconPoint).kind !=
+            WidgetViewHitKind::Empty ||
+        !IsRectEmpty(&collapsedGrid)) {
+        std::wcerr << L"Collapsed hosted widget retained content hit state\n";
+        return 279;
+    }
+    view.SetCollapsed(false);
+    view.SetLocked(true);
+    if (view.HitTestHostPoint(firstIconPoint).kind !=
+            WidgetViewHitKind::ItemIcon ||
+        view.OwnsWindow() || view.OwnsRenderTarget() ||
+        view.OwnsWallpaper() || view.OwnsIconCache()) {
+        std::wcerr << L"Hosted widget owns forbidden per-widget resources\n";
+        return 280;
+    }
+
+    std::wcout << L"UNIFIED_HOST_WIDGET_VIEW_LOGIC=PASS\n";
+
+    const DWORD required = GetEnvironmentVariableW(
+        L"DESKTOP_ORGANIZER_SMOKE_ITEMS_DIR", nullptr, 0);
+    if (required == 0) {
+        std::wcerr << L"Explicit unified-host smoke directory is required\n";
+        return 281;
+    }
+    std::wstring baseValue(required, L'\0');
+    const DWORD copied = GetEnvironmentVariableW(
+        L"DESKTOP_ORGANIZER_SMOKE_ITEMS_DIR",
+        baseValue.data(), required);
+    if (copied == 0 || copied >= required) {
+        std::wcerr << L"Unified-host smoke directory is invalid\n";
+        return 281;
+    }
+    baseValue.resize(copied);
+    const std::filesystem::path testRoot =
+        std::filesystem::absolute(baseValue).lexically_normal() /
+        (L"unified-host-widget-slice-" +
+         std::to_wstring(GetCurrentProcessId()));
+    const std::filesystem::path configRoot = testRoot / L"Config";
+    const std::filesystem::path dataRoot = testRoot / L"Data";
+    const std::filesystem::path desktopRoot = testRoot / L"Desktop";
+    std::error_code fileError;
+    std::filesystem::create_directories(configRoot, fileError);
+    std::filesystem::create_directories(dataRoot, fileError);
+    std::filesystem::create_directories(desktopRoot, fileError);
+    if (fileError) {
+        std::wcerr << L"Unified-host smoke fixture directories failed\n";
+        return 281;
+    }
+    const std::filesystem::path firstPath = desktopRoot / L"宿主甲.txt";
+    const std::filesystem::path secondPath = desktopRoot / L"宿主乙.txt";
+    {
+        std::ofstream output(firstPath, std::ios::binary | std::ios::trunc);
+        output << "first";
+    }
+    {
+        std::ofstream output(secondPath, std::ios::binary | std::ios::trunc);
+        output << "second";
+    }
+    if (!std::filesystem::exists(firstPath) ||
+        !std::filesystem::exists(secondPath)) {
+        std::filesystem::remove_all(testRoot, fileError);
+        std::wcerr << L"Unified-host smoke fixture items failed\n";
+        return 281;
+    }
+    SetEnvironmentVariableW(
+        L"DESKTOP_ORGANIZER_CONFIG_DIR", configRoot.c_str());
+    SetEnvironmentVariableW(
+        L"DESKTOP_ORGANIZER_DATA_DIR", dataRoot.c_str());
+    SetEnvironmentVariableW(
+        L"DESKTOP_ORGANIZER_DESKTOP_DIR", desktopRoot.c_str());
+
+    HWND ownerWindow = nullptr;
+    HWND hostWindow = nullptr;
+    std::unique_ptr<WidgetWindow> oracle;
+    std::unique_ptr<DesktopSurfaceWindow> surface;
+    const auto cleanup = [&]() {
+        if (surface != nullptr) {
+            DesktopSurfaceWindowSmokeAccess::ReleaseHostedWidgetSlice(
+                *surface);
+            surface.reset();
+        }
+        if (hostWindow != nullptr && IsWindow(hostWindow) != FALSE) {
+            DestroyWindow(hostWindow);
+        }
+        hostWindow = nullptr;
+        if (oracle != nullptr) {
+            oracle->Close();
+            oracle.reset();
+        }
+        if (ownerWindow != nullptr && IsWindow(ownerWindow) != FALSE) {
+            DestroyWindow(ownerWindow);
+        }
+        ownerWindow = nullptr;
+        std::error_code cleanupError;
+        std::filesystem::remove_all(testRoot, cleanupError);
+    };
+    const auto fail = [&](const wchar_t* message, int code) {
+        std::wcerr << message << L"\n";
+        cleanup();
+        return code;
+    };
+
+    HMONITOR monitor = MonitorFromPoint(
+        POINT{0, 0}, MONITOR_DEFAULTTONEAREST);
+    MONITORINFOEXW monitorInfo{};
+    monitorInfo.cbSize = sizeof(monitorInfo);
+    if (monitor == nullptr ||
+        GetMonitorInfoW(monitor, &monitorInfo) == FALSE) {
+        return fail(L"Unified-host monitor lookup failed", 282);
+    }
+
+    AppConfig appConfig;
+    appConfig.settings.theme = 0;
+    appConfig.settings.iconCacheSize = 64;
+    appConfig.settings.showPublicDesktopItems = false;
+    ItemConfig firstItem{
+        L"host-render-first", firstPath.wstring(), L"宿主甲"};
+    firstItem.originalDesktopPath = firstPath.wstring();
+    ItemConfig secondItem{
+        L"host-render-second", secondPath.wstring(), L"宿主乙"};
+    secondItem.originalDesktopPath = secondPath.wstring();
+    appConfig.items = {firstItem, secondItem};
+    CategoryConfig category;
+    category.id = L"host-render-category";
+    category.name = L"统一宿主像素基线";
+    category.storageFolder = category.name;
+    category.itemIds = {firstItem.id, secondItem.id};
+    category.layout.x = monitorInfo.rcWork.left + 48;
+    category.layout.y = monitorInfo.rcWork.top + 48;
+    category.layout.width = 390;
+    category.layout.height = 360;
+    category.layout.normalHeight = 360;
+    category.layout.iconSize = 48;
+    category.layout.density = 1;
+    category.layout.contentViewMode = 0;
+    category.layout.sortMode = 0;
+    category.layout.autoArrange = false;
+    category.layout.collapsed = false;
+    category.layout.locked = false;
+    category.layout.monitorId = monitorInfo.szDevice;
+    appConfig.categories.push_back(category);
+    ConfigStore configStore;
+    if (!configStore.SaveAppConfig(appConfig)) {
+        return fail(L"Unified-host fixture config save failed", 294);
+    }
+    const auto snapshot = BuildSmokeDesktopSnapshot(appConfig);
+    const std::vector<DesktopItem> renderItems =
+        snapshot->CopyItemsForCategory(category.id);
+    if (renderItems.size() != 2) {
+        return fail(L"Unified-host fixture snapshot membership failed", 295);
+    }
+
+    constexpr wchar_t kOwnerClassName[] =
+        L"Lattice.SmokeUnifiedHostOwner";
+    WNDCLASSEXW ownerClass{};
+    ownerClass.cbSize = sizeof(ownerClass);
+    ownerClass.lpfnWndProc = SmokeDesktopPlacementOwnerProc;
+    ownerClass.hInstance = instance;
+    ownerClass.lpszClassName = kOwnerClassName;
+    if (RegisterClassExW(&ownerClass) == 0 &&
+        GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+        return fail(L"Unified-host owner class registration failed", 283);
+    }
+    SmokeDesktopPlacementOwnerState ownerState;
+    ownerWindow = CreateWindowExW(
+        0, kOwnerClassName, L"", 0,
+        0, 0, 0, 0, HWND_MESSAGE, nullptr, instance, &ownerState);
+    if (ownerWindow == nullptr) {
+        return fail(L"Unified-host owner window creation failed", 283);
+    }
+    constexpr wchar_t kSurfaceClassName[] =
+        L"Lattice.SmokeUnifiedHostSurface";
+    WNDCLASSEXW surfaceClass{};
+    surfaceClass.cbSize = sizeof(surfaceClass);
+    surfaceClass.lpfnWndProc = SmokeUnifiedHostSurfaceProc;
+    surfaceClass.hInstance = instance;
+    surfaceClass.lpszClassName = kSurfaceClassName;
+    if (RegisterClassExW(&surfaceClass) == 0 &&
+        GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+        return fail(L"Unified-host surface class registration failed", 283);
+    }
+
+    oracle = std::make_unique<WidgetWindow>(
+        instance, ownerWindow, category.id, 0, snapshot);
+    if (!oracle->Create()) {
+        return fail(L"Legacy widget pixel oracle creation failed", 284);
+    }
+    HWND oracleWindow = WidgetWindowSmokeAccess::Window(*oracle);
+    RECT oracleClient{};
+    if (oracleWindow == nullptr ||
+        GetClientRect(oracleWindow, &oracleClient) == FALSE ||
+        oracleClient.right <= 0 || oracleClient.bottom <= 0) {
+        return fail(L"Legacy widget pixel oracle bounds failed", 284);
+    }
+    const UINT oracleDpi = (std::max)(96U, GetDpiForWindow(oracleWindow));
+    WindowConfig hostedConfig = category.layout;
+    hostedConfig.dpi = static_cast<int>(oracleDpi);
+    hostedConfig.width = MulDiv(oracleClient.right, 96, oracleDpi);
+    hostedConfig.height = MulDiv(oracleClient.bottom, 96, oracleDpi);
+    hostedConfig.normalHeight = hostedConfig.height;
+
+    hostWindow = CreateWindowExW(
+        WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+        kSurfaceClassName,
+        L"",
+        WS_POPUP,
+        monitorInfo.rcWork.left + 480,
+        monitorInfo.rcWork.top + 48,
+        oracleClient.right,
+        oracleClient.bottom,
+        nullptr,
+        nullptr,
+        instance,
+        nullptr);
+    if (hostWindow == nullptr) {
+        return fail(L"Unified DesktopHost fixture creation failed", 285);
+    }
+    surface = std::make_unique<DesktopSurfaceWindow>(instance);
+    constexpr COLORREF kFixtureWallpaper = RGB(14, 35, 44);
+    if (!DesktopSurfaceWindowSmokeAccess::ConfigureHostedWidgetSlice(
+            *surface,
+            hostWindow,
+            hostedConfig,
+            appConfig.settings.theme,
+            category.id,
+            category.name,
+            renderItems,
+            kFixtureWallpaper) ||
+        !WidgetWindowSmokeAccess::SetSolidWallpaper(
+            *oracle, kFixtureWallpaper)) {
+        return fail(L"Unified-host shared render fixture setup failed", 285);
+    }
+    SetLastError(ERROR_SUCCESS);
+    const HWND previousOracleParent = SetParent(oracleWindow, nullptr);
+    if (previousOracleParent == nullptr &&
+        GetLastError() != ERROR_SUCCESS) {
+        return fail(L"Legacy widget oracle could not detach for pixel capture", 286);
+    }
+    WidgetView* hosted =
+        DesktopSurfaceWindowSmokeAccess::HostedWidgetSlice(*surface);
+    if (hosted == nullptr ||
+        hosted->OwnsWindow() || hosted->OwnsRenderTarget() ||
+        hosted->OwnsWallpaper() || hosted->OwnsIconCache() ||
+        WidgetWindowSmokeAccess::RenderTarget(*oracle) == nullptr ||
+        DesktopSurfaceWindowSmokeAccess::RenderTarget(*surface) == nullptr ||
+        WidgetWindowSmokeAccess::RenderTarget(*oracle) ==
+            DesktopSurfaceWindowSmokeAccess::RenderTarget(*surface) ||
+        CountLatticeWidgetWindows() != 1) {
+        return fail(L"Unified-host resource ownership contract failed", 286);
+    }
+
+    for (const DesktopItem& item : renderItems) {
+        WidgetWindowSmokeAccess::PreloadIcon(*oracle, item.path);
+        DesktopSurfaceWindowSmokeAccess::PreloadHostedIcon(*surface, item);
+    }
+    const ULONGLONG iconDeadline = GetTickCount64() + 5000;
+    bool iconsReady = false;
+    do {
+        iconsReady = true;
+        for (const DesktopItem& item : renderItems) {
+            iconsReady = iconsReady &&
+                WidgetWindowSmokeAccess::IsIconReady(*oracle, item.path) &&
+                DesktopSurfaceWindowSmokeAccess::IsHostedIconReady(
+                    *surface, item);
+        }
+        MSG message{};
+        while (PeekMessageW(
+                   &message, nullptr, 0, 0, PM_REMOVE) != FALSE) {
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+        if (!iconsReady) {
+            Sleep(5);
+        }
+    } while (!iconsReady && GetTickCount64() < iconDeadline);
+    if (!iconsReady) {
+        return fail(L"Unified-host shared icon fixture did not become ready", 287);
+    }
+
+    wchar_t resourceModeValue[16]{};
+    const DWORD resourceModeLength = GetEnvironmentVariableW(
+        L"LATTICE_SMOKE_UNIFIED_HOST_RESOURCE_MODE",
+        resourceModeValue,
+        ARRAYSIZE(resourceModeValue));
+    const std::wstring resourceMode =
+        resourceModeLength > 0 &&
+            resourceModeLength < ARRAYSIZE(resourceModeValue)
+        ? std::wstring(resourceModeValue, resourceModeLength)
+        : std::wstring{};
+    if (resourceMode == L"oracle") {
+        DesktopSurfaceWindowSmokeAccess::ReleaseHostedWidgetSlice(*surface);
+        surface.reset();
+        DestroyWindow(hostWindow);
+        hostWindow = nullptr;
+        SetWindowPos(
+            oracleWindow,
+            HWND_TOPMOST,
+            monitorInfo.rcWork.left + 12,
+            monitorInfo.rcWork.top + 12,
+            oracleClient.right,
+            oracleClient.bottom,
+            SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        WidgetWindowSmokeAccess::RenderNow(*oracle);
+        std::wcout << L"UNIFIED_HOST_RESOURCE_MODE_READY=oracle\n";
+        Sleep(8000);
+        cleanup();
+        return 0;
+    }
+    if (resourceMode == L"host") {
+        oracle->Close();
+        oracle.reset();
+        SetWindowPos(
+            hostWindow,
+            HWND_TOPMOST,
+            monitorInfo.rcWork.left + 12,
+            monitorInfo.rcWork.top + 12,
+            oracleClient.right,
+            oracleClient.bottom,
+            SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        DesktopSurfaceWindowSmokeAccess::RenderHostedWidgetSlice(*surface);
+        std::wcout << L"UNIFIED_HOST_RESOURCE_MODE_READY=host\n";
+        Sleep(8000);
+        cleanup();
+        return 0;
+    }
+
+    WidgetWindowSmokeAccess::SelectOnly(*oracle, 0);
+    hosted->SelectItem(0, false);
+    const int captureX = monitorInfo.rcWork.left + 12;
+    const int captureY = monitorInfo.rcWork.top + 12;
+    const auto compareFrame = [&](const wchar_t* label) {
+        ShowWindow(hostWindow, SW_HIDE);
+        if (SetWindowPos(
+                oracleWindow,
+                HWND_TOPMOST,
+                captureX,
+                captureY,
+                oracleClient.right,
+                oracleClient.bottom,
+                SWP_NOACTIVATE | SWP_SHOWWINDOW) == FALSE ||
+            !WidgetWindowSmokeAccess::SetSolidWallpaper(
+                *oracle, kFixtureWallpaper) ||
+            !WidgetWindowSmokeAccess::RenderNow(*oracle)) {
+            std::wcerr << L"Unified-host render failed at " << label << L"\n";
+            return false;
+        }
+        DwmFlush();
+        std::vector<std::uint32_t> oraclePixels;
+        std::vector<std::uint32_t> hostedPixels;
+        SIZE oracleSize{};
+        SIZE hostedSize{};
+        if (!CaptureWindowClientPixels(
+                oracleWindow, oraclePixels, oracleSize)) {
+            std::wcerr << L"Unified-host oracle capture failed at "
+                       << label << L"\n";
+            return false;
+        }
+        ShowWindow(oracleWindow, SW_HIDE);
+        if (SetWindowPos(
+                hostWindow,
+                HWND_TOPMOST,
+                captureX,
+                captureY,
+                oracleClient.right,
+                oracleClient.bottom,
+                SWP_NOACTIVATE | SWP_SHOWWINDOW) == FALSE ||
+            !DesktopSurfaceWindowSmokeAccess::RenderHostedWidgetSlice(
+                *surface)) {
+            std::wcerr << L"Unified-host render failed at " << label << L"\n";
+            return false;
+        }
+        DwmFlush();
+        if (!CaptureWindowClientPixels(
+                hostWindow, hostedPixels, hostedSize) ||
+            oracleSize.cx != hostedSize.cx ||
+            oracleSize.cy != hostedSize.cy ||
+            oraclePixels.size() != hostedPixels.size()) {
+            std::wcerr << L"Unified-host surface capture failed at "
+                       << label << L" oraclePixels=" << oraclePixels.size()
+                       << L" hostedPixels=" << hostedPixels.size() << L"\n";
+            return false;
+        }
+        const size_t differences = static_cast<size_t>(std::count_if(
+            oraclePixels.begin(), oraclePixels.end(),
+            [&, index = size_t{0}](std::uint32_t pixel) mutable {
+                return (pixel & 0x00FFFFFFu) !=
+                    (hostedPixels[index++] & 0x00FFFFFFu);
+            }));
+        std::wcout << L"UNIFIED_HOST_PIXEL_FRAME=" << label
+                   << L" differences=" << differences
+                   << L" pixels=" << oraclePixels.size()
+                   << L" oracleFirst=0x" << std::hex << oraclePixels.front()
+                   << L" hostedFirst=0x" << hostedPixels.front()
+                   << std::dec << L"\n";
+        if (differences != 0) {
+            const RECT localCaptureRect{
+                0, 0, oracleClient.right, oracleClient.bottom};
+            SaveCapturedPixelsBmp(
+                localCaptureRect,
+                oraclePixels,
+                std::filesystem::path(baseValue) /
+                    L"unified-host-oracle-diagnostic.bmp");
+            SaveCapturedPixelsBmp(
+                localCaptureRect,
+                hostedPixels,
+                std::filesystem::path(baseValue) /
+                    L"unified-host-hosted-diagnostic.bmp");
+        }
+        return differences == 0;
+    };
+
+    WidgetWindowSmokeAccess::ConfigureVisualState(
+        *oracle, false, -1, -1, -1, RECT{}, false, -1);
+    hosted->SetVisualPointerState(POINT{-1, -1});
+    hosted->SetMarquee(RECT{}, false);
+    hosted->SetInsertionIndex(-1);
+    if (!compareFrame(L"selected")) {
+        return fail(L"Unified-host selected frame diverged", 288);
+    }
+
+    WidgetWindowSmokeAccess::ConfigureVisualState(
+        *oracle, true, 1, -1, 1, RECT{}, false, -1);
+    hosted->SetVisualPointerState(
+        POINT{MulDiv(12, oracleDpi, 96), MulDiv(12, oracleDpi, 96)},
+        1);
+    if (!compareFrame(L"header-pressed")) {
+        return fail(L"Unified-host header frame diverged", 289);
+    }
+
+    const RECT marquee{24, 52, 190, 168};
+    WidgetWindowSmokeAccess::ConfigureVisualState(
+        *oracle, false, -1, -1, -1, marquee, true, -1);
+    hosted->SetVisualPointerState(POINT{-1, -1});
+    hosted->SetMarquee(marquee, true);
+    hosted->SetInsertionIndex(-1);
+    if (!compareFrame(L"marquee")) {
+        return fail(L"Unified-host marquee frame diverged", 290);
+    }
+
+    WidgetWindowSmokeAccess::ConfigureVisualState(
+        *oracle, false, -1, 0, -1, RECT{}, false, 2);
+    const RECT hostedFirstCell = hosted->ItemHostCell(0);
+    hosted->SetVisualPointerState(POINT{
+        (hostedFirstCell.left + hostedFirstCell.right) / 2,
+        (hostedFirstCell.top + hostedFirstCell.bottom) / 2});
+    hosted->SetMarquee(RECT{}, false);
+    hosted->SetInsertionIndex(2);
+    if (!compareFrame(L"item-hover-insertion")) {
+        return fail(L"Unified-host insertion frame diverged", 291);
+    }
+
+    DesktopSurfaceWindowSmokeAccess::ReleaseHostedWidgetSlice(*surface);
+    if (DesktopSurfaceWindowSmokeAccess::HostedWidgetSlice(*surface) != nullptr ||
+        DesktopSurfaceWindowSmokeAccess::RenderTarget(*surface) != nullptr) {
+        return fail(L"Unified-host failure-close release regressed", 292);
+    }
+    cleanup();
+    if (CountLatticeWidgetWindows() != 0) {
+        std::wcerr << L"Unified-host smoke left an independent widget HWND\n";
+        return 293;
+    }
+    std::wcout << L"UNIFIED_HOST_WIDGET_PIXEL_PARITY=PASS\n"
+               << L"UNIFIED_HOST_WIDGET_RESOURCE_OWNERSHIP=PASS\n"
+               << L"UNIFIED_HOST_WIDGET_FAILURE_CLOSE=PASS\n";
+    return 0;
+}
+
+int RunSmokeUnifiedHostProduction(HINSTANCE instance) {
+    AttachParentConsole();
+
+    constexpr wchar_t kHostClassName[] =
+        L"Lattice.SmokeUnifiedHostProduction";
+    WNDCLASSEXW windowClass{};
+    windowClass.cbSize = sizeof(windowClass);
+    windowClass.lpfnWndProc = SmokeUnifiedHostSurfaceProc;
+    windowClass.hInstance = instance;
+    windowClass.lpszClassName = kHostClassName;
+    if (RegisterClassExW(&windowClass) == 0 &&
+        GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+        std::wcerr << L"Unified production host class registration failed\n";
+        return 300;
+    }
+    HWND hostWindow = CreateWindowExW(
+        WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+        kHostClassName,
+        L"",
+        WS_POPUP,
+        40,
+        40,
+        1600,
+        900,
+        nullptr,
+        nullptr,
+        instance,
+        nullptr);
+    if (hostWindow == nullptr) {
+        std::wcerr << L"Unified production host window creation failed\n";
+        return 300;
+    }
+
+    DesktopSurfaceWindow surface(instance);
+    const auto cleanup = [&]() {
+        DesktopSurfaceWindowSmokeAccess::ReleaseProductionHost(surface);
+        if (IsWindow(hostWindow) != FALSE) {
+            DestroyWindow(hostWindow);
+        }
+        hostWindow = nullptr;
+    };
+    if (!DesktopSurfaceWindowSmokeAccess::ConfigureProductionHost(
+            surface, hostWindow, RGB(14, 35, 44))) {
+        cleanup();
+        std::wcerr << L"Unified production host fixture setup failed\n";
+        return 301;
+    }
+
+    std::vector<HostedWidgetDescriptor> widgets;
+    widgets.reserve(10);
+    for (int widgetIndex = 0; widgetIndex < 10; ++widgetIndex) {
+        HostedWidgetDescriptor descriptor;
+        descriptor.categoryId =
+            L"production-category-" + std::to_wstring(widgetIndex);
+        descriptor.title =
+            L"生产格子 " + std::to_wstring(widgetIndex);
+        descriptor.config.x = 60 + (widgetIndex % 5) * 292;
+        descriptor.config.y = 60 + (widgetIndex / 5) * 402;
+        descriptor.config.width = 280;
+        descriptor.config.height = 380;
+        descriptor.config.normalHeight = 380;
+        descriptor.config.dpi = 96;
+        descriptor.config.iconSize = 48;
+        descriptor.config.density = 0;
+        descriptor.visible = true;
+        for (int itemIndex = 0; itemIndex < 8; ++itemIndex) {
+            DesktopItem item;
+            item.id = descriptor.categoryId +
+                L"-item-" + std::to_wstring(itemIndex);
+            item.path = L"C:\\unified-host-production\\" +
+                item.id + L".txt";
+            item.displayName = L"项目 " + std::to_wstring(itemIndex);
+            descriptor.items.push_back(std::move(item));
+        }
+        widgets.push_back(std::move(descriptor));
+    }
+
+    std::vector<HostedWidgetCommand> commands;
+    bool headerCommandHadCapture = false;
+    surface.SetHostedWidgetCommandHandler(
+        [&](const HostedWidgetCommand& command) {
+            if (command.type != HostedWidgetCommandType::BringToFront) {
+                if (command.type == HostedWidgetCommandType::ToggleCollapsed ||
+                    command.type == HostedWidgetCommandType::ToggleLocked ||
+                    command.type == HostedWidgetCommandType::OpenCategoryLocation ||
+                    command.type == HostedWidgetCommandType::ToggleContentView ||
+                    command.type == HostedWidgetCommandType::ShowSortMenu ||
+                    command.type == HostedWidgetCommandType::ShowBackgroundMenu) {
+                    headerCommandHadCapture =
+                        GetCapture() == hostWindow;
+                }
+                commands.push_back(command);
+            }
+            return true;
+        });
+    std::wstring errorMessage;
+    if (!surface.ApplyHostedWidgets(widgets, errorMessage) ||
+        !errorMessage.empty() ||
+        DesktopSurfaceWindowSmokeAccess::HostedWidgetCount(surface) != 10 ||
+        DesktopSurfaceWindowSmokeAccess::IndependentWidgetWindowCount(
+            surface) != 0 ||
+        DesktopSurfaceWindowSmokeAccess::SharedRenderTargetCount(surface) != 1 ||
+        DesktopSurfaceWindowSmokeAccess::SharedWallpaperCount(surface) != 1 ||
+        DesktopSurfaceWindowSmokeAccess::SharedIconCacheCount(surface) != 1 ||
+        CountLatticeWidgetWindows() != 0) {
+        cleanup();
+        std::wcerr << L"Unified production resource ownership regressed: "
+                   << errorMessage << L"\n";
+        return 302;
+    }
+    surface.SetIconCacheCapacity(333);
+    if (DesktopSurfaceWindowSmokeAccess::SharedIconCacheCapacity(
+            surface) != 333) {
+        cleanup();
+        std::wcerr << L"Unified production shared icon cache setting failed\n";
+        return 302;
+    }
+
+    for (const size_t expectedCount : {size_t{1}, size_t{30}}) {
+        std::vector<HostedWidgetDescriptor> scaled = widgets;
+        if (expectedCount == 1) {
+            scaled.resize(1);
+        } else {
+            for (size_t index = scaled.size(); index < expectedCount;
+                 ++index) {
+                HostedWidgetDescriptor extra = widgets[index % widgets.size()];
+                extra.categoryId = L"production-scale-" +
+                    std::to_wstring(index);
+                extra.title = extra.categoryId;
+                for (size_t item = 0; item < extra.items.size(); ++item) {
+                    extra.items[item].id = extra.categoryId + L"-item-" +
+                        std::to_wstring(item);
+                    extra.items[item].path =
+                        L"C:\\unified-host-production\\" +
+                        extra.items[item].id + L".txt";
+                }
+                scaled.push_back(std::move(extra));
+            }
+        }
+        errorMessage.clear();
+        if (!surface.ApplyHostedWidgets(scaled, errorMessage) ||
+            DesktopSurfaceWindowSmokeAccess::HostedWidgetCount(surface) !=
+                expectedCount ||
+            DesktopSurfaceWindowSmokeAccess::IndependentWidgetWindowCount(
+                surface) != 0 ||
+            DesktopSurfaceWindowSmokeAccess::SharedRenderTargetCount(
+                surface) != 1 ||
+            DesktopSurfaceWindowSmokeAccess::SharedWallpaperCount(
+                surface) != 1 ||
+            DesktopSurfaceWindowSmokeAccess::SharedIconCacheCount(
+                surface) != 1 ||
+            CountLatticeWidgetWindows() != 0) {
+            cleanup();
+            std::wcerr << L"Unified production 1/30-widget resources regressed: "
+                       << errorMessage << L"\n";
+            return 302;
+        }
+    }
+    errorMessage.clear();
+    if (!surface.ApplyHostedWidgets(widgets, errorMessage)) {
+        cleanup();
+        std::wcerr << L"Unified production 10-widget restore failed\n";
+        return 302;
+    }
+
+    const std::array<std::pair<int, HostedWidgetCommandType>, 6>
+        headerButtons{{
+            {12, HostedWidgetCommandType::ToggleCollapsed},
+            {36, HostedWidgetCommandType::ToggleLocked},
+            {195, HostedWidgetCommandType::OpenCategoryLocation},
+            {217, HostedWidgetCommandType::ToggleContentView},
+            {240, HostedWidgetCommandType::ShowSortMenu},
+            {263, HostedWidgetCommandType::ShowBackgroundMenu},
+        }};
+    for (const auto& [localX, expectedType] : headerButtons) {
+        WidgetView* headerView = nullptr;
+        for (size_t index = 0; index < widgets.size(); ++index) {
+            if (DesktopSurfaceWindowSmokeAccess::HostedWidgetCategory(
+                    surface, index) == widgets.front().categoryId) {
+                headerView = DesktopSurfaceWindowSmokeAccess::HostedWidgetAt(
+                    surface, index);
+                break;
+            }
+        }
+        if (headerView == nullptr) {
+            cleanup();
+            return 314;
+        }
+        const RECT bounds = headerView->HostPixelBounds();
+        const POINT point{bounds.left + localX, bounds.top + 12};
+        commands.clear();
+        headerCommandHadCapture = false;
+        DesktopSurfaceWindowSmokeAccess::DispatchHostedMouse(
+            surface, WM_LBUTTONDOWN, MK_LBUTTON, point);
+        if (GetCapture() != hostWindow) {
+            cleanup();
+            std::wcerr << L"Unified header did not capture button press\n";
+            return 315;
+        }
+        DesktopSurfaceWindowSmokeAccess::DispatchHostedMouse(
+            surface, WM_LBUTTONUP, 0, point);
+        if (commands.size() != 1 ||
+            commands.front().type != expectedType ||
+            commands.front().categoryId != widgets.front().categoryId) {
+            cleanup();
+            std::wcerr << L"Unified header command did not match its button\n";
+            return 316;
+        }
+        if (headerCommandHadCapture || GetCapture() == hostWindow) {
+            cleanup();
+            std::wcerr << L"Unified header command ran before pointer capture ended\n";
+            return 317;
+        }
+    }
+    WidgetView* headerView = nullptr;
+    for (size_t index = 0; index < widgets.size(); ++index) {
+        if (DesktopSurfaceWindowSmokeAccess::HostedWidgetCategory(
+                surface, index) == widgets.front().categoryId) {
+            headerView = DesktopSurfaceWindowSmokeAccess::HostedWidgetAt(
+                surface, index);
+            break;
+        }
+    }
+    if (headerView == nullptr) {
+        cleanup();
+        return 314;
+    }
+    const RECT headerBounds = headerView->HostPixelBounds();
+    const POINT firstButton{headerBounds.left + 12,
+                            headerBounds.top + 12};
+    for (const POINT release : {
+             POINT{headerBounds.left + 36, headerBounds.top + 12},
+             POINT{headerBounds.left + 100, headerBounds.top + 12}}) {
+        commands.clear();
+        DesktopSurfaceWindowSmokeAccess::DispatchHostedMouse(
+            surface, WM_LBUTTONDOWN, MK_LBUTTON, firstButton);
+        DesktopSurfaceWindowSmokeAccess::DispatchHostedMouse(
+            surface, WM_LBUTTONUP, 0, release);
+        if (!commands.empty() || GetCapture() == hostWindow) {
+            cleanup();
+            std::wcerr << L"Unified header release outside original button invoked command\n";
+            return 318;
+        }
+    }
+
+    // This must exercise the production hosted-pointer path. The legacy
+    // --smoke-widget-alignment only covers the Debug WidgetWindow oracle.
+    RECT hostScreen{};
+    GetWindowRect(hostWindow, &hostScreen);
+    std::vector<HostedWidgetDescriptor> alignmentWidgets{
+        widgets[0], widgets[1]};
+    alignmentWidgets[0].config.x = hostScreen.left + 100;
+    alignmentWidgets[0].config.y = hostScreen.top + 100;
+    alignmentWidgets[1].config.x = hostScreen.left + 620;
+    alignmentWidgets[1].config.y = hostScreen.top + 100;
+    errorMessage.clear();
+    if (!surface.ApplyHostedWidgets(alignmentWidgets, errorMessage)) {
+        cleanup();
+        return 313;
+    }
+    const auto visibleGuideAt = [](int expectedX) {
+        struct State { int x; bool visible; } state{expectedX, false};
+        EnumWindows([](HWND candidate, LPARAM parameter) -> BOOL {
+            wchar_t className[64]{};
+            GetClassNameW(candidate, className, ARRAYSIZE(className));
+            if (wcscmp(className, L"Lattice.AlignmentGuide") != 0 ||
+                IsWindowVisible(candidate) == FALSE) return TRUE;
+            RECT rect{};
+            GetWindowRect(candidate, &rect);
+            auto* state = reinterpret_cast<State*>(parameter);
+            if (rect.left == state->x && rect.right - rect.left == 2)
+                state->visible = true;
+            return TRUE;
+        }, reinterpret_cast<LPARAM>(&state));
+        return state.visible;
+    };
+    WidgetView* alignmentFirst =
+        DesktopSurfaceWindowSmokeAccess::HostedWidgetAt(surface, 0);
+    const RECT alignmentBefore = alignmentFirst->HostPixelBounds();
+    const POINT moveStart{alignmentBefore.left + 80,
+                          alignmentBefore.top + 16};
+    const POINT moveNear{moveStart.x + 523, moveStart.y};
+    if (!DesktopSurfaceWindowSmokeAccess::PressHostedPoint(
+            surface, moveStart, false)) {
+        cleanup();
+        return 313;
+    }
+    DesktopSurfaceWindowSmokeAccess::MoveHostedPoint(surface, moveNear);
+    const RECT movePreview = alignmentFirst->HostPixelBounds();
+    if (movePreview.left != 620 ||
+        !visibleGuideAt(hostScreen.left + 619)) {
+        cleanup();
+        std::wcerr << L"Production widget move snap/guide regressed: left="
+                   << movePreview.left << L" guide="
+                   << visibleGuideAt(hostScreen.left + 619) << L"\n";
+        return 316;
+    }
+    DesktopSurfaceWindowSmokeAccess::ReleaseHostedPoint(surface, moveNear);
+    if (visibleGuideAt(hostScreen.left + 619) || commands.empty() ||
+        commands.back().type != HostedWidgetCommandType::CommitLayout ||
+        commands.back().layout.x != hostScreen.left + 620) {
+        cleanup();
+        return 313;
+    }
+    commands.clear();
+    errorMessage.clear();
+    if (!surface.ApplyHostedWidgets(alignmentWidgets, errorMessage)) {
+        cleanup();
+        return 314;
+    }
+    alignmentFirst = DesktopSurfaceWindowSmokeAccess::HostedWidgetAt(
+        surface, 0);
+    const RECT resizeBefore = alignmentFirst->HostPixelBounds();
+    const POINT resizeStart{resizeBefore.right - 1,
+                            resizeBefore.top + 100};
+    const POINT resizeNear{resizeStart.x + 243, resizeStart.y};
+    if (!DesktopSurfaceWindowSmokeAccess::PressHostedPoint(
+            surface, resizeStart, false)) {
+        cleanup();
+        return 314;
+    }
+    DesktopSurfaceWindowSmokeAccess::MoveHostedPoint(surface, resizeNear);
+    const RECT resizePreview = alignmentFirst->HostPixelBounds();
+    if (resizePreview.right != 620 ||
+        !visibleGuideAt(hostScreen.left + 619)) {
+        cleanup();
+        std::wcerr << L"Production widget resize snap/guide regressed\n";
+        return 314;
+    }
+    DesktopSurfaceWindowSmokeAccess::ReleaseHostedPoint(surface, resizeNear);
+    if (visibleGuideAt(hostScreen.left + 619) || commands.empty() ||
+        commands.back().type != HostedWidgetCommandType::CommitLayout ||
+        commands.back().layout.width != 520) {
+        cleanup();
+        return 314;
+    }
+    commands.clear();
+
+    // Cancellation must restore geometry and remove the short-lived guide.
+    errorMessage.clear();
+    if (!surface.ApplyHostedWidgets(alignmentWidgets, errorMessage)) {
+        cleanup();
+        return 317;
+    }
+    alignmentFirst = DesktopSurfaceWindowSmokeAccess::HostedWidgetAt(
+        surface, 0);
+    const RECT cancelBefore = alignmentFirst->HostPixelBounds();
+    const POINT cancelStart{cancelBefore.left + 80,
+                            cancelBefore.top + 16};
+    const POINT cancelNear{cancelStart.x + 523, cancelStart.y};
+    DesktopSurfaceWindowSmokeAccess::PressHostedPoint(
+        surface, cancelStart, false);
+    DesktopSurfaceWindowSmokeAccess::MoveHostedPoint(surface, cancelNear);
+    DesktopSurfaceWindowSmokeAccess::CancelHostedPoint(surface);
+    if (alignmentFirst->HostPixelBounds().left != cancelBefore.left ||
+        visibleGuideAt(hostScreen.left + 619)) {
+        cleanup();
+        return 317;
+    }
+
+    // Left and bottom edges use the same old sizing guide rules.
+    alignmentWidgets[0].config.x = hostScreen.left + 620;
+    alignmentWidgets[1].config.x = hostScreen.left + 100;
+    errorMessage.clear();
+    if (!surface.ApplyHostedWidgets(alignmentWidgets, errorMessage)) {
+        cleanup();
+        return 318;
+    }
+    alignmentFirst = DesktopSurfaceWindowSmokeAccess::HostedWidgetAt(
+        surface, 0);
+    const RECT leftBefore = alignmentFirst->HostPixelBounds();
+    const POINT leftStart{leftBefore.left + 1, leftBefore.top + 100};
+    const POINT leftNear{leftStart.x - 237, leftStart.y};
+    DesktopSurfaceWindowSmokeAccess::PressHostedPoint(
+        surface, leftStart, false);
+    DesktopSurfaceWindowSmokeAccess::MoveHostedPoint(surface, leftNear);
+    if (alignmentFirst->HostPixelBounds().left != 380 ||
+        !visibleGuideAt(hostScreen.left + 379)) {
+        cleanup();
+        return 318;
+    }
+    DesktopSurfaceWindowSmokeAccess::ReleaseHostedPoint(surface, leftNear);
+    if (visibleGuideAt(hostScreen.left + 379)) {
+        cleanup();
+        return 318;
+    }
+    commands.clear();
+
+    alignmentWidgets[0].config.x = hostScreen.left + 100;
+    alignmentWidgets[1].config.x = hostScreen.left + 620;
+    alignmentWidgets[1].config.y = hostScreen.top + 700;
+    errorMessage.clear();
+    if (!surface.ApplyHostedWidgets(alignmentWidgets, errorMessage)) {
+        cleanup();
+        return 319;
+    }
+    alignmentFirst = DesktopSurfaceWindowSmokeAccess::HostedWidgetAt(
+        surface, 0);
+    const RECT bottomBefore = alignmentFirst->HostPixelBounds();
+    const POINT bottomStart{bottomBefore.left + 140,
+                            bottomBefore.bottom - 1};
+    const POINT bottomNear{bottomStart.x, bottomStart.y + 217};
+    DesktopSurfaceWindowSmokeAccess::PressHostedPoint(
+        surface, bottomStart, false);
+    DesktopSurfaceWindowSmokeAccess::MoveHostedPoint(surface, bottomNear);
+    if (alignmentFirst->HostPixelBounds().bottom != 700) {
+        cleanup();
+        return 319;
+    }
+    DesktopSurfaceWindowSmokeAccess::ReleaseHostedPoint(surface, bottomNear);
+    commands.clear();
+
+    errorMessage.clear();
+    if (!surface.ApplyHostedWidgets(widgets, errorMessage)) {
+        cleanup();
+        return 314;
+    }
+
+    // The production host must retain the old window's five resize zones.
+    // This uses real hosted-pointer routing rather than a mock geometry helper.
+    for (const POINT edgeOffset : {
+             POINT{1, 100}, POINT{279, 100}, POINT{140, 379},
+             POINT{1, 379}, POINT{279, 379}}) {
+        errorMessage.clear();
+        if (!surface.ApplyHostedWidgets(widgets, errorMessage)) {
+            cleanup();
+            return 310;
+        }
+        WidgetView* resizable =
+            DesktopSurfaceWindowSmokeAccess::HostedWidgetAt(surface, 0);
+        if (resizable == nullptr) {
+            cleanup();
+            return 310;
+        }
+        const RECT before = resizable->HostPixelBounds();
+        const POINT pressed{before.left + edgeOffset.x,
+                            before.top + edgeOffset.y};
+        if (resizable->HitTestHostPoint(pressed).kind !=
+                WidgetViewHitKind::ResizeBorder ||
+            !DesktopSurfaceWindowSmokeAccess::PressHostedPoint(
+                surface, pressed, false)) {
+            cleanup();
+            std::wcerr << L"Unified production resize edge was not hit\n";
+            return 310;
+        }
+        const bool left = edgeOffset.x == 1;
+        const bool right = edgeOffset.x == 279;
+        const bool bottom = edgeOffset.y == 379;
+        const int deltaX = left ? 12 : 24;
+        const int deltaY = 32;
+        const POINT released{pressed.x + deltaX, pressed.y + deltaY};
+        DesktopSurfaceWindowSmokeAccess::MoveHostedPoint(surface, released);
+        DesktopSurfaceWindowSmokeAccess::ReleaseHostedPoint(surface, released);
+        const RECT after = resizable->HostPixelBounds();
+        if (after.left != before.left + (left ? deltaX : 0) ||
+            after.right != before.right + (right ? 24 : 0) ||
+            after.bottom != before.bottom + (bottom ? deltaY : 0) ||
+            commands.empty() ||
+            commands.back().type != HostedWidgetCommandType::CommitLayout) {
+            cleanup();
+            std::wcerr << L"Unified production resize direction regressed\n";
+            return 311;
+        }
+        commands.clear();
+    }
+    {
+        WidgetView* resizable =
+            DesktopSurfaceWindowSmokeAccess::HostedWidgetAt(surface, 0);
+        const RECT bounds = resizable->HostPixelBounds();
+        if (resizable->HitTestHostPoint(
+                POINT{bounds.left + 1, bounds.top + 1}).kind ==
+                WidgetViewHitKind::ResizeBorder) {
+            cleanup();
+            return 312;
+        }
+        resizable->SetLocked(true);
+        if (resizable->HitTestHostPoint(
+                POINT{bounds.right - 1, bounds.bottom - 1}).kind ==
+                WidgetViewHitKind::ResizeBorder) {
+            cleanup();
+            return 312;
+        }
+        resizable->SetLocked(false);
+        resizable->SetCollapsed(true);
+        if (resizable->HitTestHostPoint(
+                POINT{bounds.right - 1, bounds.bottom - 1}).kind ==
+                WidgetViewHitKind::ResizeBorder) {
+            cleanup();
+            return 312;
+        }
+    }
+    errorMessage.clear();
+    if (!surface.ApplyHostedWidgets(widgets, errorMessage)) {
+        cleanup();
+        return 312;
+    }
+
+    WidgetView* second =
+        DesktopSurfaceWindowSmokeAccess::HostedWidgetAt(surface, 1);
+    if (second == nullptr) {
+        cleanup();
+        std::wcerr << L"Unified production second view missing\n";
+        return 303;
+    }
+    const RECT firstCell = second->ItemHostCell(0);
+    const POINT clickPoint{
+        (firstCell.left + firstCell.right) / 2,
+        firstCell.top + 12};
+    DesktopSurfaceWindowSmokeAccess::ClickHostedPoint(
+        surface, clickPoint, false);
+    DesktopSurfaceWindowSmokeAccess::DispatchHostedKey(
+        surface, VK_DELETE, false, false);
+    if (commands.size() != 1 ||
+        commands.front().type != HostedWidgetCommandType::DeleteSelection ||
+        commands.front().categoryId != L"production-category-1" ||
+        commands.front().itemIds != std::vector<std::wstring>{
+            L"production-category-1-item-0"}) {
+        cleanup();
+        std::wcerr << L"Unified production focus/identity routing regressed\n";
+        return 304;
+    }
+
+    commands.clear();
+    const RECT secondCell = second->ItemHostCell(1);
+    DesktopSurfaceWindowSmokeAccess::ClickHostedPoint(
+        surface,
+        POINT{(secondCell.left + secondCell.right) / 2,
+              secondCell.top + 12},
+        true);
+    DesktopSurfaceWindowSmokeAccess::DispatchHostedKey(
+        surface, VK_DELETE, false, false);
+    if (commands.size() != 1 ||
+        commands.back().categoryId != L"production-category-1" ||
+        commands.back().itemIds != std::vector<std::wstring>{
+            L"production-category-1-item-0",
+            L"production-category-1-item-1"}) {
+        cleanup();
+        std::wcerr << L"Unified production multi-selection identity regressed\n";
+        return 304;
+    }
+    commands.clear();
+    WidgetView* firstFocus =
+        DesktopSurfaceWindowSmokeAccess::HostedWidgetAt(surface, 0);
+    if (firstFocus == nullptr) {
+        cleanup();
+        return 304;
+    }
+    const RECT firstFocusCell = firstFocus->ItemHostCell(0);
+    DesktopSurfaceWindowSmokeAccess::ClickHostedPoint(
+        surface,
+        POINT{(firstFocusCell.left + firstFocusCell.right) / 2,
+              firstFocusCell.top + 12},
+        false);
+    DesktopSurfaceWindowSmokeAccess::DispatchHostedKey(
+        surface, VK_F2, false, false);
+    if (commands.size() != 1 ||
+        commands.back().type !=
+            HostedWidgetCommandType::RenameSelection ||
+        commands.back().categoryId != L"production-category-0" ||
+        commands.back().itemIds != std::vector<std::wstring>{
+            L"production-category-0-item-0"}) {
+        cleanup();
+        std::wcerr << L"Unified production F2 focus identity regressed\n";
+        return 304;
+    }
+    commands.clear();
+    DesktopSurfaceWindowSmokeAccess::DoubleClickHostedPoint(
+        surface,
+        POINT{(firstFocusCell.left + firstFocusCell.right) / 2,
+              firstFocusCell.top + 12});
+    if (commands.size() != 1 ||
+        commands.back().type !=
+            HostedWidgetCommandType::OpenSelection ||
+        commands.back().itemIds != std::vector<std::wstring>{
+            L"production-category-0-item-0"}) {
+        cleanup();
+        std::wcerr << L"Unified production double-click did not open painted item\n";
+        return 304;
+    }
+    errorMessage.clear();
+    if (!surface.ApplyHostedWidgets(widgets, errorMessage)) {
+        cleanup();
+        std::wcerr << L"Unified production test order restore failed\n";
+        return 304;
+    }
+
+    const std::wstring stableCategory =
+        DesktopSurfaceWindowSmokeAccess::HostedWidgetCategory(surface, 4);
+    DesktopSurfaceWindowSmokeAccess::SetPublishFailureIndex(surface, 3);
+    std::vector<HostedWidgetDescriptor> rejected = widgets;
+    rejected.erase(rejected.begin() + 4);
+    errorMessage.clear();
+    if (surface.ApplyHostedWidgets(rejected, errorMessage) ||
+        errorMessage.empty() ||
+        DesktopSurfaceWindowSmokeAccess::HostedWidgetCount(surface) != 10 ||
+        DesktopSurfaceWindowSmokeAccess::HostedWidgetCategory(surface, 4) !=
+            stableCategory) {
+        cleanup();
+        std::wcerr << L"Unified production atomic publish guard regressed\n";
+        return 305;
+    }
+    DesktopSurfaceWindowSmokeAccess::SetPublishFailureIndex(surface, -1);
+
+    wchar_t smokeItemsDirectory[32768]{};
+    const DWORD directoryLength = GetEnvironmentVariableW(
+        L"DESKTOP_ORGANIZER_SMOKE_ITEMS_DIR",
+        smokeItemsDirectory,
+        ARRAYSIZE(smokeItemsDirectory));
+    if (directoryLength == 0 ||
+        directoryLength >= ARRAYSIZE(smokeItemsDirectory)) {
+        cleanup();
+        std::wcerr << L"Unified production OLE fixture path missing\n";
+        return 306;
+    }
+    const std::filesystem::path sourcePath =
+        std::filesystem::path(smokeItemsDirectory) /
+        L"unified-host-external-source.txt";
+    {
+        std::ofstream sourceFile(sourcePath, std::ios::binary);
+        sourceFile << "external source";
+    }
+    Microsoft::WRL::ComPtr<IDataObject> externalData;
+    if (FAILED(CreateShellDragDataObject(
+            hostWindow,
+            std::vector<std::wstring>{sourcePath.wstring()},
+            externalData.GetAddressOf())) ||
+        externalData == nullptr) {
+        cleanup();
+        std::wcerr << L"Unified production OLE data object missing\n";
+        return 306;
+    }
+    RecordingDropTarget explorerTarget(DROPEFFECT_COPY);
+    if (!DesktopSurfaceWindowSmokeAccess::AttachProductionDropTarget(
+            surface, &explorerTarget)) {
+        cleanup();
+        std::wcerr << L"Unified production OLE target missing\n";
+        return 306;
+    }
+    IDropTarget* dropTarget =
+        DesktopSurfaceWindowSmokeAccess::DropTarget(surface);
+    WidgetView* first =
+        DesktopSurfaceWindowSmokeAccess::HostedWidgetAt(surface, 0);
+    POINT blankClient{};
+    POINT iconClient{};
+    if (first != nullptr) {
+        const RECT bounds = first->HostPixelBounds();
+        const RECT cell = first->ItemHostCell(0);
+        for (int y = bounds.bottom - 40;
+             y > bounds.top + 40 && blankClient.x == 0; y -= 4) {
+            for (int x = bounds.left + 20;
+                 x < bounds.right - 20; x += 4) {
+                const POINT point{x, y};
+                if (first->BuildDropAction(point, {}).type ==
+                    WidgetViewActionType::ReorderSelection) {
+                    blankClient = point;
+                    break;
+                }
+            }
+        }
+        for (int y = cell.top; y < cell.bottom && iconClient.x == 0;
+             y += 3) {
+            for (int x = cell.left; x < cell.right; x += 3) {
+                const POINT point{x, y};
+                if (first->HitTestHostPoint(point).kind ==
+                    WidgetViewHitKind::ItemIcon) {
+                    iconClient = point;
+                    break;
+                }
+            }
+        }
+    }
+    if (dropTarget == nullptr || blankClient.x == 0 ||
+        iconClient.x == 0) {
+        cleanup();
+        std::wcerr << L"Unified production OLE hit regions missing\n";
+        return 306;
+    }
+    POINT blankScreen = blankClient;
+    POINT iconScreen = iconClient;
+    POINT desktopScreen{1550, 875};
+    ClientToScreen(hostWindow, &blankScreen);
+    ClientToScreen(hostWindow, &iconScreen);
+    ClientToScreen(hostWindow, &desktopScreen);
+    DWORD effect = DROPEFFECT_COPY | DROPEFFECT_MOVE;
+    if (FAILED(dropTarget->DragEnter(
+            externalData.Get(), MK_LBUTTON,
+            POINTL{desktopScreen.x, desktopScreen.y}, &effect)) ||
+        explorerTarget.enterCount != 1 ||
+        effect != DROPEFFECT_COPY) {
+        cleanup();
+        std::wcerr << L"Unified production Explorer OLE enter failed\n";
+        return 306;
+    }
+    effect = DROPEFFECT_COPY | DROPEFFECT_MOVE;
+    if (FAILED(dropTarget->DragOver(
+            MK_LBUTTON,
+            POINTL{blankScreen.x, blankScreen.y}, &effect)) ||
+        explorerTarget.leaveCount != 1 ||
+        effect == DROPEFFECT_NONE) {
+        cleanup();
+        std::wcerr << L"Unified production OLE route switch failed\n";
+        return 306;
+    }
+    effect = DROPEFFECT_COPY | DROPEFFECT_MOVE;
+    if (FAILED(dropTarget->Drop(
+            externalData.Get(), MK_LBUTTON,
+            POINTL{blankScreen.x, blankScreen.y}, &effect)) ||
+        effect != DROPEFFECT_NONE ||
+        explorerTarget.dropCount != 0 ||
+        commands.empty() ||
+        commands.back().type != HostedWidgetCommandType::CollectPaths ||
+        commands.back().categoryId != L"production-category-0" ||
+        commands.back().paths !=
+            std::vector<std::wstring>{sourcePath.wstring()}) {
+        cleanup();
+        std::wcerr << L"Unified production OLE collection failed\n";
+        return 306;
+    }
+    effect = DROPEFFECT_COPY | DROPEFFECT_MOVE;
+    if (FAILED(dropTarget->DragEnter(
+            externalData.Get(), MK_LBUTTON,
+            POINTL{iconScreen.x, iconScreen.y}, &effect)) ||
+        effect != DROPEFFECT_NONE ||
+        explorerTarget.enterCount != 1) {
+        cleanup();
+        std::wcerr << L"Unified production icon target rejection failed\n";
+        return 306;
+    }
+    effect = DROPEFFECT_COPY | DROPEFFECT_MOVE;
+    if (FAILED(dropTarget->DragOver(
+            MK_LBUTTON,
+            POINTL{desktopScreen.x, desktopScreen.y}, &effect)) ||
+        explorerTarget.enterCount != 2 ||
+        effect != DROPEFFECT_COPY ||
+        FAILED(dropTarget->DragLeave()) ||
+        explorerTarget.leaveCount != 2) {
+        cleanup();
+        std::wcerr << L"Unified production OLE target leave failed\n";
+        return 306;
+    }
+
+    std::vector<HostedWidgetDescriptor> overlap{widgets[0], widgets[1]};
+    overlap[1].config.x = overlap[0].config.x + 140;
+    overlap[1].config.y = overlap[0].config.y;
+    errorMessage.clear();
+    if (!surface.ApplyHostedWidgets(overlap, errorMessage)) {
+        cleanup();
+        return 309;
+    }
+    const POINT lowerHeader{
+        overlap[0].config.x - 40 + 24,
+        overlap[0].config.y - 40 + 12};
+    const POINT overlapPoint{
+        overlap[1].config.x - 40 + 20,
+        overlap[1].config.y - 40 + 12};
+    DesktopSurfaceWindowSmokeAccess::ClickHostedPoint(
+        surface, lowerHeader, false);
+    if (DesktopSurfaceWindowSmokeAccess::HostedWidgetCategory(
+            surface, 1) != overlap[0].categoryId ||
+        DesktopSurfaceWindowSmokeAccess::HostedCategoryAtPoint(
+            surface, overlapPoint) != overlap[0].categoryId) {
+        cleanup();
+        std::wcerr << L"Unified production clicked widget remained covered\n";
+        return 309;
+    }
+
+    WidgetView* selectedView =
+        DesktopSurfaceWindowSmokeAccess::HostedWidgetAt(surface, 1);
+    if (selectedView == nullptr) {
+        cleanup();
+        return 310;
+    }
+    selectedView->SetSelectedItemIds({
+        overlap[0].items[0].id, overlap[0].items[1].id});
+    const RECT selectedCell = selectedView->ItemHostCell(0);
+    const POINT selectedPoint{
+        (selectedCell.left + selectedCell.right) / 2,
+        selectedCell.top + 12};
+    if (!DesktopSurfaceWindowSmokeAccess::PressHostedPoint(
+            surface, selectedPoint, false) ||
+        selectedView->SelectedItemIds().size() != 2) {
+        cleanup();
+        std::wcerr << L"Unified production selected drag collapsed group\n";
+        return 310;
+    }
+    DesktopSurfaceWindowSmokeAccess::ReleaseHostedPoint(
+        surface, selectedPoint);
+    if (selectedView->SelectedItemIds() !=
+        std::vector<std::wstring>{overlap[0].items[0].id}) {
+        cleanup();
+        std::wcerr << L"Unified production plain click did not reduce group\n";
+        return 310;
+    }
+    selectedView->SetSelectedItemIds({
+        overlap[0].items[0].id, overlap[0].items[1].id});
+    if (!DesktopSurfaceWindowSmokeAccess::PressHostedPoint(
+            surface, selectedPoint, true) ||
+        selectedView->SelectedItemIds().size() != 2) {
+        cleanup();
+        std::wcerr << L"Unified production Ctrl drag collapsed group\n";
+        return 310;
+    }
+    DesktopSurfaceWindowSmokeAccess::ReleaseHostedPoint(
+        surface, selectedPoint);
+    if (selectedView->SelectedItemIds() !=
+        std::vector<std::wstring>{overlap[0].items[1].id}) {
+        cleanup();
+        std::wcerr << L"Unified production Ctrl click did not toggle item\n";
+        return 310;
+    }
+
+    selectedView->SetSelectedItemIds({
+        overlap[0].items[0].id, overlap[0].items[1].id});
+    const RECT selectedBounds = selectedView->HostPixelBounds();
+    const POINT selectedBlank{
+        selectedBounds.left + 22, selectedBounds.bottom - 20};
+    commands.clear();
+    if (!DesktopSurfaceWindowSmokeAccess::PressHostedPoint(
+            surface, selectedPoint, false)) {
+        cleanup();
+        return 311;
+    }
+    DesktopSurfaceWindowSmokeAccess::MoveHostedPoint(
+        surface, selectedBlank);
+    if (selectedView->SelectedItemIds().size() != 2 ||
+        !DragGhostWindow::Instance().IsVisible()) {
+        cleanup();
+        std::wcerr << L"Unified production multi-drag feedback regressed\n";
+        return 311;
+    }
+    DesktopSurfaceWindowSmokeAccess::ReleaseHostedPoint(
+        surface, selectedBlank);
+    if (commands.empty() ||
+        commands.back().type !=
+            HostedWidgetCommandType::ReorderSelection ||
+        commands.back().itemIds != std::vector<std::wstring>{
+            overlap[0].items[0].id, overlap[0].items[1].id} ||
+        DragGhostWindow::Instance().IsVisible()) {
+        cleanup();
+        std::wcerr << L"Unified production multi-drag commit regressed\n";
+        return 311;
+    }
+
+    if (!DesktopSurfaceWindowSmokeAccess::PressHostedPoint(
+            surface, selectedPoint, false)) {
+        cleanup();
+        return 312;
+    }
+    DesktopSurfaceWindowSmokeAccess::MoveHostedPoint(
+        surface, selectedBlank);
+    errorMessage.clear();
+    if (!DragGhostWindow::Instance().IsVisible() ||
+        !surface.ApplyHostedWidgets(overlap, errorMessage) ||
+        DragGhostWindow::Instance().IsVisible()) {
+        cleanup();
+        std::wcerr << L"Unified production republish left drag ghost\n";
+        return 312;
+    }
+
+    if (!DesktopSurfaceWindowSmokeAccess::RenderProductionHost(surface)) {
+        cleanup();
+        std::wcerr << L"Unified production host render failed\n";
+        return 306;
+    }
+    selectedView = DesktopSurfaceWindowSmokeAccess::HostedWidgetAt(
+        surface, 0);
+    if (selectedView == nullptr) {
+        cleanup();
+        return 312;
+    }
+    selectedView->SetSelectedItemIds({overlap[0].items[0].id});
+    const RECT hideCell = selectedView->ItemHostCell(0);
+    const POINT hidePress{
+        (hideCell.left + hideCell.right) / 2,
+        hideCell.top + 12};
+    if (!DesktopSurfaceWindowSmokeAccess::PressHostedPoint(
+            surface, hidePress, false)) {
+        cleanup();
+        return 312;
+    }
+    DesktopSurfaceWindowSmokeAccess::MoveHostedPoint(
+        surface, selectedBlank);
+    if (!DragGhostWindow::Instance().IsVisible()) {
+        cleanup();
+        return 312;
+    }
+    surface.Hide();
+    if (DragGhostWindow::Instance().IsVisible()) {
+        cleanup();
+        std::wcerr << L"Unified production hidden host left drag ghost\n";
+        return 312;
+    }
+    cleanup();
+    if (CountLatticeWidgetWindows() != 0) {
+        std::wcerr << L"Unified production host left Widget HWNDs\n";
+        return 307;
+    }
+
+    const std::filesystem::path desktopFixture =
+        std::filesystem::path(smokeItemsDirectory) /
+        L"unified-host-desktop";
+    std::error_code desktopFixtureError;
+    std::filesystem::create_directories(
+        desktopFixture, desktopFixtureError);
+    if (desktopFixtureError ||
+        SetEnvironmentVariableW(
+            L"DESKTOP_ORGANIZER_DESKTOP_DIR",
+            desktopFixture.c_str()) == FALSE) {
+        std::wcerr << L"Unified production desktop fixture setup failed\n";
+        return 308;
+    }
+    const std::filesystem::path collectionPath =
+        desktopFixture /
+        L"unified-host-collection-original.txt";
+    {
+        std::ofstream collectionFile(collectionPath, std::ios::binary);
+        collectionFile << "original file remains in desktop";
+    }
+    const auto originalIdentity = ReadStableFileIdentity(collectionPath);
+    const auto originalBytes = ReadFileBytes(collectionPath.wstring());
+    AppConfig collectionConfig;
+    collectionConfig.settings.lastVisible = false;
+    collectionConfig.window.viewMode = 1;
+    CategoryConfig collectionCategory;
+    collectionCategory.id = L"unified-host-collection";
+    collectionCategory.name = L"收纳定点";
+    collectionCategory.layout.width = 300;
+    collectionCategory.layout.height = 300;
+    collectionCategory.layout.dpi = 288;
+    collectionConfig.categories.push_back(collectionCategory);
+    ConfigStore collectionStore;
+    if (!collectionStore.SaveAppConfig(collectionConfig)) {
+        std::wcerr << L"Unified production collection config setup failed\n";
+        return 308;
+    }
+    {
+        MainWindow main(instance, {}, false);
+        if (!main.Create()) {
+            std::wcerr << L"Unified production collection main failed\n";
+            return 308;
+        }
+        const AppConfig persistedDpiFixture =
+            collectionStore.LoadAppConfig();
+        if (MainWindowSmokeAccess::HostedRuntimeDpiForCategory(
+                main, collectionCategory.id) !=
+                static_cast<int>(GetDpiForWindow(main.Window())) ||
+            persistedDpiFixture.categories.size() != 1 ||
+            persistedDpiFixture.categories.front().layout.dpi != 288) {
+            DestroyWindow(main.Window());
+            std::wcerr << L"Unified production runtime widget DPI or persisted layout regressed\n";
+            return 309;
+        }
+        HostedWidgetCommand collectCommand;
+        collectCommand.type = HostedWidgetCommandType::CollectPaths;
+        collectCommand.categoryId = collectionCategory.id;
+        collectCommand.paths = {collectionPath.wstring()};
+        if (!MainWindowSmokeAccess::ExecuteHostedCommand(
+                main, collectCommand)) {
+            DestroyWindow(main.Window());
+            std::wcerr << L"Unified production collection was not queued\n";
+            return 308;
+        }
+        const ULONGLONG deadline = GetTickCount64() + 5000;
+        bool collected = false;
+        do {
+            MSG message{};
+            while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+                TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
+            const AppConfig current = collectionStore.LoadAppConfig();
+            collected = current.categories.size() == 1 &&
+                current.categories.front().itemIds.size() == 1 &&
+                std::any_of(
+                    current.items.begin(), current.items.end(),
+                    [&](const ItemConfig& item) {
+                        return item.id ==
+                                   current.categories.front().itemIds.front() &&
+                            CompareStringOrdinal(
+                                item.path.c_str(), -1,
+                                collectionPath.c_str(), -1,
+                                TRUE) == CSTR_EQUAL;
+                    });
+            if (collected) {
+                break;
+            }
+            MsgWaitForMultipleObjects(
+                0, nullptr, FALSE, 16, QS_ALLINPUT);
+        } while (GetTickCount64() < deadline);
+        DestroyWindow(main.Window());
+        if (!collected ||
+            !SameStableFileIdentity(
+                originalIdentity,
+                ReadStableFileIdentity(collectionPath)) ||
+            ReadFileBytes(collectionPath.wstring()) != originalBytes) {
+            std::wcerr << L"Unified production collection changed source or failed membership\n";
+            return 308;
+        }
+    }
+    std::wcout << L"UNIFIED_HOST_PRODUCTION_COLLECTION=PASS\n"
+               << L"UNIFIED_HOST_RUNTIME_DPI=PASS\n"
+               << L"UNIFIED_HOST_PRODUCTION_FOCUS_IDENTITY=PASS\n"
+               << L"UNIFIED_HOST_PRODUCTION_ATOMIC_PUBLISH=PASS\n"
+               << L"UNIFIED_HOST_PRODUCTION_OLE_ROUTING=PASS\n"
+               << L"UNIFIED_HOST_PRODUCTION_RESOURCES=PASS\n";
     return 0;
 }
 
@@ -15775,8 +19886,14 @@ std::optional<int> RunSmokeOrPreviewCommand(
     if (HasArgument(commandLine, L"--smoke-scan")) {
         return RunSmokeScan();
     }
+    if (HasArgument(commandLine, L"--smoke-desktop-snapshot")) {
+        return RunSmokeDesktopSnapshot(instance);
+    }
     if (HasArgument(commandLine, L"--smoke-config")) {
         return RunSmokeConfig();
+    }
+    if (HasArgument(commandLine, L"--smoke-layout-restore")) {
+        return RunSmokeLayoutRestore(instance);
     }
     if (HasArgument(commandLine, L"--smoke-layout")) {
         return RunSmokeDesktopLayout();
@@ -15849,6 +19966,11 @@ std::optional<int> RunSmokeOrPreviewCommand(
     }
     if (HasArgument(
             commandLine,
+            L"--smoke-desktop-double-click")) {
+        return RunSmokeDesktopDoubleClick(instance);
+    }
+    if (HasArgument(
+            commandLine,
             L"--smoke-desktop-internal-drag")) {
         return RunSmokeDesktopInternalDrag(instance);
     }
@@ -15864,6 +19986,16 @@ std::optional<int> RunSmokeOrPreviewCommand(
     }
     if (HasArgument(commandLine, L"--smoke-widget-interaction")) {
         return RunSmokeWidgetInteraction(instance);
+    }
+    if (HasArgument(
+            commandLine,
+            L"--smoke-unified-host-widget-slice")) {
+        return RunSmokeUnifiedHostWidgetSlice(instance);
+    }
+    if (HasArgument(
+            commandLine,
+            L"--smoke-unified-host-production")) {
+        return RunSmokeUnifiedHostProduction(instance);
     }
     if (HasArgument(commandLine, L"--smoke-widget-normal-exit")) {
         return RunSmokeWidgetNormalExit(instance);

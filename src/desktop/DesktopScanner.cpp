@@ -6,6 +6,7 @@
 #include <wrl/client.h>
 
 #include <algorithm>
+#include <atomic>
 #include <string>
 
 #include "desktop/ShortcutResolver.h"
@@ -13,6 +14,10 @@
 #include "util/StringUtil.h"
 
 namespace {
+
+#ifndef NDEBUG
+std::atomic<std::uint64_t> gDesktopScanCount{0};
+#endif
 
 std::wstring ConfiguredDesktopPath() {
     const DWORD required = GetEnvironmentVariableW(L"DESKTOP_ORGANIZER_DESKTOP_DIR", nullptr, 0);
@@ -66,6 +71,9 @@ std::wstring DisplayNameForPath(const std::wstring& fullPath, DesktopItemKind ki
 }  // namespace
 
 std::vector<DesktopItem> DesktopScanner::Scan(bool includePublicDesktop) const {
+#ifndef NDEBUG
+    gDesktopScanCount.fetch_add(1, std::memory_order_relaxed);
+#endif
     std::vector<DesktopItem> items;
     const std::wstring configuredDesktop = ConfiguredDesktopPath();
     ScanDirectory(configuredDesktop, items);
@@ -78,6 +86,16 @@ std::vector<DesktopItem> DesktopScanner::Scan(bool includePublicDesktop) const {
     });
     return items;
 }
+
+#ifndef NDEBUG
+void DesktopScanner::ResetScanCountForTesting() noexcept {
+    gDesktopScanCount.store(0, std::memory_order_relaxed);
+}
+
+std::uint64_t DesktopScanner::ScanCountForTesting() noexcept {
+    return gDesktopScanCount.load(std::memory_order_relaxed);
+}
+#endif
 
 DesktopItem DesktopScanner::CreateItemFromPath(
     const std::wstring& path,

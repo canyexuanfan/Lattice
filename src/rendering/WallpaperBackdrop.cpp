@@ -5,6 +5,7 @@
 #include <wincodec.h>
 
 #include <algorithm>
+#include <cstdint>
 #include <cmath>
 #include <cwctype>
 #include <limits>
@@ -910,3 +911,53 @@ bool WallpaperBackdrop::Draw(
 bool WallpaperBackdrop::CoversPixels(int width, int height) const noexcept {
     return bitmap_ != nullptr && pixelSize_.cx >= width && pixelSize_.cy >= height;
 }
+
+void WallpaperBackdrop::Release() noexcept {
+    bitmap_.Reset();
+    pixelSize_ = {};
+}
+
+#ifndef NDEBUG
+bool WallpaperBackdrop::SetSolidForSmoke(
+    ID2D1RenderTarget* renderTarget,
+    int width,
+    int height,
+    COLORREF color) {
+    if (renderTarget == nullptr || width <= 0 || height <= 0) {
+        return false;
+    }
+    const std::uint32_t pixel =
+        0xFF000000u |
+        (static_cast<std::uint32_t>(GetRValue(color)) << 16) |
+        (static_cast<std::uint32_t>(GetGValue(color)) << 8) |
+        static_cast<std::uint32_t>(GetBValue(color));
+    std::vector<std::uint32_t> pixels(
+        static_cast<size_t>(width) * static_cast<size_t>(height),
+        pixel);
+    Microsoft::WRL::ComPtr<ID2D1Bitmap> nextBitmap;
+    FLOAT dpiX = 96.0f;
+    FLOAT dpiY = 96.0f;
+    renderTarget->GetDpi(&dpiX, &dpiY);
+    const D2D1_BITMAP_PROPERTIES properties = D2D1::BitmapProperties(
+        D2D1::PixelFormat(
+            DXGI_FORMAT_B8G8R8A8_UNORM,
+            D2D1_ALPHA_MODE_PREMULTIPLIED),
+        dpiX,
+        dpiY);
+    if (FAILED(renderTarget->CreateBitmap(
+            D2D1::SizeU(
+                static_cast<UINT32>(width),
+                static_cast<UINT32>(height)),
+            pixels.data(),
+            static_cast<UINT32>(width * sizeof(std::uint32_t)),
+            properties,
+            nextBitmap.GetAddressOf())) ||
+        nextBitmap == nullptr) {
+        return false;
+    }
+    bitmap_ = std::move(nextBitmap);
+    pixelSize_ = SIZE{width, height};
+    ++generation_;
+    return true;
+}
+#endif

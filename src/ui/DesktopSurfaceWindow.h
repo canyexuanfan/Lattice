@@ -5,6 +5,8 @@
 #include <wrl/client.h>
 
 #include <functional>
+#include <cstdint>
+#include <memory>
 #include <optional>
 #include <set>
 #include <string>
@@ -16,8 +18,56 @@
 #include "rendering/WallpaperBackdrop.h"
 #include "shell/ShellItemReference.h"
 #include "shell/ShellLauncher.h"
+#include "ui/WidgetView.h"
 
 class DesktopSurfaceDropTarget;
+
+struct HostedWidgetDescriptor {
+    std::wstring categoryId;
+    std::wstring title;
+    WindowConfig config{};
+    int theme = 0;
+    bool visible = true;
+    bool singleClickOpen = false;
+    std::vector<DesktopItem> items;
+};
+
+enum class HostedWidgetCommandType {
+    None,
+    OpenSelection,
+    RenameSelection,
+    DeleteSelection,
+    CopySelection,
+    CutSelection,
+    ShowSelectionMenu,
+    ShowBackgroundMenu,
+    BringToFront,
+    ToggleCollapsed,
+    ToggleLocked,
+    OpenCategoryLocation,
+    ToggleContentView,
+    ShowSortMenu,
+    ReorderSelection,
+    MoveSelectionToCategory,
+    MoveSelectionOut,
+    CommitLayout,
+    RefreshIcons,
+    ShellDropTarget,
+    CollectPaths,
+};
+
+struct HostedWidgetCommand {
+    HostedWidgetCommandType type = HostedWidgetCommandType::None;
+    std::wstring categoryId;
+    std::vector<std::wstring> itemIds;
+    std::wstring targetCategoryId;
+    std::wstring targetItemId;
+    int insertionIndex = -1;
+    POINT screenPoint{};
+    std::vector<POINT> itemScreenPoints;
+    std::vector<std::wstring> paths;
+    WindowConfig layout{};
+};
 
 class DesktopSurfaceWindow {
 public:
@@ -29,6 +79,10 @@ public:
             const std::wstring&,
             const std::wstring&,
             const std::wstring&)>;
+    using HostedWidgetCommandHandler =
+        std::function<bool(const HostedWidgetCommand&)>;
+    using ShellMenuForwardHandler =
+        std::function<bool(UINT, WPARAM, LPARAM, LRESULT&)>;
 
     explicit DesktopSurfaceWindow(HINSTANCE instance);
     ~DesktopSurfaceWindow();
@@ -48,6 +102,7 @@ public:
     void InvalidateIconCache(
         const std::vector<std::wstring>& paths);
     void RefreshIconCache();
+    void SetIconCacheCapacity(size_t capacity);
     void RemoveDeletedIdentities(
         const std::vector<std::wstring>& identities);
     void UpdateAssignedIdentities(
@@ -57,6 +112,18 @@ public:
     void SetDisplayPositionCommitHandler(
         DisplayPositionCommitHandler handler);
     void SetRenameCommitHandler(RenameCommitHandler handler);
+    void SetHostedWidgetCommandHandler(
+        HostedWidgetCommandHandler handler);
+    void SetShellMenuForwardHandler(
+        ShellMenuForwardHandler handler);
+    bool ApplyHostedWidgets(
+        const std::vector<HostedWidgetDescriptor>& widgets,
+        std::wstring& errorMessage);
+    void ClearHostedWidgets();
+    size_t HostedWidgetCount() const noexcept;
+#ifndef NDEBUG
+    bool AttachDropTargetForSmoke(IDropTarget* explorerTarget);
+#endif
     void PresentUnassignedItemAt(
         const std::wstring& identity,
         POINT screenPoint);
@@ -95,6 +162,22 @@ private:
         MarqueeActive,
     };
 
+    enum class HostedPointerGesture {
+        None,
+        ItemPressed,
+        ItemDragging,
+        MarqueePending,
+        MarqueeActive,
+        HeaderButtonPressed,
+        Moving,
+        Resizing,
+    };
+
+    struct HostedWidgetEntry {
+        HostedWidgetDescriptor descriptor;
+        WidgetView view;
+    };
+
 #ifndef NDEBUG
     enum class InternalDropStage {
         None,
@@ -128,6 +211,30 @@ private:
         LPARAM lParam);
     LRESULT HandleMessage(UINT message, WPARAM wParam, LPARAM lParam);
     void Render();
+    int HostedWidgetIndexAt(POINT clientPoint) const;
+    int RaiseHostedWidget(int index);
+    bool ActivateHostedWidgetAt(
+        POINT clientPoint,
+        bool controlPressed);
+    bool DispatchHostedWidgetKey(
+        UINT virtualKey,
+        bool controlPressed,
+        bool shiftPressed);
+    bool DispatchHostedWidgetAction(
+        size_t widgetIndex,
+        const WidgetViewAction& action,
+        POINT screenPoint = POINT{});
+    bool BeginHostedPointerGesture(
+        POINT clientPoint,
+        bool controlPressed);
+    void ContinueHostedPointerGesture(POINT clientPoint);
+    void CompleteHostedPointerGesture(POINT clientPoint);
+    void ResetHostedPointerGesture() noexcept;
+    void ClearHostedDragFeedback() noexcept;
+    void DispatchHostedHeaderButton(
+        size_t widgetIndex,
+        int button,
+        POINT screenPoint);
     int HitTest(POINT clientPoint) const;
     RECT CellRect(const DesktopViewItem& item) const;
     RECT LabelRect(const DesktopViewItem& item) const;
@@ -194,7 +301,8 @@ private:
         const DesktopShellRenameResult& renamedItem);
     void ApplyMarqueeSelection(const RECT& marqueeRect);
     bool IsAssigned(const std::wstring& identity) const;
-    void RebuildVisibleItems();
+    void RebuildVisibleItems(
+        const std::vector<std::wstring>& newlyObserved = {});
     void MaintainDesktopLayer();
     void UpdateViewMetrics();
     void ConfigurePixelRenderTarget();
@@ -233,6 +341,13 @@ private:
         int cellHeight,
         int iconSize,
         std::vector<DesktopPosition>& plannedPositions);
+    static std::vector<DesktopPosition> ResolveVisiblePositionCollisions(
+        const std::vector<DesktopPosition>& nativePositions,
+        const std::vector<DesktopPosition>& displayOverrides,
+        const RECT& viewBounds,
+        int cellWidth,
+        int cellHeight,
+        const std::vector<std::wstring>& newlyObserved = {});
 
     struct PositionOverride {
         std::wstring identity;
@@ -255,6 +370,8 @@ private:
     std::vector<PositionOverride> positionOverrides_;
     DisplayPositionCommitHandler displayPositionCommitHandler_;
     RenameCommitHandler renameCommitHandler_;
+    HostedWidgetCommandHandler hostedWidgetCommandHandler_;
+    ShellMenuForwardHandler shellMenuForwardHandler_;
     D2DContext d2d_;
     IconCache iconCache_;
     WallpaperBackdrop wallpaper_;
@@ -269,6 +386,11 @@ private:
     PointerGesture pointerGesture_ = PointerGesture::None;
     bool controlAtPointerDown_ = false;
     bool pressedWasSelected_ = false;
+    std::wstring lastCompletedClickIdentity_;
+    std::wstring lastCompletedClickCategoryId_;
+    POINT lastCompletedClickPoint_{};
+    DWORD lastCompletedClickTime_ = 0;
+    bool swallowDoubleClickRelease_ = false;
     bool renameClickCandidate_ = false;
     std::wstring pendingRenameIdentity_;
     HWND renameEdit_ = nullptr;
@@ -285,8 +407,36 @@ private:
     bool internalDragActive_ = false;
     POINT internalDragSourceScreenPoint_{};
     std::vector<DesktopPosition> internalDragOriginalPositions_;
+    std::vector<std::unique_ptr<HostedWidgetEntry>> hostedWidgets_;
+    int activeHostedWidgetIndex_ = -1;
+    HostedPointerGesture hostedPointerGesture_ =
+        HostedPointerGesture::None;
+    int hostedPointerWidgetIndex_ = -1;
+    int hostedPointerTargetWidgetIndex_ = -1;
+    WidgetViewHit hostedPointerHit_{};
+    POINT hostedPointerStart_{};
+    POINT hostedPointerCurrent_{};
+    RECT hostedPointerOriginalBounds_{};
+    WindowConfig hostedPointerOriginalLayout_{};
+    bool hostedPointerControlPressed_ = false;
+    bool hostedPointerPressedWasSelected_ = false;
+    std::vector<std::wstring> hostedPointerSelectionBaseline_;
+    std::vector<std::wstring> hostedDraggingItemIds_;
+    std::vector<RECT> hostedAlignmentRects_;
+    int hostedDragInsertionIndex_ = -1;
+    std::uint64_t hostedDragGhostGeneration_ = 0;
 #ifndef NDEBUG
     InternalDropStage internalDropStage_ = InternalDropStage::None;
+    std::unique_ptr<WidgetView> hostedWidgetSlice_;
+    int hostedWidgetPublishFailureIndex_ = -1;
+    bool suppressDesktopOpenForSmoke_ = false;
+    size_t doubleClickMessageCountForSmoke_ = 0;
+    size_t leftDownMessageCountForSmoke_ = 0;
+    size_t leftUpMessageCountForSmoke_ = 0;
+    POINT hostedDragActivationPointForSmoke_{};
+    POINT doubleClickPointForSmoke_{};
+    size_t desktopOpenRequestCountForSmoke_ = 0;
+    std::wstring desktopOpenPathForSmoke_;
 #endif
     bool dropTargetRegistered_ = false;
     Microsoft::WRL::ComPtr<IDropTarget> desktopDropTarget_;

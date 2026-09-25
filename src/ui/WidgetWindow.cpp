@@ -15,6 +15,7 @@
 
 #include "desktop/DesktopScanner.h"
 #include "desktop/DesktopLayout.h"
+#include "desktop/DesktopItemOrder.h"
 #include "desktop/DesktopPlacementCoordinator.h"
 #include "desktop/CategoryStorageManager.h"
 #include "app/resource.h"
@@ -25,17 +26,15 @@
 #include "ui/InputDialog.h"
 #include "ui/DragGhostWindow.h"
 #include "ui/MessageDialog.h"
+#include "ui/WidgetViewRenderer.h"
+#include "ui/WidgetAlignment.h"
 #include "util/PathUtil.h"
 #include "util/StringUtil.h"
 
 namespace {
 
 constexpr wchar_t kWindowClassName[] = L"Lattice.WidgetWindow";
-constexpr int kTitleHeight = 32;
-constexpr FLOAT kHeaderVisualHeight = 24.0f;
-constexpr FLOAT kHeaderVisualTop =
-    (static_cast<FLOAT>(kTitleHeight) - kHeaderVisualHeight) / 2.0f;
-constexpr FLOAT kHeaderControlOffsetY = kHeaderVisualTop - 7.5f;
+constexpr int kTitleHeight = kWidgetTitleHeight;
 constexpr int kDefaultWidgetWidth = 390;
 constexpr int kResizeGrip = 12;
 constexpr int kWheelScrollPixels = 84;
@@ -49,8 +48,7 @@ constexpr UINT kInteractionSaveDelayMilliseconds = 240;
 constexpr UINT_PTR kShellMutationCleanupTimerId = 7;
 constexpr UINT kShellMutationCleanupDelayMilliseconds = 500;
 constexpr unsigned int kMaximumShellMutationCleanupAttempts = 20;
-constexpr wchar_t kAlignmentGuideClassName[] = L"Lattice.AlignmentGuide";
-constexpr wchar_t kCurrentVersion[] = L"0.4.64";
+constexpr wchar_t kCurrentVersion[] = L"0.4.73";
 constexpr UINT kShellNewCommandFirst = 0x5000;
 constexpr UINT kShellNewCommandLast = 0x5FFF;
 
@@ -167,86 +165,7 @@ std::vector<HWND> CollectOtherWidgetWindows(HWND current) {
     return windows;
 }
 
-class AlignmentGuideOverlay {
-public:
-    static void Update(
-        HINSTANCE instance,
-        bool showVertical,
-        int verticalX,
-        int verticalTop,
-        int verticalBottom,
-        bool showHorizontal,
-        int horizontalY,
-        int horizontalLeft,
-        int horizontalRight) {
-        EnsureWindows(instance);
-        PositionLine(VerticalWindow(), showVertical, verticalX - 1, verticalTop, 2, std::max(1, verticalBottom - verticalTop));
-        PositionLine(HorizontalWindow(), showHorizontal, horizontalLeft, horizontalY - 1, std::max(1, horizontalRight - horizontalLeft), 2);
-    }
-
-    static void Hide() {
-        if (VerticalWindow() != nullptr) {
-            ShowWindow(VerticalWindow(), SW_HIDE);
-        }
-        if (HorizontalWindow() != nullptr) {
-            ShowWindow(HorizontalWindow(), SW_HIDE);
-        }
-    }
-
-private:
-    static HWND& VerticalWindow() {
-        static HWND window = nullptr;
-        return window;
-    }
-
-    static HWND& HorizontalWindow() {
-        static HWND window = nullptr;
-        return window;
-    }
-
-    static void EnsureWindows(HINSTANCE instance) {
-        WNDCLASSEXW existing{};
-        existing.cbSize = sizeof(existing);
-        if (!GetClassInfoExW(instance, kAlignmentGuideClassName, &existing)) {
-            WNDCLASSEXW windowClass{};
-            windowClass.cbSize = sizeof(windowClass);
-            windowClass.hInstance = instance;
-            windowClass.lpfnWndProc = DefWindowProcW;
-            windowClass.lpszClassName = kAlignmentGuideClassName;
-            windowClass.hbrBackground = CreateSolidBrush(RGB(63, 211, 241));
-            RegisterClassExW(&windowClass);
-        }
-        if (VerticalWindow() == nullptr) {
-            VerticalWindow() = CreateWindowExW(
-                WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-                kAlignmentGuideClassName, L"", WS_POPUP, 0, 0, 1, 1,
-                nullptr, nullptr, instance, nullptr);
-            if (VerticalWindow() != nullptr) {
-                SetLayeredWindowAttributes(VerticalWindow(), 0, 220, LWA_ALPHA);
-            }
-        }
-        if (HorizontalWindow() == nullptr) {
-            HorizontalWindow() = CreateWindowExW(
-                WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-                kAlignmentGuideClassName, L"", WS_POPUP, 0, 0, 1, 1,
-                nullptr, nullptr, instance, nullptr);
-            if (HorizontalWindow() != nullptr) {
-                SetLayeredWindowAttributes(HorizontalWindow(), 0, 220, LWA_ALPHA);
-            }
-        }
-    }
-
-    static void PositionLine(HWND window, bool show, int x, int y, int width, int height) {
-        if (window == nullptr) {
-            return;
-        }
-        if (!show) {
-            ShowWindow(window, SW_HIDE);
-            return;
-        }
-        SetWindowPos(window, HWND_TOPMOST, x, y, width, height, SWP_NOACTIVATE | SWP_SHOWWINDOW);
-    }
-};
+using AlignmentGuideOverlay = WidgetAlignmentGuideOverlay;
 
 bool IsShellMenuMessage(UINT message) {
     return message == WM_INITMENUPOPUP || message == WM_DRAWITEM || message == WM_MEASUREITEM || message == WM_MENUCHAR;
@@ -319,28 +238,6 @@ void ConfigureDeskGoWindowChrome(HWND hwnd) {
     DwmSetWindowAttribute(hwnd, DWMWA_REDIRECTIONBITMAP_ALPHA, &useRedirectionAlpha, sizeof(useRedirectionAlpha));
 }
 
-std::wstring Lowercase(std::wstring value) {
-    std::transform(value.begin(), value.end(), value.begin(), [](wchar_t character) {
-        return static_cast<wchar_t>(std::towlower(character));
-    });
-    return value;
-}
-
-std::wstring ItemExtension(const DesktopItem& item) {
-    return Lowercase(std::filesystem::path(item.path).extension().wstring());
-}
-
-ULONGLONG ItemModifiedTime(const DesktopItem& item) {
-    WIN32_FILE_ATTRIBUTE_DATA data{};
-    if (!GetFileAttributesExW(item.path.c_str(), GetFileExInfoStandard, &data)) {
-        return 0;
-    }
-    ULARGE_INTEGER value{};
-    value.HighPart = data.ftLastWriteTime.dwHighDateTime;
-    value.LowPart = data.ftLastWriteTime.dwLowDateTime;
-    return value.QuadPart;
-}
-
 bool SameDesktopItems(
     const std::vector<DesktopItem>& left,
     const std::vector<DesktopItem>& right) {
@@ -381,11 +278,17 @@ bool UseLightTheme(int theme) {
 
 }  // namespace
 
-WidgetWindow::WidgetWindow(HINSTANCE instance, HWND owner, std::wstring categoryId, int spawnOffset)
+WidgetWindow::WidgetWindow(
+    HINSTANCE instance,
+    HWND owner,
+    std::wstring categoryId,
+    int spawnOffset,
+    std::shared_ptr<const DesktopSnapshot> desktopSnapshot)
     : instance_(instance),
       owner_(owner),
       categoryId_(std::move(categoryId)),
-      spawnOffset_(spawnOffset) {
+      spawnOffset_(spawnOffset),
+      desktopSnapshot_(std::move(desktopSnapshot)) {
     LoadConfig();
 }
 
@@ -458,10 +361,13 @@ void WidgetWindow::Show(int showCommand) {
     if (hwnd_ == nullptr) {
         return;
     }
-    ShowWindow(hwnd_, showCommand);
-    if (showCommand != SW_HIDE) {
-        MaintainDesktopLayer();
+    if (showCommand == SW_HIDE) {
+        SetVisible(false);
+        return;
     }
+    RestoreVisibleResources();
+    ShowWindow(hwnd_, showCommand);
+    MaintainDesktopLayer();
     RedrawWindow(hwnd_, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_ERASE | RDW_FRAME);
 }
 
@@ -469,10 +375,36 @@ void WidgetWindow::SetVisible(bool visible) {
     if (hwnd_ == nullptr) {
         return;
     }
-    ShowWindow(hwnd_, visible ? SW_SHOWNOACTIVATE : SW_HIDE);
-    if (visible) {
-        MaintainDesktopLayer();
-        RedrawWindow(hwnd_, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_ERASE | RDW_FRAME);
+    if (!visible) {
+        ShowWindow(hwnd_, SW_HIDE);
+        ReleaseInvisibleResources();
+        return;
+    }
+    RestoreVisibleResources();
+    ShowWindow(hwnd_, SW_SHOWNOACTIVATE);
+    MaintainDesktopLayer();
+    RedrawWindow(hwnd_, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_ERASE | RDW_FRAME);
+}
+
+void WidgetWindow::ReleaseInvisibleResources() {
+    if (resourcesSuspended_) {
+        return;
+    }
+    KillTimer(hwnd_, kBackdropRefreshTimerId);
+    iconCache_.Clear();
+    wallpaperBackdrop_.Release();
+    d2d_.ReleaseTarget();
+    resourcesSuspended_ = true;
+}
+
+void WidgetWindow::RestoreVisibleResources() {
+    if (!resourcesSuspended_ || hwnd_ == nullptr || IsWindow(hwnd_) == FALSE) {
+        return;
+    }
+    resourcesSuspended_ = false;
+    d2d_.RecreateTarget(hwnd_);
+    if (d2d_.Target() != nullptr) {
+        RefreshWallpaperBackdrop();
     }
 }
 
@@ -558,6 +490,42 @@ void WidgetWindow::SetLocked(bool locked) {
     InvalidateRect(hwnd_, nullptr, FALSE);
 }
 
+bool WidgetWindow::ApplyLayout(
+    const WindowConfig& config,
+    bool visible) {
+    if (hwnd_ == nullptr || IsWindow(hwnd_) == FALSE) {
+        return false;
+    }
+    windowConfig_ = config;
+    const LONG_PTR extendedStyle = GetWindowLongPtrW(hwnd_, GWL_EXSTYLE);
+    if (((extendedStyle & WS_EX_LAYERED) != 0 &&
+         SetLayeredWindowAttributes(
+             hwnd_, 0, static_cast<BYTE>(windowConfig_.opacity),
+             LWA_ALPHA) == FALSE) ||
+        !SetWindowBoundsFromScreen(
+            windowConfig_.x,
+            windowConfig_.y,
+            windowConfig_.width,
+            windowConfig_.height,
+            SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED)) {
+        return false;
+    }
+    iconGrid_.SetIconSize(windowConfig_.iconSize);
+    iconGrid_.SetDensity(windowConfig_.density);
+    iconGrid_.SetListMode(windowConfig_.contentViewMode == 1);
+    iconGrid_.SetBounds(GridBounds());
+    if (visible) {
+        RestoreVisibleResources();
+        ShowWindow(hwnd_, SW_SHOWNOACTIVATE);
+        MaintainDesktopLayer();
+    } else {
+        ShowWindow(hwnd_, SW_HIDE);
+        ReleaseInvisibleResources();
+    }
+    InvalidateRect(hwnd_, nullptr, FALSE);
+    return true;
+}
+
 void WidgetWindow::Close() {
     if (hwnd_ != nullptr && IsWindow(hwnd_)) {
         DestroyWindow(hwnd_);
@@ -568,6 +536,19 @@ void WidgetWindow::Close() {
 void WidgetWindow::RefreshFromConfig() {
     if (hwnd_ != nullptr) {
         PostMessageW(hwnd_, kWidgetRefreshMessage, 0, 0);
+    }
+}
+
+void WidgetWindow::ApplySnapshot(
+    std::shared_ptr<const DesktopSnapshot> desktopSnapshot) {
+    if (desktopSnapshot_ == desktopSnapshot) {
+        return;
+    }
+    desktopSnapshot_ = std::move(desktopSnapshot);
+    LoadConfig();
+    LoadItems();
+    if (hwnd_ != nullptr && IsWindow(hwnd_) != FALSE) {
+        InvalidateRect(hwnd_, nullptr, FALSE);
     }
 }
 
@@ -678,12 +659,17 @@ LRESULT WidgetWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) 
             return 0;
 
         case WM_SIZE:
-            d2d_.Resize(LOWORD(lParam), HIWORD(lParam));
+            if (!resourcesSuspended_) {
+                d2d_.Resize(LOWORD(lParam), HIWORD(lParam));
+            }
             iconGrid_.SetBounds(GridBounds());
-            if (!wallpaperBackdrop_.CoversPixels(LOWORD(lParam), HIWORD(lParam))) {
+            if (!resourcesSuspended_ &&
+                !wallpaperBackdrop_.CoversPixels(LOWORD(lParam), HIWORD(lParam))) {
                 ScheduleWallpaperBackdropRefresh();
             }
-            InvalidateRect(hwnd_, nullptr, FALSE);
+            if (!resourcesSuspended_) {
+                InvalidateRect(hwnd_, nullptr, FALSE);
+            }
             return 0;
 
         case WM_MOVE:
@@ -720,10 +706,14 @@ LRESULT WidgetWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) 
             }
             windowConfig_.dpi = HIWORD(wParam);
             iconCache_.Clear();
-            d2d_.RecreateTarget(hwnd_);
-            RefreshWallpaperBackdrop();
+            if (!resourcesSuspended_) {
+                d2d_.RecreateTarget(hwnd_);
+                RefreshWallpaperBackdrop();
+            }
             iconGrid_.SetBounds(GridBounds());
-            InvalidateRect(hwnd_, nullptr, FALSE);
+            if (!resourcesSuspended_) {
+                InvalidateRect(hwnd_, nullptr, FALSE);
+            }
             return 0;
         }
 
@@ -1212,6 +1202,7 @@ LRESULT WidgetWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) 
             KillTimer(hwnd_, kBackdropRefreshTimerId);
             KillTimer(hwnd_, kInteractionSaveTimerId);
             KillTimer(hwnd_, kShellMutationCleanupTimerId);
+            ReleaseInvisibleResources();
             if (shellDropTargetRegistered_) {
                 UnregisterShellDropTarget(hwnd_);
                 shellDropTargetRegistered_ = false;
@@ -1302,15 +1293,6 @@ void WidgetWindow::LoadItems() {
     ++loadItemsGeneration_;
     const AppConfig appConfig = configStore_.LoadAppConfig();
     registeredItems_ = appConfig.items;
-    DesktopScanner scanner;
-    items_ = scanner.Scan(appConfig.settings.showPublicDesktopItems);
-    for (const ItemConfig& registered : appConfig.items) {
-        scanner.MergeRegisteredItem(
-            items_,
-            registered.id,
-            registered.path,
-            registered.displayName);
-    }
     iconGrid_.SetIconSize(windowConfig_.iconSize);
     iconGrid_.SetDensity(windowConfig_.density);
     iconGrid_.SetCompactStyle(true);
@@ -1323,8 +1305,9 @@ void WidgetWindow::LoadItems() {
 }
 
 void WidgetWindow::RefreshCurrentItems() {
-    std::vector<DesktopItem> nextItems;
-    const AppConfig appConfig = configStore_.LoadAppConfig();
+    std::vector<DesktopItem> nextItems = desktopSnapshot_ == nullptr
+        ? std::vector<DesktopItem>{}
+        : desktopSnapshot_->CopyItemsForCategory(categoryId_);
     const auto applyItems = [&]() {
         const bool changed = !SameDesktopItems(currentItems_, nextItems);
         currentItems_ = std::move(nextItems);
@@ -1333,74 +1316,7 @@ void WidgetWindow::RefreshCurrentItems() {
         }
         PruneSelectionToCurrentItems();
     };
-    if (categoryId_ == kUncategorizedCategoryId) {
-        for (const std::wstring& itemId : appConfig.uncategorizedItemIds) {
-            const auto found = std::find_if(items_.begin(), items_.end(), [&](const DesktopItem& item) {
-                return item.id == itemId;
-            });
-            if (found != items_.end()) {
-                nextItems.push_back(*found);
-            }
-        }
-        const int effectiveSortMode = windowConfig_.autoArrange && windowConfig_.sortMode == 0
-            ? 1
-            : windowConfig_.sortMode;
-        if (effectiveSortMode != 0) {
-            std::stable_sort(nextItems.begin(), nextItems.end(), [&](const DesktopItem& left, const DesktopItem& right) {
-                if (effectiveSortMode == 2) {
-                    const std::wstring leftExtension = ItemExtension(left);
-                    const std::wstring rightExtension = ItemExtension(right);
-                    if (leftExtension != rightExtension) {
-                        return leftExtension < rightExtension;
-                    }
-                } else if (effectiveSortMode == 3) {
-                    const ULONGLONG leftTime = ItemModifiedTime(left);
-                    const ULONGLONG rightTime = ItemModifiedTime(right);
-                    if (leftTime != rightTime) {
-                        return leftTime > rightTime;
-                    }
-                }
-                return Lowercase(left.displayName) < Lowercase(right.displayName);
-            });
-        }
-        applyItems();
-        return;
-    }
-    for (const CategoryConfig& category : appConfig.categories) {
-        if (category.id != categoryId_) {
-            continue;
-        }
-        for (const std::wstring& itemId : category.itemIds) {
-            const auto found = std::find_if(items_.begin(), items_.end(), [&](const DesktopItem& item) {
-                return item.id == itemId;
-            });
-            if (found != items_.end()) {
-                nextItems.push_back(*found);
-            }
-        }
-        break;
-    }
-    const int effectiveSortMode = windowConfig_.autoArrange && windowConfig_.sortMode == 0
-        ? 1
-        : windowConfig_.sortMode;
-    if (effectiveSortMode != 0) {
-        std::stable_sort(nextItems.begin(), nextItems.end(), [&](const DesktopItem& left, const DesktopItem& right) {
-            if (effectiveSortMode == 2) {
-                const std::wstring leftExtension = ItemExtension(left);
-                const std::wstring rightExtension = ItemExtension(right);
-                if (leftExtension != rightExtension) {
-                    return leftExtension < rightExtension;
-                }
-            } else if (effectiveSortMode == 3) {
-                const ULONGLONG leftTime = ItemModifiedTime(left);
-                const ULONGLONG rightTime = ItemModifiedTime(right);
-                if (leftTime != rightTime) {
-                    return leftTime > rightTime;
-                }
-            }
-            return Lowercase(left.displayName) < Lowercase(right.displayName);
-        });
-    }
+    SortDesktopItemsForWindow(nextItems, windowConfig_);
     applyItems();
 }
 
@@ -1685,16 +1601,8 @@ bool WidgetWindow::QueueNextDesktopCollectionItem() {
                 static_cast<int>(desktopCollectionCommittedCount_)));
         request.showError = pendingShellDropShowError_;
         request.sourceWindow = hwnd_;
-        const auto visibleItem = std::find_if(
-            items_.begin(),
-            items_.end(),
-            [&](const DesktopItem& value) {
-                return CompareStringOrdinal(
-                           value.path.c_str(), -1,
-                           path.c_str(), -1,
-                           TRUE) == CSTR_EQUAL;
-            });
-        if (visibleItem != items_.end()) {
+        const DesktopItem* visibleItem = FindItemByPath(path);
+        if (visibleItem != nullptr) {
             request.sourceVisibleId = visibleItem->id;
         }
         const auto desktopPosition = std::find_if(
@@ -1766,9 +1674,7 @@ void WidgetWindow::HandleDesktopCollectionResult(
                     }),
                 values.end());
         };
-        eraseMatching(items_);
         eraseMatching(shellDropCommittedItems_);
-        items_.push_back(committedItem);
         const size_t insertionIndex = (std::min)(
             static_cast<size_t>(std::max(0, desktopCollectionBaseInsertionIndex_)) +
                 desktopCollectionCommittedCount_,
@@ -2001,18 +1907,8 @@ bool WidgetWindow::AddDroppedPaths(
 
         DesktopItem probedItem = scanner.CreateItemFromPath(path, false);
         const std::wstring sourceDerivedId = probedItem.id;
-        const auto visibleSource = std::find_if(
-            items_.begin(),
-            items_.end(),
-            [&](const DesktopItem& value) {
-                return CompareStringOrdinal(
-                           value.path.c_str(),
-                           -1,
-                           path.c_str(),
-                           -1,
-                           TRUE) == CSTR_EQUAL;
-            });
-        DesktopItem item = visibleSource != items_.end()
+        const DesktopItem* visibleSource = FindItemByPath(path);
+        DesktopItem item = visibleSource != nullptr
             ? *visibleSource
             : std::move(probedItem);
         const std::wstring sourceVisibleId = item.id;
@@ -2261,39 +2157,40 @@ bool WidgetWindow::AddDroppedPaths(
             !registered->displayName.empty()) {
             movedItem.displayName = registered->displayName;
         }
-        items_.erase(
-            std::remove_if(
-                items_.begin(),
-                items_.end(),
-                [&](const DesktopItem& value) {
-                    return value.id == item.id ||
-                           CompareStringOrdinal(
-                               value.path.c_str(),
-                               -1,
-                               sourcePath.c_str(),
-                               -1,
-                               TRUE) == CSTR_EQUAL;
-                }),
-            items_.end());
-        items_.push_back(movedItem);
         movedItems.push_back(std::move(movedItem));
     }
 
     if (!movedItems.empty()) {
         windowConfig_.autoArrange = false;
         windowConfig_.sortMode = 0;
+        std::vector<DesktopItem> availableItems = currentItems_;
+        for (const DesktopItem& movedItem : movedItems) {
+            availableItems.erase(
+                std::remove_if(
+                    availableItems.begin(),
+                    availableItems.end(),
+                    [&](const DesktopItem& value) {
+                        return value.id == movedItem.id ||
+                               CompareStringOrdinal(
+                                   value.path.c_str(), -1,
+                                   movedItem.path.c_str(), -1,
+                                   TRUE) == CSTR_EQUAL;
+                    }),
+                availableItems.end());
+            availableItems.push_back(movedItem);
+        }
         currentItems_.clear();
         const std::vector<std::wstring>* finalItemIds =
             targetItemIds(appConfig);
         if (finalItemIds != nullptr) {
             for (const std::wstring& itemId : *finalItemIds) {
                 const auto found = std::find_if(
-                    items_.begin(),
-                    items_.end(),
+                    availableItems.begin(),
+                    availableItems.end(),
                     [&](const DesktopItem& value) {
                         return value.id == itemId;
                     });
-                if (found != items_.end()) {
+                if (found != availableItems.end()) {
                     currentItems_.push_back(*found);
                 }
             }
@@ -2397,6 +2294,12 @@ void WidgetWindow::ToggleCollapsed() {
         windowConfig_.width,
         windowConfig_.height,
         SWP_NOZORDER);
+    if (!resourcesSuspended_) {
+        if (windowConfig_.collapsed) {
+            iconCache_.Clear();
+        }
+        ScheduleWallpaperBackdropRefresh();
+    }
     if (expanding) {
         PlaceAboveSiblingWidgets();
     }
@@ -2458,186 +2361,17 @@ void WidgetWindow::OpenCategoryLocation() {
 }
 
 void WidgetWindow::ApplyMovingSnap(RECT& movingRect) const {
-    const int width = movingRect.right - movingRect.left;
-    const int height = movingRect.bottom - movingRect.top;
-    const int alignmentThreshold = DipToPixels(4);
-    const int adjacencyThreshold = DipToPixels(2);
-    int bestX = movingRect.left;
-    int bestY = movingRect.top;
-    int bestDx = alignmentThreshold + 1;
-    int bestDy = alignmentThreshold + 1;
-    int bestGuideX = 0;
-    int bestGuideXTop = 0;
-    int bestGuideXBottom = 0;
-    int bestGuideY = 0;
-    int bestGuideYLeft = 0;
-    int bestGuideYRight = 0;
-
-    const auto considerX = [&](int candidate, int guideX, int guideTop, int guideBottom, int threshold) {
-        const int delta = std::abs(candidate - movingRect.left);
-        if (delta < bestDx && delta <= threshold) {
-            bestDx = delta;
-            bestX = candidate;
-            bestGuideX = guideX;
-            bestGuideXTop = guideTop;
-            bestGuideXBottom = guideBottom;
-        }
-    };
-    const auto considerY = [&](int candidate, int guideY, int guideLeft, int guideRight, int threshold) {
-        const int delta = std::abs(candidate - movingRect.top);
-        if (delta < bestDy && delta <= threshold) {
-            bestDy = delta;
-            bestY = candidate;
-            bestGuideY = guideY;
-            bestGuideYLeft = guideLeft;
-            bestGuideYRight = guideRight;
-        }
-    };
-
-    HMONITOR monitor = MonitorFromRect(&movingRect, MONITOR_DEFAULTTONEAREST);
-    MONITORINFO monitorInfo{};
-    monitorInfo.cbSize = sizeof(monitorInfo);
-    if (GetMonitorInfoW(monitor, &monitorInfo)) {
-        considerX(monitorInfo.rcWork.left, monitorInfo.rcWork.left, monitorInfo.rcWork.top, monitorInfo.rcWork.bottom, alignmentThreshold);
-        considerX(monitorInfo.rcWork.right - width, monitorInfo.rcWork.right, monitorInfo.rcWork.top, monitorInfo.rcWork.bottom, alignmentThreshold);
-        considerY(monitorInfo.rcWork.top, monitorInfo.rcWork.top, monitorInfo.rcWork.left, monitorInfo.rcWork.right, alignmentThreshold);
-        considerY(monitorInfo.rcWork.bottom - height, monitorInfo.rcWork.bottom, monitorInfo.rcWork.left, monitorInfo.rcWork.right, alignmentThreshold);
-    }
-
-    const std::vector<RECT> otherRectangles =
-        CollectOtherWidgetRectangles(hwnd_);
-    for (const RECT& other : otherRectangles) {
-        const int guideTop = std::min(movingRect.top, other.top);
-        const int guideBottom = std::max(movingRect.bottom, other.bottom);
-        const int guideLeft = std::min(movingRect.left, other.left);
-        const int guideRight = std::max(movingRect.right, other.right);
-        considerX(other.left, other.left, guideTop, guideBottom, alignmentThreshold);
-        considerX(other.right - width, other.right, guideTop, guideBottom, alignmentThreshold);
-        considerX(other.left - width, other.left, guideTop, guideBottom, adjacencyThreshold);
-        considerX(other.right, other.right, guideTop, guideBottom, adjacencyThreshold);
-        considerX((other.left + other.right - width) / 2, (other.left + other.right) / 2, guideTop, guideBottom, alignmentThreshold);
-        considerY(other.top, other.top, guideLeft, guideRight, alignmentThreshold);
-        considerY(other.bottom - height, other.bottom, guideLeft, guideRight, alignmentThreshold);
-        considerY(other.top - height, other.top, guideLeft, guideRight, adjacencyThreshold);
-        considerY(other.bottom, other.bottom, guideLeft, guideRight, adjacencyThreshold);
-        considerY((other.top + other.bottom - height) / 2, (other.top + other.bottom) / 2, guideLeft, guideRight, alignmentThreshold);
-    }
-
-    movingRect.left = bestX;
-    movingRect.top = bestY;
-    movingRect.right = bestX + width;
-    movingRect.bottom = bestY + height;
-    AlignmentGuideOverlay::Update(
-        instance_,
-        bestDx <= alignmentThreshold,
-        bestGuideX,
-        bestGuideXTop,
-        bestGuideXBottom,
-        bestDy <= alignmentThreshold,
-        bestGuideY,
-        bestGuideYLeft,
-        bestGuideYRight);
+    const WidgetAlignmentGuides guides = SnapMovingWidget(
+        movingRect, static_cast<int>(WindowDpi()),
+        CollectOtherWidgetRectangles(hwnd_));
+    AlignmentGuideOverlay::Update(instance_, guides);
 }
 
 void WidgetWindow::ApplySizingSnap(RECT& sizingRect, WPARAM sizingEdge) const {
-    const int threshold = DipToPixels(4);
-    const int minimumWidth = DipToPixels(260);
-    const int minimumHeight = DipToPixels(120);
-    const bool resizeLeft = sizingEdge == WMSZ_LEFT || sizingEdge == WMSZ_TOPLEFT || sizingEdge == WMSZ_BOTTOMLEFT;
-    const bool resizeRight = sizingEdge == WMSZ_RIGHT || sizingEdge == WMSZ_TOPRIGHT || sizingEdge == WMSZ_BOTTOMRIGHT;
-    const bool resizeTop = sizingEdge == WMSZ_TOP || sizingEdge == WMSZ_TOPLEFT || sizingEdge == WMSZ_TOPRIGHT;
-    const bool resizeBottom = sizingEdge == WMSZ_BOTTOM || sizingEdge == WMSZ_BOTTOMLEFT || sizingEdge == WMSZ_BOTTOMRIGHT;
-    int bestDx = threshold + 1;
-    int bestDy = threshold + 1;
-    int bestEdgeX = 0;
-    int bestEdgeY = 0;
-    int bestGuideXTop = 0;
-    int bestGuideXBottom = 0;
-    int bestGuideYLeft = 0;
-    int bestGuideYRight = 0;
-
-    const auto considerX = [&](int candidate, int guideTop, int guideBottom) {
-        const int current = resizeLeft ? sizingRect.left : sizingRect.right;
-        const int delta = std::abs(candidate - current);
-        const bool keepsMinimum = resizeLeft
-            ? sizingRect.right - candidate >= minimumWidth
-            : candidate - sizingRect.left >= minimumWidth;
-        if (keepsMinimum && delta < bestDx && delta <= threshold) {
-            bestDx = delta;
-            bestEdgeX = candidate;
-            bestGuideXTop = guideTop;
-            bestGuideXBottom = guideBottom;
-        }
-    };
-    const auto considerY = [&](int candidate, int guideLeft, int guideRight) {
-        const int current = resizeTop ? sizingRect.top : sizingRect.bottom;
-        const int delta = std::abs(candidate - current);
-        const bool keepsMinimum = resizeTop
-            ? sizingRect.bottom - candidate >= minimumHeight
-            : candidate - sizingRect.top >= minimumHeight;
-        if (keepsMinimum && delta < bestDy && delta <= threshold) {
-            bestDy = delta;
-            bestEdgeY = candidate;
-            bestGuideYLeft = guideLeft;
-            bestGuideYRight = guideRight;
-        }
-    };
-
-    HMONITOR monitor = MonitorFromRect(&sizingRect, MONITOR_DEFAULTTONEAREST);
-    MONITORINFO monitorInfo{};
-    monitorInfo.cbSize = sizeof(monitorInfo);
-    if (GetMonitorInfoW(monitor, &monitorInfo)) {
-        if (resizeLeft || resizeRight) {
-            considerX(monitorInfo.rcWork.left, monitorInfo.rcWork.top, monitorInfo.rcWork.bottom);
-            considerX(monitorInfo.rcWork.right, monitorInfo.rcWork.top, monitorInfo.rcWork.bottom);
-        }
-        if (resizeTop || resizeBottom) {
-            considerY(monitorInfo.rcWork.top, monitorInfo.rcWork.left, monitorInfo.rcWork.right);
-            considerY(monitorInfo.rcWork.bottom, monitorInfo.rcWork.left, monitorInfo.rcWork.right);
-        }
-    }
-
-    const std::vector<RECT> otherRectangles =
-        CollectOtherWidgetRectangles(hwnd_);
-    for (const RECT& other : otherRectangles) {
-        if (resizeLeft || resizeRight) {
-            const int guideTop = std::min(sizingRect.top, other.top);
-            const int guideBottom = std::max(sizingRect.bottom, other.bottom);
-            considerX(other.left, guideTop, guideBottom);
-            considerX(other.right, guideTop, guideBottom);
-        }
-        if (resizeTop || resizeBottom) {
-            const int guideLeft = std::min(sizingRect.left, other.left);
-            const int guideRight = std::max(sizingRect.right, other.right);
-            considerY(other.top, guideLeft, guideRight);
-            considerY(other.bottom, guideLeft, guideRight);
-        }
-    }
-
-    if (bestDx <= threshold) {
-        if (resizeLeft) {
-            sizingRect.left = bestEdgeX;
-        } else if (resizeRight) {
-            sizingRect.right = bestEdgeX;
-        }
-    }
-    if (bestDy <= threshold) {
-        if (resizeTop) {
-            sizingRect.top = bestEdgeY;
-        } else if (resizeBottom) {
-            sizingRect.bottom = bestEdgeY;
-        }
-    }
-    AlignmentGuideOverlay::Update(
-        instance_,
-        bestDx <= threshold,
-        bestEdgeX,
-        bestGuideXTop,
-        bestGuideXBottom,
-        bestDy <= threshold,
-        bestEdgeY,
-        bestGuideYLeft,
-        bestGuideYRight);
+    const WidgetAlignmentGuides guides = SnapSizingWidget(
+        sizingRect, sizingEdge, static_cast<int>(WindowDpi()),
+        CollectOtherWidgetRectangles(hwnd_));
+    AlignmentGuideOverlay::Update(instance_, guides);
 }
 
 void WidgetWindow::OpenDataLocation() {
@@ -4081,11 +3815,48 @@ void WidgetWindow::ReorderSelectedItems(size_t insertionIndex) {
     InvalidateRect(hwnd_, nullptr, FALSE);
 }
 
-DesktopItem* WidgetWindow::FindItem(const std::wstring& itemId) {
-    for (DesktopItem& item : items_) {
+const DesktopItem* WidgetWindow::FindItem(const std::wstring& itemId) const {
+    for (const DesktopItem& item : currentItems_) {
         if (item.id == itemId) {
             return &item;
         }
+    }
+    for (const DesktopItem& item : shellDropProjectedItems_) {
+        if (item.id == itemId) {
+            return &item;
+        }
+    }
+    return desktopSnapshot_ == nullptr
+        ? nullptr
+        : desktopSnapshot_->FindUniqueById(itemId);
+}
+
+const DesktopItem* WidgetWindow::FindItemByPath(
+    const std::wstring& path) const {
+    const auto findIn = [&](const std::vector<DesktopItem>& items)
+        -> const DesktopItem* {
+        const auto found = std::find_if(
+            items.begin(), items.end(), [&](const DesktopItem& item) {
+                return CompareStringOrdinal(
+                           item.path.c_str(), -1,
+                           path.c_str(), -1,
+                           TRUE) == CSTR_EQUAL;
+            });
+        return found == items.end() ? nullptr : &*found;
+    };
+    if (const DesktopItem* current = findIn(currentItems_); current != nullptr) {
+        return current;
+    }
+    if (desktopSnapshot_ != nullptr) {
+        if (const DesktopItem* snapshotItem =
+                desktopSnapshot_->FindUniqueByPath(path);
+            snapshotItem != nullptr) {
+            return snapshotItem;
+        }
+    }
+    if (const DesktopItem* projected = findIn(shellDropProjectedItems_);
+        projected != nullptr) {
+        return projected;
     }
     return nullptr;
 }
@@ -4230,7 +4001,7 @@ void WidgetWindow::RenameSelectedItem() {
     if (selectedIds.size() != 1) {
         return;
     }
-    DesktopItem* item = FindItem(selectedIds.front());
+    const DesktopItem* item = FindItem(selectedIds.front());
     if (item == nullptr) {
         return;
     }
@@ -4567,11 +4338,6 @@ bool WidgetWindow::MoveItemOut(
                     kDesktopPlacementRequestMessage,
                     0,
                     reinterpret_cast<LPARAM>(&request)) != 0) {
-                items_.erase(
-                    std::remove_if(items_.begin(), items_.end(), [&](const DesktopItem& value) {
-                        return value.id == itemId;
-                    }),
-                    items_.end());
                 currentItems_.erase(
                     std::remove_if(currentItems_.begin(), currentItems_.end(), [&](const DesktopItem& value) {
                         return value.id == itemId;
@@ -4701,12 +4467,13 @@ bool WidgetWindow::MoveItemOut(
         DragGhostWindow::Instance().EndIfGeneration(dragGhostGeneration);
     }
     if (dropScreenPoint != nullptr) {
-        items_.erase(
-            std::remove_if(items_.begin(), items_.end(), [&](const DesktopItem& value) {
-                return value.id == itemId;
-            }),
-            items_.end());
-        RefreshCurrentItems();
+        currentItems_.erase(
+            std::remove_if(
+                currentItems_.begin(), currentItems_.end(),
+                [&](const DesktopItem& value) { return value.id == itemId; }),
+            currentItems_.end());
+        iconGrid_.SetItems(currentItems_);
+        PruneSelectionToCurrentItems();
     } else {
         LoadItems();
     }
@@ -4718,22 +4485,25 @@ bool WidgetWindow::MoveItemOut(
 }
 
 void WidgetWindow::RefreshWallpaperBackdrop() {
-    if (hwnd_ == nullptr || d2d_.Target() == nullptr) {
+    if (resourcesSuspended_ || hwnd_ == nullptr || d2d_.Target() == nullptr) {
         return;
     }
-    const int minimumHeight = windowConfig_.collapsed
-        ? (std::max)(windowConfig_.normalHeight, windowConfig_.height)
-        : windowConfig_.height;
+    RECT client{};
+    if (GetClientRect(hwnd_, &client) == FALSE) {
+        return;
+    }
+    const int minimumWidth = (std::max)(0L, client.right - client.left);
+    const int minimumHeight = (std::max)(0L, client.bottom - client.top);
     wallpaperBackdrop_.Refresh(
         hwnd_,
         d2d_.Target(),
-        windowConfig_.width,
+        minimumWidth,
         minimumHeight);
     InvalidateRect(hwnd_, nullptr, FALSE);
 }
 
 void WidgetWindow::ScheduleWallpaperBackdropRefresh() {
-    if (hwnd_ != nullptr) {
+    if (!resourcesSuspended_ && hwnd_ != nullptr) {
         SetTimer(hwnd_, kBackdropRefreshTimerId, kBackdropRefreshDelayMilliseconds, nullptr);
     }
 }
@@ -4741,6 +4511,10 @@ void WidgetWindow::ScheduleWallpaperBackdropRefresh() {
 void WidgetWindow::Render() {
     PAINTSTRUCT paint{};
     BeginPaint(hwnd_, &paint);
+    if (resourcesSuspended_) {
+        EndPaint(hwnd_, &paint);
+        return;
+    }
     if (d2d_.Target() == nullptr) {
         d2d_.RecreateTarget(hwnd_);
     }
@@ -4749,225 +4523,40 @@ void WidgetWindow::Render() {
     ID2D1HwndRenderTarget* target = d2d_.Target();
     if (target != nullptr) {
         target->Clear(D2D1::ColorF(0x061E24, 1.0f));
-        Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> backgroundTintBrush;
-        Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> borderBrush;
-        Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> iconBrush;
-        Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> textBrush;
-        Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> titleShadowBrush;
-        Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> headerHoverBrush;
-        Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> headerPressedBrush;
-        const bool lightTheme = UseLightTheme(theme_);
-        target->CreateSolidColorBrush(
-            D2D1::ColorF(lightTheme ? 0xDDEFF3 : 0x082A32, lightTheme ? 0.34f : 0.68f),
-            backgroundTintBrush.GetAddressOf());
-        target->CreateSolidColorBrush(
-            D2D1::ColorF(lightTheme ? 0x4C90A3 : 0x2E829D, lightTheme ? 0.32f : 0.18f),
-            borderBrush.GetAddressOf());
-        target->CreateSolidColorBrush(
-            D2D1::ColorF(lightTheme ? 0x15303B : 0xFFFFFF, 1.0f), textBrush.GetAddressOf());
-        target->CreateSolidColorBrush(
-            D2D1::ColorF(lightTheme ? 0x15303B : 0xDAE0E2, 1.0f), iconBrush.GetAddressOf());
-        target->CreateSolidColorBrush(
-            D2D1::ColorF(lightTheme ? 0x15303B : 0x000000, lightTheme ? 0.18f : 0.72f), titleShadowBrush.GetAddressOf());
-        target->CreateSolidColorBrush(
-            D2D1::ColorF(lightTheme ? 0x79CBE2 : 0xBCEEFF, lightTheme ? 0.24f : 0.28f), headerHoverBrush.GetAddressOf());
-        target->CreateSolidColorBrush(
-            D2D1::ColorF(lightTheme ? 0x4AAFCB : 0x8ADDF6, lightTheme ? 0.38f : 0.42f), headerPressedBrush.GetAddressOf());
-
         const D2D1_SIZE_F size = target->GetSize();
+        const D2D1_SIZE_U targetPixels = target->GetPixelSize();
+        const WallpaperBackdropDrawMode wallpaperDrawMode =
+            wallpaperBackdrop_.CoversPixels(
+                static_cast<int>(targetPixels.width),
+                static_cast<int>(targetPixels.height))
+            ? kWallpaperDrawMode
+            : WallpaperBackdropDrawMode::StretchToDestination;
         wallpaperBackdrop_.Draw(
             target,
             D2D1::RectF(0.0f, 0.0f, size.width, size.height),
-            kWallpaperDrawMode);
-        if (backgroundTintBrush != nullptr) {
-            target->FillRectangle(D2D1::RectF(0.0f, 0.0f, size.width, size.height), backgroundTintBrush.Get());
-        }
-        target->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
-        target->SetAntialiasMode(D2D1_ANTIALIAS_MODE_ALIASED);
-        target->DrawLine(D2D1::Point2F(0.5f, 0.0f), D2D1::Point2F(0.5f, size.height), borderBrush.Get(), 1.0f);
-        target->DrawLine(D2D1::Point2F(size.width - 0.5f, 0.0f), D2D1::Point2F(size.width - 0.5f, size.height), borderBrush.Get(), 1.0f);
-        target->DrawLine(D2D1::Point2F(0.0f, 0.5f), D2D1::Point2F(size.width, 0.5f), borderBrush.Get(), 1.0f);
-        target->SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+            wallpaperDrawMode);
 
-        const auto drawHeaderHover = [&](int button, const D2D1_RECT_F& rect) {
-            ID2D1SolidColorBrush* stateBrush = nullptr;
-            if (pressedHeaderButton_ == button && hoverHeaderButton_ == button) {
-                stateBrush = headerPressedBrush.Get();
-            } else if (hoverHeaderButton_ == button) {
-                stateBrush = headerHoverBrush.Get();
-            }
-            if (stateBrush != nullptr) {
-                target->FillRoundedRectangle(D2D1::RoundedRect(rect, 1.5f, 1.5f), stateBrush);
-            }
-        };
-        const bool showHeaderControls = headerHovered_ || pressedHeaderButton_ >= 0;
-        if (showHeaderControls) {
-            drawHeaderHover(1, D2D1::RectF(0.0f, 7.5f + kHeaderControlOffsetY, 24.0f, 31.5f + kHeaderControlOffsetY));
-            drawHeaderHover(2, D2D1::RectF(24.0f, 7.5f + kHeaderControlOffsetY, 48.0f, 31.5f + kHeaderControlOffsetY));
-            drawHeaderHover(3, D2D1::RectF(size.width - 97.0f, 7.5f + kHeaderControlOffsetY, size.width - 73.0f, 31.5f + kHeaderControlOffsetY));
-            drawHeaderHover(4, D2D1::RectF(size.width - 75.0f, 7.5f + kHeaderControlOffsetY, size.width - 51.0f, 31.5f + kHeaderControlOffsetY));
-            drawHeaderHover(5, D2D1::RectF(size.width - 52.0f, 7.5f + kHeaderControlOffsetY, size.width - 28.0f, 31.5f + kHeaderControlOffsetY));
-            drawHeaderHover(6, D2D1::RectF(size.width - 29.0f, 7.5f + kHeaderControlOffsetY, size.width - 5.0f, 31.5f + kHeaderControlOffsetY));
-        }
-
-        Microsoft::WRL::ComPtr<IDWriteTextFormat> titleFormat;
-        d2d_.WriteFactory()->CreateTextFormat(
-            L"Microsoft YaHei UI", nullptr, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
-            DWRITE_FONT_STRETCH_NORMAL, 12.0f, L"zh-cn", titleFormat.GetAddressOf());
-        if (titleFormat != nullptr) {
-            titleFormat->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-            titleFormat->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-            const D2D1_RECT_F titleRect = D2D1::RectF(0.0f, 0.0f, size.width, static_cast<FLOAT>(kTitleHeight));
-            if (titleShadowBrush != nullptr) {
-                target->DrawTextW(
-                    categoryName_.c_str(),
-                    static_cast<UINT32>(categoryName_.size()),
-                    titleFormat.Get(),
-                    D2D1::RectF(titleRect.left + 0.7f, titleRect.top + 1.1f, titleRect.right + 0.7f, titleRect.bottom + 1.1f),
-                    titleShadowBrush.Get());
-            }
-            target->DrawTextW(categoryName_.c_str(), static_cast<UINT32>(categoryName_.size()), titleFormat.Get(), titleRect, textBrush.Get());
-        }
-
-        if (showHeaderControls) {
-        const FLOAT stroke = 2.0f / 3.0f;
-        auto lineWithWidth = [&](FLOAT x1, FLOAT y1, FLOAT x2, FLOAT y2, FLOAT width) {
-            target->DrawLine(D2D1::Point2F(x1, y1), D2D1::Point2F(x2, y2), iconBrush.Get(), width);
-        };
-        auto line = [&](FLOAT x1, FLOAT y1, FLOAT x2, FLOAT y2) {
-            lineWithWidth(x1, y1, x2, y2, stroke);
-        };
-        if (windowConfig_.collapsed) {
-            line(7.0f, 16.35f + kHeaderControlOffsetY, 12.0f, 21.2f + kHeaderControlOffsetY);
-            line(12.0f, 21.2f + kHeaderControlOffsetY, 17.0f, 16.35f + kHeaderControlOffsetY);
-        } else {
-            line(7.0f, 21.2f + kHeaderControlOffsetY, 12.0f, 16.35f + kHeaderControlOffsetY);
-            line(12.0f, 16.35f + kHeaderControlOffsetY, 17.0f, 21.2f + kHeaderControlOffsetY);
-        }
-
-        target->DrawRoundedRectangle(
-            D2D1::RoundedRect(D2D1::RectF(31.25f, 18.5f + kHeaderControlOffsetY, 40.75f, 24.5f + kHeaderControlOffsetY), 0.8f, 0.8f),
-            iconBrush.Get(),
-            0.8f);
-        if (windowConfig_.locked) {
-            lineWithWidth(32.75f, 18.5f + kHeaderControlOffsetY, 32.75f, 16.2f + kHeaderControlOffsetY, 0.8f);
-            lineWithWidth(32.75f, 16.2f + kHeaderControlOffsetY, 34.35f, 14.4f + kHeaderControlOffsetY, 0.8f);
-            lineWithWidth(34.35f, 14.4f + kHeaderControlOffsetY, 37.75f, 14.4f + kHeaderControlOffsetY, 0.8f);
-            lineWithWidth(37.75f, 14.4f + kHeaderControlOffsetY, 39.25f, 16.2f + kHeaderControlOffsetY, 0.8f);
-            lineWithWidth(39.25f, 16.2f + kHeaderControlOffsetY, 39.25f, 18.5f + kHeaderControlOffsetY, 0.8f);
-        } else {
-            lineWithWidth(34.75f, 18.5f + kHeaderControlOffsetY, 34.75f, 16.25f + kHeaderControlOffsetY, 0.8f);
-            lineWithWidth(34.75f, 16.25f + kHeaderControlOffsetY, 36.15f, 14.55f + kHeaderControlOffsetY, 0.8f);
-            lineWithWidth(36.15f, 14.55f + kHeaderControlOffsetY, 39.05f, 14.55f + kHeaderControlOffsetY, 0.8f);
-            lineWithWidth(39.05f, 14.55f + kHeaderControlOffsetY, 40.65f, 16.1f + kHeaderControlOffsetY, 0.8f);
-        }
-
-        const FLOAT rightY = 20.0f + kHeaderControlOffsetY;
-        const FLOAT actionLeft = size.width - 97.5f;
-        const FLOAT actionTop = 7.8333f + kHeaderControlOffsetY;
-        constexpr FLOAT actionCenterX = 12.20f;
-        constexpr FLOAT actionCenterY = 11.575f;
-        constexpr FLOAT actionScale = 0.84f;
-        const auto actionX = [&](FLOAT value) { return actionLeft + actionCenterX + (value - actionCenterX) * actionScale; };
-        const auto actionY = [&](FLOAT value) { return actionTop + actionCenterY + (value - actionCenterY) * actionScale; };
-        const auto actionLine = [&](FLOAT x1, FLOAT y1, FLOAT x2, FLOAT y2) {
-            lineWithWidth(actionX(x1), actionY(y1), actionX(x2), actionY(y2), 0.8f);
-        };
-        actionLine(13.77f, 5.86f, 7.49f, 5.86f);
-        actionLine(7.49f, 5.86f, 6.86f, 6.49f);
-        actionLine(6.86f, 6.49f, 6.86f, 16.66f);
-        actionLine(6.86f, 16.66f, 7.49f, 17.29f);
-        actionLine(7.49f, 17.29f, 16.29f, 17.29f);
-        actionLine(16.29f, 17.29f, 16.91f, 16.66f);
-        actionLine(16.91f, 16.66f, 16.91f, 10.89f);
-        actionLine(8.74f, 13.40f, 12.51f, 13.40f);
-        actionLine(17.54f, 6.49f, 13.77f, 10.26f);
-
-        const FLOAT listX = size.width - 62.5f;
-        for (int row = 0; row < 3; ++row) {
-            const FLOAT top = 14.6667f + kHeaderControlOffsetY + static_cast<FLOAT>(row) * 4.0f;
-            target->DrawRectangle(D2D1::RectF(listX - 5.5f, top, listX - 2.5f, top + 2.0f), iconBrush.Get(), 0.8f);
-            lineWithWidth(listX + 0.5f, top + 1.0f, listX + 4.5f, top + 1.0f, 0.8f);
-        }
-
-        const FLOAT filterX = size.width - 40.0f;
-        line(filterX - 5.5f, rightY - 5.0f, filterX + 5.5f, rightY - 5.0f);
-        line(filterX - 5.5f, rightY - 5.0f, filterX - 0.8f, rightY + 0.5f);
-        line(filterX + 5.5f, rightY - 5.0f, filterX + 0.8f, rightY + 0.5f);
-        line(filterX + 0.8f, rightY + 0.5f, filterX + 0.8f, rightY + 4.3f);
-        line(filterX + 3.5f, rightY - 1.5f, filterX + 5.5f, rightY - 1.5f);
-        line(filterX + 3.5f, rightY + 1.0f, filterX + 5.2f, rightY + 1.0f);
-        line(filterX + 3.5f, rightY + 3.5f, filterX + 4.9f, rightY + 3.5f);
-
-        const FLOAT menuX = size.width - 17.0f;
-        target->FillRectangle(D2D1::RectF(menuX - 5.0f, 15.3333f + kHeaderControlOffsetY, menuX + 5.0f, 16.0f + kHeaderControlOffsetY), iconBrush.Get());
-        target->FillRectangle(D2D1::RectF(menuX - 5.0f, 19.3333f + kHeaderControlOffsetY, menuX + 5.0f, 20.0f + kHeaderControlOffsetY), iconBrush.Get());
-        target->FillRectangle(D2D1::RectF(menuX - 5.0f, 23.3333f + kHeaderControlOffsetY, menuX + 5.0f, 24.0f + kHeaderControlOffsetY), iconBrush.Get());
-        }
-
-        if (!windowConfig_.collapsed) {
-            iconGrid_.Draw(d2d_, iconCache_);
-            if (pointerSelectionGesture_ ==
-                    PointerSelectionGesture::MarqueeActive &&
-                !IsRectEmpty(&selectionMarqueeRect_)) {
-                Microsoft::WRL::ComPtr<ID2D1SolidColorBrush>
-                    marqueeFillBrush;
-                Microsoft::WRL::ComPtr<ID2D1SolidColorBrush>
-                    marqueeBorderBrush;
-                target->CreateSolidColorBrush(
-                    D2D1::ColorF(0x2D8CFF, 0.18f),
-                    marqueeFillBrush.GetAddressOf());
-                target->CreateSolidColorBrush(
-                    D2D1::ColorF(0x5AA8FF, 0.92f),
-                    marqueeBorderBrush.GetAddressOf());
-                const D2D1_RECT_F marquee = D2D1::RectF(
-                    static_cast<FLOAT>(selectionMarqueeRect_.left),
-                    static_cast<FLOAT>(selectionMarqueeRect_.top),
-                    static_cast<FLOAT>(selectionMarqueeRect_.right),
-                    static_cast<FLOAT>(selectionMarqueeRect_.bottom));
-                if (marqueeFillBrush != nullptr) {
-                    target->FillRectangle(
-                        marquee, marqueeFillBrush.Get());
-                }
-                if (marqueeBorderBrush != nullptr) {
-                    target->DrawRectangle(
-                        marquee, marqueeBorderBrush.Get(), 1.0f);
-                }
-            }
-            const int visibleInsertionIndex =
-                dragVisualActive_ && dragInsertionIndex_ >= 0
-                    ? dragInsertionIndex_
-                    : (shellDropPreviewActive_
-                        ? shellDropInsertionIndex_
-                        : -1);
-            if (visibleInsertionIndex >= 0) {
-                Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> insertionBrush;
-                target->CreateSolidColorBrush(
-                    D2D1::ColorF(0x63D3F1, 0.92f),
-                    insertionBrush.GetAddressOf());
-                RECT slot = iconGrid_.InsertionCellAt(
-                    static_cast<size_t>(visibleInsertionIndex));
-                const RECT gridBounds = GridBounds();
-                RECT clipped{};
-                if (insertionBrush != nullptr &&
-                    IntersectRect(&clipped, &slot, &gridBounds) &&
-                    clipped.right > clipped.left &&
-                    clipped.bottom > clipped.top) {
-                    const D2D1_RECT_F marker = D2D1::RectF(
-                        static_cast<FLOAT>(clipped.left) + 3.0f,
-                        static_cast<FLOAT>(clipped.top) + 3.0f,
-                        static_cast<FLOAT>(clipped.right) - 3.0f,
-                        static_cast<FLOAT>(clipped.bottom) - 3.0f);
-                    if (marker.right > marker.left &&
-                        marker.bottom > marker.top) {
-                        target->DrawRoundedRectangle(
-                            D2D1::RoundedRect(marker, 5.0f, 5.0f),
-                            insertionBrush.Get(),
-                            2.0f);
-                    }
-                }
-            }
-        }
+        WidgetViewRenderState state;
+        state.size = size;
+        state.title = categoryName_;
+        state.lightTheme = UseLightTheme(theme_);
+        state.collapsed = windowConfig_.collapsed;
+        state.locked = windowConfig_.locked;
+        state.headerHovered = headerHovered_;
+        state.hoverHeaderButton = hoverHeaderButton_;
+        state.pressedHeaderButton = pressedHeaderButton_;
+        state.marqueeActive =
+            pointerSelectionGesture_ ==
+                PointerSelectionGesture::MarqueeActive;
+        state.marqueeRect = selectionMarqueeRect_;
+        state.insertionIndex =
+            dragVisualActive_ && dragInsertionIndex_ >= 0
+                ? dragInsertionIndex_
+                : (shellDropPreviewActive_
+                    ? shellDropInsertionIndex_
+                    : -1);
+        DrawWidgetViewContent(
+            d2d_, iconCache_, iconGrid_, state);
     }
     const HRESULT hr = d2d_.EndDraw();
 #ifndef NDEBUG

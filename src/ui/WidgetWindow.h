@@ -13,6 +13,7 @@
 #include "config/ConfigStore.h"
 #include "desktop/ManagedShortcutStore.h"
 #include "desktop/DesktopItem.h"
+#include "desktop/DesktopSnapshot.h"
 #include "rendering/D2DContext.h"
 #include "rendering/IconCache.h"
 #include "rendering/WallpaperBackdrop.h"
@@ -56,15 +57,25 @@ public:
         const std::vector<std::wstring>&,
         POINT)>;
 
-    WidgetWindow(HINSTANCE instance, HWND owner, std::wstring categoryId, int spawnOffset);
+    WidgetWindow(
+        HINSTANCE instance,
+        HWND owner,
+        std::wstring categoryId,
+        int spawnOffset,
+        std::shared_ptr<const DesktopSnapshot> desktopSnapshot = {});
     ~WidgetWindow();
 
     bool Create();
     void Show(int showCommand);
     void SetVisible(bool visible);
     void SetLocked(bool locked);
+    bool ApplyLayout(const WindowConfig& config, bool visible);
     void Close();
     void RefreshFromConfig();
+    void ApplySnapshot(std::shared_ptr<const DesktopSnapshot> desktopSnapshot);
+    std::uint64_t SnapshotRevision() const noexcept {
+        return desktopSnapshot_ == nullptr ? 0 : desktopSnapshot_->Revision();
+    }
     void RefreshIconCache();
     void InvalidateIconCache(
         const std::vector<std::wstring>& paths);
@@ -114,6 +125,8 @@ private:
     void Render();
     void RefreshWallpaperBackdrop();
     void ScheduleWallpaperBackdropRefresh();
+    void ReleaseInvisibleResources();
+    void RestoreVisibleResources();
     void SaveLayout();
     bool FlushPendingInteractionSave();
     void ScheduleInteractionSave();
@@ -235,7 +248,8 @@ private:
         bool showError = true,
         const POINT* dropScreenPoint = nullptr,
         std::uint64_t dragGhostGeneration = 0);
-    DesktopItem* FindItem(const std::wstring& itemId);
+    const DesktopItem* FindItem(const std::wstring& itemId) const;
+    const DesktopItem* FindItemByPath(const std::wstring& path) const;
 
     HINSTANCE instance_ = nullptr;
     HWND owner_ = nullptr;
@@ -254,7 +268,7 @@ private:
     IconCache iconCache_;
     IconGrid iconGrid_;
     ShellLauncher launcher_;
-    std::vector<DesktopItem> items_;
+    std::shared_ptr<const DesktopSnapshot> desktopSnapshot_;
     std::vector<DesktopItem> currentItems_;
     std::vector<ItemConfig> registeredItems_;
     int draggingIconIndex_ = -1;
@@ -302,6 +316,7 @@ private:
     int desktopCollectionBaseInsertionIndex_ = 0;
     std::uint64_t loadItemsGeneration_ = 0;
     bool interactionSavePending_ = false;
+    bool resourcesSuspended_ = false;
     bool pendingOrderValid_ = false;
     WindowConfig pendingLayout_{};
     std::vector<std::wstring> pendingOrderIds_;

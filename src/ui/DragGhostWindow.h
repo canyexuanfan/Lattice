@@ -44,6 +44,7 @@ public:
     std::uint64_t CurrentGeneration() const noexcept;
 
 private:
+    friend struct DragGhostWindowSmokeAccess;
     DragGhostWindow() = default;
     ~DragGhostWindow();
 

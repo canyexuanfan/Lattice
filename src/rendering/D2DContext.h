@@ -17,6 +17,7 @@ public:
     IDWriteFactory* WriteFactory() const { return writeFactory_.Get(); }
 
     void RecreateTarget(HWND hwnd);
+    void ReleaseTarget() noexcept;
 
 private:
     HWND hwnd_ = nullptr;

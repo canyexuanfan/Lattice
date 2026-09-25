@@ -51,8 +51,14 @@ bool D2DContext::Initialize(HWND hwnd, bool premultipliedAlpha) {
 
 void D2DContext::RecreateTarget(HWND hwnd) {
     renderTarget_.Reset();
+    hwnd_ = hwnd;
+    if (hwnd == nullptr || IsWindow(hwnd) == FALSE || factory_ == nullptr) {
+        return;
+    }
     RECT rect{};
-    GetClientRect(hwnd, &rect);
+    if (GetClientRect(hwnd, &rect) == FALSE) {
+        return;
+    }
     const D2D1_SIZE_U size = D2D1::SizeU(
         static_cast<UINT>(rect.right - rect.left),
         static_cast<UINT>(rect.bottom - rect.top));
@@ -69,6 +75,10 @@ void D2DContext::RecreateTarget(HWND hwnd) {
             dpi),
         D2D1::HwndRenderTargetProperties(hwnd, size),
         renderTarget_.GetAddressOf());
+}
+
+void D2DContext::ReleaseTarget() noexcept {
+    renderTarget_.Reset();
 }
 
 void D2DContext::Resize(UINT width, UINT height) {

@@ -16,5 +16,6 @@ public:
         HWND owner,
         const std::wstring& message,
         const std::wstring& title,
-        UINT type);
+        UINT type,
+        HWND* activeWindow = nullptr);
 };

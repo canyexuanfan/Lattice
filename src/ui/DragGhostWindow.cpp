@@ -409,39 +409,7 @@ void DragGhostWindow::Render() {
     if (icon_ != nullptr) {
         DrawIconEx(dc, iconLeft, iconTop, icon_, iconSizePixels_, iconSizePixels_, 0, nullptr, DI_NORMAL);
     }
-    if (shortcut_) {
-        const int overlaySize = std::max(12, MulDiv(16, static_cast<int>(dpi_), 96));
-        const int overlayLeft = iconLeft - MulDiv(1, static_cast<int>(dpi_), 96);
-        const int overlayTop =
-            iconTop + iconSizePixels_ - overlaySize + MulDiv(1, static_cast<int>(dpi_), 96);
-        const auto scaled = [overlaySize](int value) {
-            return MulDiv(value, overlaySize, 16);
-        };
-        HBRUSH darkBrush = CreateSolidBrush(RGB(36, 49, 58));
-        HBRUSH lightBrush = CreateSolidBrush(RGB(248, 250, 252));
-        RECT part{
-            overlayLeft + scaled(2), overlayTop + scaled(9),
-            overlayLeft + scaled(11), overlayTop + scaled(14)};
-        FillRect(dc, &part, darkBrush);
-        part = RECT{
-            overlayLeft + scaled(9), overlayTop + scaled(3),
-            overlayLeft + scaled(14), overlayTop + scaled(12)};
-        FillRect(dc, &part, darkBrush);
-        part = RECT{
-            overlayLeft + scaled(4), overlayTop + scaled(10),
-            overlayLeft + scaled(11), overlayTop + scaled(12)};
-        FillRect(dc, &part, lightBrush);
-        part = RECT{
-            overlayLeft + scaled(10), overlayTop + scaled(5),
-            overlayLeft + scaled(12), overlayTop + scaled(11)};
-        FillRect(dc, &part, lightBrush);
-        part = RECT{
-            overlayLeft + scaled(7), overlayTop + scaled(5),
-            overlayLeft + scaled(13), overlayTop + scaled(7)};
-        FillRect(dc, &part, lightBrush);
-        DeleteObject(lightBrush);
-        DeleteObject(darkBrush);
-    }
+    // The staged HICON already contains Explorer's shortcut overlay.
 
     EnsureLabelFont();
     HGDIOBJ oldFont = labelFont_ == nullptr

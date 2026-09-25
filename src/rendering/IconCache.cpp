@@ -831,22 +831,21 @@ private:
                 const bool iconOnly =
                     attributes == INVALID_FILE_ATTRIBUTES ||
                     (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0;
-                icon = LoadShellItemImage(
-                    loadPath,
-                    desiredPixelSize,
-                    iconOnly);
-                const bool needsShield =
-                    (ReadShellIconFlags(loadPath) & GIL_SHIELD) != 0;
-                if (icon != nullptr &&
-                    (shellOverlayIndex > 0 || needsShield)) {
-                    HICON decorated = AddShellDecorations(
-                        icon,
-                        shellOverlayIndex,
-                        needsShield,
-                        desiredPixelSize);
-                    if (decorated != nullptr) {
-                        DestroyIcon(icon);
-                        icon = decorated;
+                // For overlay items, use the Shell-composited image rather
+                // than decorating a factory image that may already carry it.
+                if (shellOverlayIndex > 0) {
+                    icon = LoadShellIconWithFallback(loadPath);
+                } else {
+                    icon = LoadShellItemImage(
+                        loadPath, desiredPixelSize, iconOnly);
+                    if (icon != nullptr &&
+                        (ReadShellIconFlags(loadPath) & GIL_SHIELD) != 0) {
+                        HICON decorated = AddShellDecorations(
+                            icon, 0, true, desiredPixelSize);
+                        if (decorated != nullptr) {
+                            DestroyIcon(icon);
+                            icon = decorated;
+                        }
                     }
                 }
             }
@@ -1231,6 +1230,11 @@ void IconCache::Clear() {
 size_t IconCache::Size() const noexcept {
     std::lock_guard<std::mutex> lock(cacheMutex_);
     return cache_.size();
+}
+
+size_t IconCache::PendingCountForTesting() const noexcept {
+    std::lock_guard<std::mutex> lock(asyncState_->mutex);
+    return asyncState_->pendingById.size();
 }
 
 size_t IconCache::Capacity() const noexcept {

@@ -56,6 +56,7 @@ public:
     void Invalidate(const std::vector<std::wstring>& paths);
     void Clear();
     size_t Size() const noexcept;
+    size_t PendingCountForTesting() const noexcept;
     size_t Capacity() const noexcept;
     void SetCapacity(size_t capacity);
     void SetInvalidateCallback(std::function<void()> callback);

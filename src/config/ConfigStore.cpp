@@ -1,4 +1,5 @@
 #include "config/ConfigStore.h"
+#include "config/LayoutSnapshot.h"
 
 #include <Windows.h>
 #include <ShlObj.h>
@@ -205,6 +206,176 @@ std::map<std::wstring, std::wstring> ReadKeyValueFile(const std::wstring& path) 
         values[Trim(key)] = Trim(value);
     }
     return values;
+}
+
+void WriteWindowConfig(
+    std::ostringstream& output,
+    const std::string& prefix,
+    const WindowConfig& config) {
+    output << prefix << "x=" << config.x << "\n";
+    output << prefix << "y=" << config.y << "\n";
+    output << prefix << "width=" << config.width << "\n";
+    output << prefix << "height=" << config.height << "\n";
+    output << prefix << "opacity=" << config.opacity << "\n";
+    output << prefix << "normalHeight=" << config.normalHeight << "\n";
+    output << prefix << "iconSize=" << config.iconSize << "\n";
+    output << prefix << "density=" << config.density << "\n";
+    output << prefix << "viewMode=" << config.viewMode << "\n";
+    output << prefix << "contentViewMode=" << config.contentViewMode << "\n";
+    output << prefix << "sortMode=" << config.sortMode << "\n";
+    output << prefix << "tabSide=" << config.tabSide << "\n";
+    output << prefix << "titleOpacity=" << config.titleOpacity << "\n";
+    output << prefix << "dpi=" << config.dpi << "\n";
+    output << prefix << "monitorId=" << WideToUtf8(config.monitorId) << "\n";
+    output << prefix << "collapsed=" << (config.collapsed ? 1 : 0) << "\n";
+    output << prefix << "locked=" << (config.locked ? 1 : 0) << "\n";
+    output << prefix << "showBorder=" << (config.showBorder ? 1 : 0) << "\n";
+    output << prefix << "autoArrange=" << (config.autoArrange ? 1 : 0) << "\n";
+    output << prefix << "fixedExpanded=" << (config.fixedExpanded ? 1 : 0) << "\n";
+}
+
+WindowConfig ReadWindowConfig(
+    const std::map<std::wstring, std::wstring>& values,
+    const std::wstring& prefix,
+    WindowConfig fallback = {}) {
+    const auto readInt = [&](const wchar_t* suffix, int current) {
+        const auto found = values.find(prefix + suffix);
+        return found == values.end() ? current : ParseInt(found->second, current);
+    };
+    const auto readBool = [&](const wchar_t* suffix, bool current) {
+        const auto found = values.find(prefix + suffix);
+        return found == values.end() ? current : ParseBool(found->second, current);
+    };
+    const auto readString = [&](const wchar_t* suffix, const std::wstring& current) {
+        const auto found = values.find(prefix + suffix);
+        return found == values.end() ? current : found->second;
+    };
+    fallback.x = readInt(L"x", fallback.x);
+    fallback.y = readInt(L"y", fallback.y);
+    fallback.width = readInt(L"width", fallback.width);
+    fallback.height = readInt(L"height", fallback.height);
+    fallback.opacity = readInt(L"opacity", fallback.opacity);
+    fallback.normalHeight = readInt(L"normalHeight", fallback.normalHeight);
+    fallback.iconSize = readInt(L"iconSize", fallback.iconSize);
+    fallback.density = readInt(L"density", fallback.density);
+    fallback.viewMode = readInt(L"viewMode", fallback.viewMode);
+    fallback.contentViewMode = readInt(
+        L"contentViewMode", fallback.contentViewMode);
+    fallback.sortMode = readInt(L"sortMode", fallback.sortMode);
+    fallback.tabSide = readInt(L"tabSide", fallback.tabSide);
+    fallback.titleOpacity = readInt(L"titleOpacity", fallback.titleOpacity);
+    fallback.dpi = readInt(L"dpi", fallback.dpi);
+    fallback.monitorId = readString(L"monitorId", fallback.monitorId);
+    fallback.collapsed = readBool(L"collapsed", fallback.collapsed);
+    fallback.locked = readBool(L"locked", fallback.locked);
+    fallback.showBorder = readBool(L"showBorder", fallback.showBorder);
+    fallback.autoArrange = readBool(L"autoArrange", fallback.autoArrange);
+    fallback.fixedExpanded = readBool(
+        L"fixedExpanded", fallback.fixedExpanded);
+    return fallback;
+}
+
+bool ParseLayoutSnapshot(
+    const std::map<std::wstring, std::wstring>& values,
+    LayoutSnapshot& snapshot,
+    std::wstring& errorMessage) {
+    const auto schema = values.find(L"schemaVersion");
+    if (schema == values.end()) return false;
+    const int schemaVersion = ParseInt(schema->second, 0);
+    if (schemaVersion == 1) {
+        LayoutSnapshot legacy;
+        legacy.schemaVersion = 1;
+        legacy.legacyMainOnly = true;
+        legacy.main = ReadWindowConfig(values, L"window.");
+        legacy.viewMode = legacy.main.viewMode;
+        if (!ValidateLayoutSnapshot(legacy, errorMessage)) return false;
+        snapshot = std::move(legacy);
+        return true;
+    }
+    if (schemaVersion != 2) return false;
+
+    const auto readInt = [&](const std::wstring& key, int fallback) {
+        const auto found = values.find(key);
+        return found == values.end() ? fallback : ParseInt(found->second, fallback);
+    };
+    const auto readBool = [&](const std::wstring& key, bool fallback) {
+        const auto found = values.find(key);
+        return found == values.end() ? fallback : ParseBool(found->second, fallback);
+    };
+    const auto readString = [&](const std::wstring& key) {
+        const auto found = values.find(key);
+        return found == values.end() ? std::wstring{} : found->second;
+    };
+
+    LayoutSnapshot loaded;
+    loaded.schemaVersion = 2;
+    loaded.timestamp = ParseUnsigned64(
+        readString(L"snapshot.timestamp"), 0);
+    loaded.globalVisible = readBool(L"global.visible", true);
+    loaded.viewMode = readInt(L"global.viewMode", 1);
+    loaded.main = ReadWindowConfig(values, L"main.");
+
+    const int uncategorizedCount = readInt(
+        L"uncategorized.item.count", -1);
+    const int categoryCount = readInt(L"category.count", -1);
+    const int desktopDisplayCount = readInt(
+        L"desktopDisplay.count", -1);
+    const int monitorCount = readInt(L"monitor.count", -1);
+    if (uncategorizedCount < 0 || uncategorizedCount > 100000 ||
+        categoryCount < 0 || categoryCount > 4096 ||
+        desktopDisplayCount < 0 || desktopDisplayCount > 100000 ||
+        monitorCount < 1 || monitorCount > 64) {
+        return false;
+    }
+    loaded.uncategorizedItemOrder.reserve(
+        static_cast<std::size_t>(uncategorizedCount));
+    for (int index = 0; index < uncategorizedCount; ++index) {
+        loaded.uncategorizedItemOrder.push_back(readString(
+            L"uncategorized.item." + std::to_wstring(index)));
+    }
+    loaded.categories.reserve(static_cast<std::size_t>(categoryCount));
+    for (int index = 0; index < categoryCount; ++index) {
+        const std::wstring prefix =
+            L"category." + std::to_wstring(index) + L".";
+        LayoutCategorySnapshot category;
+        category.categoryId = readString(prefix + L"id");
+        category.layout = ReadWindowConfig(values, prefix + L"layout.");
+        const int itemCount = readInt(prefix + L"item.count", -1);
+        if (itemCount < 0 || itemCount > 100000) return false;
+        category.itemOrder.reserve(static_cast<std::size_t>(itemCount));
+        for (int itemIndex = 0; itemIndex < itemCount; ++itemIndex) {
+            category.itemOrder.push_back(readString(
+                prefix + L"item." + std::to_wstring(itemIndex)));
+        }
+        loaded.categories.push_back(std::move(category));
+    }
+    loaded.desktopDisplayLayout.reserve(
+        static_cast<std::size_t>(desktopDisplayCount));
+    for (int index = 0; index < desktopDisplayCount; ++index) {
+        const std::wstring prefix =
+            L"desktopDisplay." + std::to_wstring(index) + L".";
+        loaded.desktopDisplayLayout.push_back(DesktopPlacementConfig{
+            readString(prefix + L"identity"),
+            readInt(prefix + L"x", 0),
+            readInt(prefix + L"y", 0)});
+    }
+    loaded.monitors.reserve(static_cast<std::size_t>(monitorCount));
+    for (int index = 0; index < monitorCount; ++index) {
+        const std::wstring prefix =
+            L"monitor." + std::to_wstring(index) + L".";
+        loaded.monitors.push_back(LayoutMonitorSnapshot{
+            readString(prefix + L"id"),
+            LayoutRect{
+                readInt(prefix + L"left", 0),
+                readInt(prefix + L"top", 0),
+                readInt(prefix + L"right", 0),
+                readInt(prefix + L"bottom", 0)},
+            readInt(prefix + L"dpi", 96),
+            readBool(prefix + L"primary", false)});
+    }
+    if (!ValidateLayoutSnapshot(loaded, errorMessage)) return false;
+    snapshot = std::move(loaded);
+    return true;
 }
 
 bool AtomicWriteConfig(
@@ -1034,6 +1205,8 @@ AppConfig ConfigStore::LoadAppConfigFromDisk() const {
         category.layout.normalHeight = readInt(prefix + L"normalHeight", category.layout.normalHeight);
         category.layout.iconSize = readInt(prefix + L"iconSize", category.layout.iconSize);
         category.layout.density = readInt(prefix + L"density", category.layout.density);
+        category.layout.viewMode = std::clamp(
+            readInt(prefix + L"viewMode", category.layout.viewMode), 0, 1);
         category.layout.contentViewMode = std::clamp(readInt(prefix + L"contentViewMode", category.layout.contentViewMode), 0, 1);
         category.layout.sortMode = std::clamp(readInt(prefix + L"sortMode", category.layout.sortMode), 0, 3);
         category.layout.tabSide = std::clamp(readInt(prefix + L"tabSide", category.layout.tabSide), 0, 3);
@@ -1509,6 +1682,126 @@ bool ConfigStore::UndoAutoOrganizeAsync(
         });
 }
 
+bool ConfigStore::RestoreLayoutAsync(
+    const LayoutRestoreRequest& request,
+    HWND notificationWindow,
+    UINT notificationMessage,
+    std::uint64_t token) const {
+    if (notificationMessage == 0 || request.currentMonitors.empty()) {
+        return false;
+    }
+    const ConfigStore store = *this;
+    const std::wstring jobKey = configPath_ +
+        L"\x1flayout-restore:" + std::to_wstring(token);
+    return AsyncConfigWriter::Instance().Enqueue(
+        jobKey,
+        [store, request, notificationWindow, notificationMessage, token]() {
+            auto result = std::make_unique<LayoutRestoreResult>();
+            result->token = token;
+            result->legacyMainOnly = request.snapshot.legacyMainOnly ||
+                request.snapshot.schemaVersion == 1;
+            result->recoveredFromBackup = request.recoveredFromBackup;
+            result->desktopSnapshotRevision =
+                request.desktopSnapshotRevision;
+            result->expectedMonitors = request.currentMonitors;
+            bool writerSucceeded = true;
+            {
+                std::lock_guard<std::mutex> fileLock(ConfigFileWriteMutex());
+                const std::vector<InteractionMutation> mutations =
+                    SnapshotInteractionMutations(store.configPath_);
+                AppConfig current = store.LoadAppConfigFromDisk();
+                ApplyInteractionMutations(mutations, current);
+                LayoutRestorePlan plan;
+                std::wstring errorMessage;
+                if (!BuildLayoutRestorePlan(
+                        request.snapshot,
+                        current,
+                        request.currentMonitors,
+                        request.identities,
+                        plan,
+                        errorMessage)) {
+                    result->message = errorMessage.empty()
+                        ? L"布局方案无效，未恢复任何布局。"
+                        : errorMessage;
+                    writerSucceeded = false;
+                } else {
+                    result->before = plan.before;
+                    result->candidate = plan.candidate;
+                    if (!store.SaveAppConfigToDisk(plan.candidate)) {
+                        result->message =
+                            L"配置写入失败，未恢复任何布局。";
+                        writerSucceeded = false;
+                    } else {
+                        RemoveAppliedInteractionMutations(
+                            store.configPath_, mutations);
+                        result->succeeded = true;
+                        result->message = result->legacyMainOnly
+                            ? L"旧布局方案只包含主窗口，已恢复主窗口布局。"
+                            : L"完整布局方案已恢复。";
+                    }
+                }
+            }
+            if (notificationWindow != nullptr &&
+                IsWindow(notificationWindow) != FALSE &&
+                PostMessageW(
+                    notificationWindow,
+                    notificationMessage,
+                    0,
+                    reinterpret_cast<LPARAM>(result.get())) != FALSE) {
+                result.release();
+            }
+            return writerSucceeded;
+        });
+}
+
+bool ConfigStore::RollbackLayoutRestoreAsync(
+    const AppConfig& before,
+    HWND notificationWindow,
+    UINT notificationMessage,
+    std::uint64_t token) const {
+    if (notificationMessage == 0) return false;
+    const ConfigStore store = *this;
+    const std::wstring jobKey = configPath_ +
+        L"\x1flayout-rollback:" + std::to_wstring(token);
+    return AsyncConfigWriter::Instance().Enqueue(
+        jobKey,
+        [store, before, notificationWindow, notificationMessage, token]() {
+            auto result = std::make_unique<LayoutRestoreResult>();
+            result->token = token;
+            result->rollback = true;
+            bool writerSucceeded = true;
+            {
+                std::lock_guard<std::mutex> fileLock(ConfigFileWriteMutex());
+                const std::vector<InteractionMutation> mutations =
+                    SnapshotInteractionMutations(store.configPath_);
+                AppConfig candidate = before;
+                ApplyInteractionMutations(mutations, candidate);
+                result->before = candidate;
+                result->candidate = candidate;
+                if (!store.SaveAppConfigToDisk(candidate)) {
+                    result->message =
+                        L"布局恢复失败，且旧配置回滚写入失败；请重新启动 Lattice 读取磁盘状态。";
+                    writerSucceeded = false;
+                } else {
+                    RemoveAppliedInteractionMutations(
+                        store.configPath_, mutations);
+                    result->succeeded = true;
+                    result->message = L"布局恢复未完成，原布局已完整保留。";
+                }
+            }
+            if (notificationWindow != nullptr &&
+                IsWindow(notificationWindow) != FALSE &&
+                PostMessageW(
+                    notificationWindow,
+                    notificationMessage,
+                    0,
+                    reinterpret_cast<LPARAM>(result.get())) != FALSE) {
+                result.release();
+            }
+            return writerSucceeded;
+        });
+}
+
 bool ConfigStore::DrainPendingWrites(unsigned long timeoutMilliseconds) {
     std::vector<std::pair<std::wstring, std::function<bool()>>>
         pendingFlushes;
@@ -1652,6 +1945,7 @@ bool ConfigStore::SaveAppConfigToDisk(const AppConfig& config) const {
         output << "category." << index << ".normalHeight=" << category.layout.normalHeight << "\n";
         output << "category." << index << ".iconSize=" << category.layout.iconSize << "\n";
         output << "category." << index << ".density=" << std::clamp(category.layout.density, 0, 2) << "\n";
+        output << "category." << index << ".viewMode=" << std::clamp(category.layout.viewMode, 0, 1) << "\n";
         output << "category." << index << ".contentViewMode=" << std::clamp(category.layout.contentViewMode, 0, 1) << "\n";
         output << "category." << index << ".sortMode=" << std::clamp(category.layout.sortMode, 0, 3) << "\n";
         output << "category." << index << ".tabSide=" << std::clamp(category.layout.tabSide, 0, 3) << "\n";
@@ -1923,47 +2217,92 @@ bool ConfigStore::ImportCategoryConfig(const std::wstring& path, CategoryConfig&
     return true;
 }
 
-bool ConfigStore::SaveLayoutProfile(const WindowConfig& config) const {
+bool ConfigStore::SaveLayoutProfile(const LayoutSnapshot& snapshot) const {
     const std::wstring profilePath = configDir_ + L"\\layout.profile.ini";
     const std::wstring profileBackupPath = profilePath + L".backup";
     const std::wstring profileTempPath = profilePath + L".tmp";
-    std::ostringstream output;
-    output << "schemaVersion=1\n";
-    output << "window.x=" << config.x << "\n";
-    output << "window.y=" << config.y << "\n";
-    output << "window.width=" << config.width << "\n";
-    output << "window.height=" << config.height << "\n";
-    output << "window.opacity=" << config.opacity << "\n";
-    output << "window.normalHeight=" << config.normalHeight << "\n";
-    output << "window.iconSize=" << config.iconSize << "\n";
-    output << "window.density=" << config.density << "\n";
-    output << "window.viewMode=" << config.viewMode << "\n";
-    output << "window.tabSide=" << config.tabSide << "\n";
-    output << "window.titleOpacity=" << config.titleOpacity << "\n";
-    output << "window.dpi=" << config.dpi << "\n";
-    output << "window.monitorId=" << WideToUtf8(config.monitorId) << "\n";
-    output << "window.collapsed=" << (config.collapsed ? 1 : 0) << "\n";
-    output << "window.locked=" << (config.locked ? 1 : 0) << "\n";
-    output << "window.showBorder=" << (config.showBorder ? 1 : 0) << "\n";
-    return AtomicWriteConfig(configDir_, profilePath, profileBackupPath, profileTempPath, 2, output.str());
-}
-
-bool ConfigStore::LoadLayoutProfile(WindowConfig& config) const {
-    const std::wstring profilePath = configDir_ + L"\\layout.profile.ini";
-    const auto values = ReadKeyValueFile(profilePath);
-    const auto schemaIt = values.find(L"schemaVersion");
-    if (schemaIt == values.end() || ParseInt(schemaIt->second, 0) <= 0) {
+    std::wstring validationError;
+    if (!ValidateLayoutSnapshot(snapshot, validationError) ||
+        snapshot.schemaVersion != 2 || snapshot.legacyMainOnly ||
+        ShouldInjectSmokeConfigWriteFailure(profilePath)) {
         return false;
     }
-    WindowConfig loaded;
-    for (const auto& [key, value] : values) {
-        ApplyConfigLine(loaded, key + L"=" + value);
+    std::ostringstream output;
+    output << "schemaVersion=2\n";
+    output << "snapshot.timestamp=" << snapshot.timestamp << "\n";
+    output << "global.viewMode=" << snapshot.viewMode << "\n";
+    output << "global.visible=" << (snapshot.globalVisible ? 1 : 0) << "\n";
+    WriteWindowConfig(output, "main.", snapshot.main);
+    output << "uncategorized.item.count="
+           << snapshot.uncategorizedItemOrder.size() << "\n";
+    for (std::size_t index = 0;
+         index < snapshot.uncategorizedItemOrder.size(); ++index) {
+        output << "uncategorized.item." << index << "="
+               << WideToUtf8(snapshot.uncategorizedItemOrder[index]) << "\n";
     }
-    loaded.density = std::clamp(loaded.density, 0, 2);
-    loaded.viewMode = std::clamp(loaded.viewMode, 0, 1);
-    loaded.tabSide = std::clamp(loaded.tabSide, 0, 3);
-    loaded.titleOpacity = std::clamp(loaded.titleOpacity, 80, 255);
-    loaded.iconSize = std::clamp(loaded.iconSize, 32, 72);
-    config = loaded;
-    return true;
+    output << "category.count=" << snapshot.categories.size() << "\n";
+    for (std::size_t index = 0; index < snapshot.categories.size(); ++index) {
+        const LayoutCategorySnapshot& category = snapshot.categories[index];
+        const std::string prefix = "category." + std::to_string(index) + ".";
+        output << prefix << "id=" << WideToUtf8(category.categoryId) << "\n";
+        WriteWindowConfig(output, prefix + "layout.", category.layout);
+        output << prefix << "item.count=" << category.itemOrder.size() << "\n";
+        for (std::size_t itemIndex = 0;
+             itemIndex < category.itemOrder.size(); ++itemIndex) {
+            output << prefix << "item." << itemIndex << "="
+                   << WideToUtf8(category.itemOrder[itemIndex]) << "\n";
+        }
+    }
+    output << "desktopDisplay.count="
+           << snapshot.desktopDisplayLayout.size() << "\n";
+    for (std::size_t index = 0;
+         index < snapshot.desktopDisplayLayout.size(); ++index) {
+        const DesktopPlacementConfig& placement =
+            snapshot.desktopDisplayLayout[index];
+        const std::string prefix =
+            "desktopDisplay." + std::to_string(index) + ".";
+        output << prefix << "identity=" << WideToUtf8(placement.path) << "\n";
+        output << prefix << "x=" << placement.x << "\n";
+        output << prefix << "y=" << placement.y << "\n";
+    }
+    output << "monitor.count=" << snapshot.monitors.size() << "\n";
+    for (std::size_t index = 0; index < snapshot.monitors.size(); ++index) {
+        const LayoutMonitorSnapshot& monitor = snapshot.monitors[index];
+        const std::string prefix = "monitor." + std::to_string(index) + ".";
+        output << prefix << "id=" << WideToUtf8(monitor.id) << "\n";
+        output << prefix << "left=" << monitor.workArea.left << "\n";
+        output << prefix << "top=" << monitor.workArea.top << "\n";
+        output << prefix << "right=" << monitor.workArea.right << "\n";
+        output << prefix << "bottom=" << monitor.workArea.bottom << "\n";
+        output << prefix << "dpi=" << monitor.dpi << "\n";
+        output << prefix << "primary=" << (monitor.primary ? 1 : 0) << "\n";
+    }
+    std::lock_guard<std::mutex> fileLock(ConfigFileWriteMutex());
+    return AtomicWriteConfig(
+        configDir_, profilePath, profileBackupPath, profileTempPath, 2,
+        output.str());
+}
+
+bool ConfigStore::LoadLayoutProfile(
+    LayoutSnapshot& snapshot,
+    bool* recoveredFromBackup) const {
+    const std::wstring profilePath = configDir_ + L"\\layout.profile.ini";
+    const std::vector<std::wstring> candidates{
+        profilePath,
+        profilePath + L".backup",
+        profilePath + L".backup.1"};
+    for (std::size_t index = 0; index < candidates.size(); ++index) {
+        LayoutSnapshot loaded;
+        std::wstring parseError;
+        if (ParseLayoutSnapshot(
+                ReadKeyValueFile(candidates[index]), loaded, parseError)) {
+            snapshot = std::move(loaded);
+            if (recoveredFromBackup != nullptr) {
+                *recoveredFromBackup = index != 0;
+            }
+            return true;
+        }
+    }
+    if (recoveredFromBackup != nullptr) *recoveredFromBackup = false;
+    return false;
 }

@@ -13,9 +13,11 @@
 #include "app/TrayIcon.h"
 #include "app/UpdateService.h"
 #include "config/ConfigStore.h"
+#include "config/LayoutSnapshot.h"
 #include "desktop/DesktopPlacementCoordinator.h"
 #include "desktop/DesktopWatcher.h"
 #include "desktop/DesktopItem.h"
+#include "desktop/DesktopSnapshot.h"
 #include "desktop/ManagedShortcutStore.h"
 #include "model/OrganizerModel.h"
 #include "rendering/D2DContext.h"
@@ -72,8 +74,41 @@ private:
     LRESULT HandleMessage(UINT message, WPARAM wParam, LPARAM lParam);
 
     void LoadDesktopItems();
-    void ConfigureWidgetShellDrop(WidgetWindow& widget);
-    void ReconcileDeletedDesktopItems();
+    std::vector<HostedWidgetDescriptor> BuildHostedWidgets() const;
+    bool SyncHostedWidgets(std::wstring* errorMessage = nullptr);
+    bool ExecuteHostedWidgetCommand(
+        const HostedWidgetCommand& command);
+    WindowConfig* HostedWidgetLayout(
+        const std::wstring& categoryId);
+    const WindowConfig* HostedWidgetLayout(
+        const std::wstring& categoryId) const;
+    void ShowHostedWidgetSortMenu(
+        const std::wstring& categoryId,
+        POINT screenPoint);
+    void ShowHostedWidgetBackgroundMenu(
+        const std::wstring& categoryId,
+        POINT screenPoint);
+    bool CollectHostedPaths(
+        const std::wstring& categoryId,
+        const std::vector<std::wstring>& paths,
+        int insertionIndex,
+        bool showError);
+    bool ReorderHostedSelection(
+        const std::wstring& categoryId,
+        const std::vector<std::wstring>& itemIds,
+        size_t insertionIndex);
+    bool RenameHostedShellItem(const std::wstring& itemId);
+    bool InvokeHostedShellVerb(
+        const std::vector<std::wstring>& itemIds,
+        const std::wstring& canonicalVerb);
+    void ShowHostedShellMenu(
+        const std::wstring& categoryId,
+        const std::vector<std::wstring>& itemIds,
+        POINT screenPoint);
+    void ReconcileDeletedDesktopItems(std::vector<DesktopItem>& items);
+    void PublishDesktopSnapshot(std::vector<DesktopItem> items);
+    void RepublishDesktopSnapshotMembership();
+    const std::vector<DesktopItem>& DesktopItems() const noexcept;
     std::vector<std::wstring> AssignedDesktopIdentities() const;
     void RefreshDesktopSurfaceAssignments();
     void ScheduleDesktopRefresh();
@@ -101,6 +136,13 @@ private:
         HWND sourceWindow);
     void HandleAutoOrganizeTransactionResult(
         AutoOrganizeTransactionResult* rawResult);
+    void HandleLayoutRestoreResult(LayoutRestoreResult* rawResult);
+    bool PublishLayoutConfig(
+        const AppConfig& config,
+        const std::vector<LayoutMonitorSnapshot>& expectedMonitors,
+        std::uint64_t expectedDesktopRevision,
+        bool enforceGuards);
+    LayoutIdentityIndex CurrentLayoutIdentityIndex() const;
     bool PublishReloadedOrganizerState(
         const std::vector<std::wstring>& newCategoryIds);
     void ApplyLiveSettings(bool publicDesktopChanged);
@@ -118,9 +160,11 @@ private:
     void HandleUpdateServiceResult(UpdateServiceResult* result);
     void EnsureWindowVisible();
     void LoadOrganizerConfig();
+    void ApplyOrganizerConfig(const AppConfig& appConfig);
     void Render();
     void SaveWindowConfig();
-    bool SaveOrganizerConfig();
+    bool SaveOrganizerConfig(
+        const DesktopPlacementConfig* displayPlacement = nullptr);
     RECT GridBounds() const;
     RECT TabBounds(size_t index) const;
     RECT CollapseButtonBounds() const;
@@ -176,7 +220,7 @@ private:
         bool allowDialogs);
     bool ImportPathToCategory(const std::wstring& path, const std::wstring& categoryId, bool showError = true);
     std::wstring StorageFolderForCategory(const std::wstring& categoryId) const;
-    DesktopItem* FindItem(const std::wstring& itemId);
+    const DesktopItem* FindItem(const std::wstring& itemId) const;
     bool IsItemAssigned(const std::wstring& itemId) const;
     Category* FindCategory(const std::wstring& categoryId);
     const Category* FindCategory(const std::wstring& categoryId) const;
@@ -204,7 +248,8 @@ private:
     IconCache iconCache_;
     IconGrid iconGrid_;
     ShellLauncher launcher_;
-    std::vector<DesktopItem> items_;
+    std::shared_ptr<const DesktopSnapshot> desktopSnapshot_;
+    std::uint64_t desktopSnapshotRevision_ = 0;
     OrganizerConfig organizerConfig_;
     std::vector<DesktopItem> currentItems_;
     int draggingIconIndex_ = -1;
@@ -217,12 +262,19 @@ private:
     bool organizerRefreshPending_ = false;
     std::mutex desktopChangesMutex_;
     DesktopChangeBatch pendingDesktopChanges_;
+    bool desktopInitialScanComplete_ = false;
     std::wstring searchQuery_;
     int searchScope_ = 0;
     POINT lastMousePoint_{};
     int hoverTabIndex_ = -1;
     int hoverButtonIndex_ = -1;
+#ifndef NDEBUG
     std::vector<std::unique_ptr<WidgetWindow>> widgetWindows_;
+#endif
+    std::vector<std::wstring> hostedWidgetCategoryIds_;
+    size_t hostedCollectionsPending_ = 0;
+    bool hostedCollectionBusyNotified_ = false;
+    bool hostedCollectionDirty_ = false;
     std::unique_ptr<AutoOrganizePreviewWindow> autoOrganizePreview_;
     std::unique_ptr<DesktopSurfaceWindow> desktopSurface_;
     std::vector<TileView> tileViews_;
@@ -234,6 +286,7 @@ private:
     int draggingTileIconIndex_ = -1;
     POINT dragStartPoint_{};
     bool updateExitRequested_ = false;
+    HWND updateProgressDialog_ = nullptr;
     bool normalExitInProgress_ = false;
     bool normalExitCompleted_ = false;
     std::wstring lastNormalExitError_;
@@ -246,4 +299,11 @@ private:
     AutoOrganizeOperation autoOrganizeOperation_ = AutoOrganizeOperation::None;
     std::uint64_t autoOrganizeOperationToken_ = 0;
     std::vector<std::wstring> pendingAutoOrganizeCategoryIds_;
+    enum class LayoutOperation {
+        None,
+        Restore,
+        Rollback,
+    };
+    LayoutOperation layoutOperation_ = LayoutOperation::None;
+    std::uint64_t layoutOperationToken_ = 0;
 };
