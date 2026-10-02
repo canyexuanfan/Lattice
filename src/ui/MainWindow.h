@@ -42,6 +42,7 @@ public:
     bool Create();
     HWND Window() const noexcept { return hwnd_; }
     bool EnableDesktopDisplayTakeover(std::wstring& errorMessage);
+    bool PreTranslateMessage(MSG& message);
     void ReloadPersistedState();
     void ShowNonBlockingNotice(
         const std::wstring& title,
@@ -269,6 +270,8 @@ private:
     int hoverTabIndex_ = -1;
     int hoverButtonIndex_ = -1;
 #ifndef NDEBUG
+    unsigned s0SaveProfileRevision_ = 0;
+    long long s0SaveProfileNanoseconds_[4]{};
     std::vector<std::unique_ptr<WidgetWindow>> widgetWindows_;
 #endif
     std::vector<std::wstring> hostedWidgetCategoryIds_;

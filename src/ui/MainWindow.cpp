@@ -10,6 +10,10 @@
 
 #include <algorithm>
 #include <cwctype>
+#ifndef NDEBUG
+#include <chrono>
+#include <fstream>
+#endif
 #include <filesystem>
 #include <iterator>
 #include <tuple>
@@ -31,6 +35,42 @@
 #include "util/StringUtil.h"
 
 namespace {
+
+#ifndef NDEBUG
+void RecordExplorerRoutingDiagnostic(const std::wstring& text) noexcept {
+    try {
+        wchar_t directory[32768]{}, module[32768]{};
+        const DWORD length = GetEnvironmentVariableW(
+            L"LATTICE_EXPLORER_ROUTING_DIAGNOSTIC_ROOT", directory, _countof(directory));
+        if (length == 0 || length >= _countof(directory) ||
+            !GetModuleFileNameW(nullptr, module, _countof(module))) return;
+        const auto project = std::filesystem::path(module).parent_path().parent_path().parent_path();
+        const auto root = std::filesystem::absolute(directory).lexically_normal();
+        const auto allowed = project / L".workspace" / L"resource-s0";
+        const auto prefix = allowed.wstring() + L"\\";
+        const auto actual = root.wstring();
+        if (actual.size() <= prefix.size() || CompareStringOrdinal(actual.data(),
+                static_cast<int>(prefix.size()), prefix.data(), static_cast<int>(prefix.size()), TRUE) != CSTR_EQUAL) return;
+        for (auto ancestor = root; !ancestor.empty(); ancestor = ancestor.parent_path()) {
+            const DWORD attributes = GetFileAttributesW(ancestor.c_str());
+            if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_REPARSE_POINT)) return;
+            if (ancestor == project) break;
+            if (ancestor == ancestor.parent_path()) return;
+        }
+        const auto output = root / L"explorer-routing-diagnostic.txt";
+        const DWORD attributes = GetFileAttributesW(output.c_str());
+        if (attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_REPARSE_POINT)) return;
+        const int bytes = WideCharToMultiByte(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), nullptr, 0, nullptr, nullptr);
+        if (bytes <= 0) return;
+        std::string utf8(static_cast<size_t>(bytes), '\0');
+        if (WideCharToMultiByte(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), utf8.data(), bytes, nullptr, nullptr) != bytes) return;
+        std::ofstream file(output, std::ios::binary | std::ios::app);
+        file << GetTickCount64() << " " << utf8 << '\n';
+    } catch (...) {
+        OutputDebugStringW(L"Lattice Explorer routing diagnostic could not write workspace evidence.\n");
+    }
+}
+#endif
 
 constexpr wchar_t kWindowClassName[] = L"Lattice.MainWindow";
 constexpr int kTitleHeight = 38;
@@ -513,6 +553,10 @@ MainWindow::~MainWindow() {
     hostedWidgetCategoryIds_.clear();
     desktopWatcher_.Stop();
     trayIcon_.Remove();
+}
+
+bool MainWindow::PreTranslateMessage(MSG& message) {
+    return desktopSurface_ && desktopSurface_->PreTranslateMessage(message);
 }
 
 bool MainWindow::EnableDesktopDisplayTakeover(
@@ -2039,6 +2083,11 @@ LRESULT MainWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
     }
     if (kTaskbarCreatedMessage != 0 &&
         message == kTaskbarCreatedMessage) {
+#ifndef NDEBUG
+        RecordExplorerRoutingDiagnostic(L"TaskbarCreated entered lastVisible=" +
+            std::to_wstring(organizerConfig_.settings.lastVisible) + L" host=" +
+            std::to_wstring(reinterpret_cast<uintptr_t>(desktopSurface_ == nullptr ? nullptr : desktopSurface_->Window())));
+#endif
         trayIcon_.Remove();
         trayIcon_.Initialize(hwnd_, instance_);
         if (!organizerConfig_.settings.lastVisible) {
@@ -2049,13 +2098,26 @@ LRESULT MainWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
             return 0;
         }
         std::wstring takeoverError;
+        // Explorer has replaced the old parent; release its exclusive F2 route
+        // before the replacement surface attempts to install the same route.
+        if (desktopSurface_ != nullptr) {
+            desktopSurface_->Close();
+            desktopSurface_.reset();
+        }
         if (!EnableDesktopDisplayTakeover(takeoverError)) {
+#ifndef NDEBUG
+            RecordExplorerRoutingDiagnostic(L"Takeover failed: " + takeoverError);
+#endif
             const std::wstring diagnostic =
                 L"Lattice could not reattach the desktop surface after Explorer restart: " +
                 takeoverError + L"\n";
             OutputDebugStringW(diagnostic.c_str());
         } else {
             desktopSurface_->Show();
+#ifndef NDEBUG
+            RecordExplorerRoutingDiagnostic(L"Takeover succeeded host=" +
+                std::to_wstring(reinterpret_cast<uintptr_t>(desktopSurface_->Window())));
+#endif
         }
         return 0;
     }
@@ -5166,7 +5228,13 @@ bool MainWindow::SaveOrganizerConfig(
         }
         return false;
     }
+#ifndef NDEBUG
+    const auto s0ProfileStarted = std::chrono::steady_clock::now();
+#endif
     AppConfig appConfig = configStore_.LoadAppConfig();
+#ifndef NDEBUG
+    const auto s0ProfileLoaded = std::chrono::steady_clock::now();
+#endif
     appConfig.settings = organizerConfig_.settings;
     appConfig.window = windowConfig_;
     appConfig.currentCategoryId = organizerConfig_.currentCategoryId;
@@ -5237,10 +5305,24 @@ bool MainWindow::SaveOrganizerConfig(
         categoryConfig.layout = category.layout;
         appConfig.categories.push_back(std::move(categoryConfig));
     }
+#ifndef NDEBUG
+    const auto s0ProfileBuilt = std::chrono::steady_clock::now();
+#endif
     if (!configStore_.SaveAppConfig(appConfig)) {
         return false;
     }
+#ifndef NDEBUG
+    const auto s0ProfileWritten = std::chrono::steady_clock::now();
+#endif
     RepublishDesktopSnapshotMembership();
+#ifndef NDEBUG
+    const auto s0ProfilePublished = std::chrono::steady_clock::now();
+    s0SaveProfileNanoseconds_[0] = std::chrono::duration_cast<std::chrono::nanoseconds>(s0ProfileLoaded - s0ProfileStarted).count();
+    s0SaveProfileNanoseconds_[1] = std::chrono::duration_cast<std::chrono::nanoseconds>(s0ProfileBuilt - s0ProfileLoaded).count();
+    s0SaveProfileNanoseconds_[2] = std::chrono::duration_cast<std::chrono::nanoseconds>(s0ProfileWritten - s0ProfileBuilt).count();
+    s0SaveProfileNanoseconds_[3] = std::chrono::duration_cast<std::chrono::nanoseconds>(s0ProfilePublished - s0ProfileWritten).count();
+    ++s0SaveProfileRevision_;
+#endif
     return true;
 }
 
@@ -6380,8 +6462,15 @@ bool MainWindow::MoveItemOut(
                 dragGhostGeneration);
             return false;
         }
+        POINT resolvedViewPoint{};
+        if (!desktopSurface_->PlanReturnedDisplayPosition(
+                sourcePath, viewPoint, resolvedViewPoint)) {
+            DragGhostWindow::Instance().EndIfGeneration(
+                dragGhostGeneration);
+            return false;
+        }
         displayPlacement = DesktopPlacementConfig{
-            sourcePath, viewPoint.x, viewPoint.y};
+            sourcePath, resolvedViewPoint.x, resolvedViewPoint.y};
     }
     const OrganizerConfig originalConfig = organizerConfig_;
     const auto persistRemoval = [&]() {

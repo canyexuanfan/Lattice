@@ -24,6 +24,7 @@ public:
     IconCache();
     ~IconCache();
     static void ShutdownSharedLoader();
+    static bool SubmitWallpaperWork(std::function<void()> task);
     ID2D1Bitmap* GetIcon(
         ID2D1RenderTarget* target,
         const std::wstring& path,
@@ -57,6 +58,11 @@ public:
     void Clear();
     size_t Size() const noexcept;
     size_t PendingCountForTesting() const noexcept;
+#ifndef NDEBUG
+    size_t DragIconCountForTesting() const noexcept;
+    std::uint64_t BitmapPixelBytesForTesting() const noexcept;
+    HICON CopyCachedIconForTesting(const std::wstring& path) const;
+#endif
     size_t Capacity() const noexcept;
     void SetCapacity(size_t capacity);
     void SetInvalidateCallback(std::function<void()> callback);

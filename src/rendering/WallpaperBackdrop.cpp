@@ -388,7 +388,7 @@ void ScheduleDecodedWallpaperReleaseLocked(
     }
 }
 
-std::shared_ptr<const DecodedWallpaper> CachedWallpaper(const std::wstring& path) {
+std::shared_ptr<const DecodedWallpaper> CachedWallpaper(const std::wstring& path, bool shareDecodedWave) {
     DecodedWallpaperCache& cache = SharedDecodedWallpaperCache();
     FILETIME writeTime{};
     if (!FileWriteTime(path, writeTime)) {
@@ -400,7 +400,7 @@ std::shared_ptr<const DecodedWallpaper> CachedWallpaper(const std::wstring& path
             CompareStringOrdinal(cache.path.c_str(), -1, path.c_str(), -1, TRUE) == CSTR_EQUAL &&
             CompareFileTime(&cache.writeTime, &writeTime) == 0) {
             const std::shared_ptr<const DecodedWallpaper> result = cache.image;
-            ScheduleDecodedWallpaperReleaseLocked(cache);
+            if (shareDecodedWave) { ScheduleDecodedWallpaperReleaseLocked(cache); }
             return result;
         }
     }
@@ -409,6 +409,7 @@ std::shared_ptr<const DecodedWallpaper> CachedWallpaper(const std::wstring& path
     if (!DecodeWallpaper(path, *decoded)) {
         return {};
     }
+    if (!shareDecodedWave) { return decoded; }
     std::lock_guard<std::mutex> lock(cache.mutex);
     cache.path = path;
     cache.writeTime = writeTime;
@@ -705,31 +706,65 @@ bool BuildWallpaperMonitorSlices(
     return !slices.empty();
 }
 
-bool WallpaperBackdrop::Refresh(
-    HWND hwnd,
-    ID2D1RenderTarget* renderTarget,
-    int minimumWidthPixels,
-    int minimumHeightPixels,
-    bool blur) {
-    if (hwnd == nullptr || renderTarget == nullptr) {
-        return false;
-    }
-
+bool WallpaperBackdrop::CapturePrepareInput(
+    HWND hwnd, int minimumWidthPixels, int minimumHeightPixels,
+    bool blur, PrepareInput& input) {
     RECT clientRect{};
-    POINT clientOrigin{};
-    if (!GetClientRect(hwnd, &clientRect) || !ClientToScreen(hwnd, &clientOrigin)) {
-        return false;
-    }
-    const int outputWidth = (std::max)(
-        static_cast<int>(clientRect.right - clientRect.left),
-        minimumWidthPixels);
-    const int outputHeight = (std::max)(
-        static_cast<int>(clientRect.bottom - clientRect.top),
-        minimumHeightPixels);
-    if (outputWidth <= 0 || outputHeight <= 0) {
-        return false;
-    }
+    POINT origin{};
+    if (hwnd == nullptr || !GetClientRect(hwnd, &clientRect) ||
+        !ClientToScreen(hwnd, &origin)) { return false; }
+    input.origin = origin;
+    input.size = SIZE{(std::max)(static_cast<int>(clientRect.right - clientRect.left), minimumWidthPixels),
+        (std::max)(static_cast<int>(clientRect.bottom - clientRect.top), minimumHeightPixels)};
+    input.dpi = (std::max)(GetDpiForWindow(hwnd), 96U);
+    input.blur = blur;
+    return input.size.cx > 0 && input.size.cy > 0;
+}
 
+bool WallpaperBackdrop::Refresh(HWND hwnd, ID2D1RenderTarget* renderTarget,
+    int minimumWidthPixels, int minimumHeightPixels, bool blur) {
+    PrepareInput input;
+    PreparedPixels prepared;
+    return renderTarget != nullptr && CapturePrepareInput(hwnd, minimumWidthPixels,
+        minimumHeightPixels, blur, input) && PreparePixels(input, prepared) &&
+        CommitPreparedPixels(renderTarget, prepared);
+}
+
+bool WallpaperBackdrop::PreparePixels(const PrepareInput& input,
+    PreparedPixels& prepared, bool shareDecodedWave,
+    const std::function<bool()>& cancelled) {
+    prepared = {};
+    prepared.input = input;
+    const int outputWidth = input.size.cx;
+    const int outputHeight = input.size.cy;
+    const POINT clientOrigin = input.origin;
+    const bool blur = input.blur;
+    if (outputWidth <= 0 || outputHeight <= 0) { return false; }
+#ifndef NDEBUG
+    prepared.profile = {};
+    wchar_t traceValue[2]{};
+    LARGE_INTEGER profileFrequency{}, profilePrevious{};
+    prepared.profile.enabled = GetEnvironmentVariableW(
+        L"DESKTOP_ORGANIZER_S0_TRACE", traceValue, ARRAYSIZE(traceValue)) == 1 &&
+        traceValue[0] == L'1' && QueryPerformanceFrequency(&profileFrequency) &&
+        profileFrequency.QuadPart > 0 && QueryPerformanceCounter(&profilePrevious);
+    if (prepared.profile.enabled) {
+        prepared.profile.threadId = GetCurrentThreadId();
+        prepared.profile.blur = blur;
+    }
+    const auto finishProfileStage = [&](size_t stage) {
+        if (prepared.profile.enabled) {
+            LARGE_INTEGER now{};
+            if (!QueryPerformanceCounter(&now)) {
+                prepared.profile.enabled = false;
+                return;
+            }
+            prepared.profile.stageMicroseconds[stage] = static_cast<std::uint64_t>(
+                (now.QuadPart - profilePrevious.QuadPart) * 1000000LL / profileFrequency.QuadPart);
+            profilePrevious = now;
+        }
+    };
+#endif
     const int padding = blur ? kBlurRadius * kBlurPasses : 0;
     const int sampleWidth = outputWidth + padding * 2;
     const int sampleHeight = outputHeight + padding * 2;
@@ -744,6 +779,7 @@ bool WallpaperBackdrop::Refresh(
         clientOrigin.y - padding,
         clientOrigin.x - padding + sampleWidth,
         clientOrigin.y - padding + sampleHeight};
+    if (cancelled && cancelled()) { return false; }
     std::vector<WallpaperDescription> descriptions;
     if (!ResolveWallpapers(sampleScreenRect, descriptions)) {
         return false;
@@ -758,20 +794,27 @@ bool WallpaperBackdrop::Refresh(
             sampleScreenRect, monitorRects, slices)) {
         return false;
     }
+#ifndef NDEBUG
+    finishProfileStage(0);
+#endif
     std::vector<std::shared_ptr<const DecodedWallpaper>> wallpapers;
     wallpapers.reserve(descriptions.size());
     for (const WallpaperDescription& description : descriptions) {
+        if (cancelled && cancelled()) { return false; }
         if (description.solidColor) {
             wallpapers.push_back({});
             continue;
         }
         std::shared_ptr<const DecodedWallpaper> wallpaper =
-            CachedWallpaper(description.path);
+            CachedWallpaper(description.path, shareDecodedWave);
         if (wallpaper == nullptr) {
             return false;
         }
         wallpapers.push_back(std::move(wallpaper));
     }
+#ifndef NDEBUG
+    finishProfileStage(1);
+#endif
 
     std::vector<BYTE> sampled(static_cast<size_t>(sampleWidth) * sampleHeight * 4U);
     const BgraPixel fallback = BackgroundPixel(
@@ -793,6 +836,7 @@ bool WallpaperBackdrop::Refresh(
         for (LONG y = slice.destinationRect.top;
              y < slice.destinationRect.bottom;
              ++y) {
+            if (cancelled && cancelled()) { return false; }
             const double screenY =
                 static_cast<double>(sampleScreenRect.top + y) + 0.5;
             for (LONG x = slice.destinationRect.left;
@@ -816,9 +860,19 @@ bool WallpaperBackdrop::Refresh(
             }
         }
     }
+#ifndef NDEBUG
+    if (prepared.profile.enabled) {
+        prepared.profile.sampledCapacityBytes = sampled.capacity();
+    }
+    finishProfileStage(2);
+#endif
+    if (cancelled && cancelled()) { return false; }
     if (blur) {
         BlurPixels(sampled, sampleWidth, sampleHeight);
     }
+#ifndef NDEBUG
+    finishProfileStage(3);
+#endif
 
     std::vector<BYTE> output(static_cast<size_t>(outputWidth) * outputHeight * 4U);
     const size_t outputStride = static_cast<size_t>(outputWidth) * 4U;
@@ -829,8 +883,35 @@ bool WallpaperBackdrop::Refresh(
         BYTE* destinationRow = output.data() + static_cast<size_t>(y) * outputStride;
         std::copy_n(sourceRow, outputStride, destinationRow);
     }
+#ifndef NDEBUG
+    if (prepared.profile.enabled) {
+        prepared.profile.outputCapacityBytes = output.capacity();
+        prepared.profile.outputWidth = outputWidth;
+        prepared.profile.outputHeight = outputHeight;
+    }
+    finishProfileStage(4);
+#endif
 
-    const FLOAT dpi = static_cast<FLOAT>((std::max)(GetDpiForWindow(hwnd), 96U));
+    if (cancelled && cancelled()) { return false; }
+    prepared.pixels = std::move(output);
+    return true;
+}
+
+bool WallpaperBackdrop::CommitPreparedPixels(ID2D1RenderTarget* renderTarget,
+    const PreparedPixels& prepared) {
+    if (renderTarget == nullptr || prepared.input.size.cx <= 0 ||
+        prepared.input.size.cy <= 0) { return false; }
+    const int outputWidth = prepared.input.size.cx;
+    const int outputHeight = prepared.input.size.cy;
+    const size_t outputStride = static_cast<size_t>(outputWidth) * 4U;
+    if (prepared.pixels.size() != outputStride * outputHeight) { return false; }
+#ifndef NDEBUG
+    refreshProfile_ = prepared.profile;
+    LARGE_INTEGER commitStarted{}, frequency{};
+    QueryPerformanceFrequency(&frequency);
+    QueryPerformanceCounter(&commitStarted);
+#endif
+    const FLOAT dpi = static_cast<FLOAT>(prepared.input.dpi);
     const D2D1_BITMAP_PROPERTIES properties = D2D1::BitmapProperties(
         D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED),
         dpi,
@@ -843,7 +924,7 @@ bool WallpaperBackdrop::Refresh(
     Microsoft::WRL::ComPtr<ID2D1Bitmap> nextBitmap;
     const bool created = SUCCEEDED(renderTarget->CreateBitmap(
         D2D1::SizeU(static_cast<UINT>(outputWidth), static_cast<UINT>(outputHeight)),
-        output.data(),
+        prepared.pixels.data(),
         static_cast<UINT32>(outputStride),
         properties,
         nextBitmap.GetAddressOf()));
@@ -852,6 +933,19 @@ bool WallpaperBackdrop::Refresh(
         pixelSize_ = SIZE{outputWidth, outputHeight};
         ++generation_;
     }
+#ifndef NDEBUG
+    if (refreshProfile_.enabled && frequency.QuadPart > 0) {
+        LARGE_INTEGER now{};
+        QueryPerformanceCounter(&now);
+        refreshProfile_.stageMicroseconds[5] = static_cast<std::uint64_t>(
+            (now.QuadPart - commitStarted.QuadPart) * 1000000LL / frequency.QuadPart);
+    }
+    if (refreshProfile_.enabled) {
+        refreshProfile_.complete = true;
+        refreshProfile_.succeeded = created;
+        refreshProfile_.generation = generation_;
+    }
+#endif
     return created;
 }
 

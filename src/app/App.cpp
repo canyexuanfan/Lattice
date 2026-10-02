@@ -124,6 +124,7 @@ bool App::InitializeInternal(int showCommand, bool enableDesktopTakeover) {
 int App::Run() {
     MSG message{};
     while (GetMessageW(&message, nullptr, 0, 0) > 0) {
+        if (mainWindow_ && mainWindow_->PreTranslateMessage(message)) continue;
         TranslateMessage(&message);
         DispatchMessageW(&message);
     }

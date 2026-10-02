@@ -21,7 +21,10 @@ param(
         "--smoke-widget-desktop-layer",
         "--smoke-desktop-icon-fidelity",
         "--smoke-desktop-display-takeover",
+        "--smoke-native-desktop-host",
+        "--smoke-desktop-grid-and-drag-plan",
         "--smoke-desktop-double-click",
+        "--smoke-wallpaper-async",
         "--smoke-collapse-selection-logic",
         "--smoke-widget-interaction",
         "--smoke-widget-normal-exit",
@@ -32,7 +35,8 @@ param(
         "--smoke-update-dialog")]
     [string]$Mode = "",
     [switch]$SkipBuild,
-    [switch]$VisibleFixture
+    [switch]$VisibleFixture,
+    [string]$S0LedgerOutput = ''
 )
 
 $ErrorActionPreference = "Stop"
@@ -127,7 +131,8 @@ function Invoke-SmokeMode {
     $process = [System.Diagnostics.Process]::Start($psi)
     $processId = $process.Id
     $processStartTime = $process.StartTime.ToFileTime()
-    if (!$process.WaitForExit(30000)) {
+    $timeoutSeconds = if ($Mode -eq '--smoke-resource-idle' -and $S0LedgerOutput -ne '') { 50 } else { 30 }
+    if (!$process.WaitForExit($timeoutSeconds * 1000)) {
         $actual = Get-Process -Id $processId -ErrorAction SilentlyContinue
         $actualPath = $null
         if ($null -ne $actual) {
@@ -181,9 +186,9 @@ function Invoke-SmokeMode {
             }
         }
         if ($null -ne $dumpFailure) {
-            throw "Smoke mode exceeded 30 seconds and dump failed: $Mode ($dumpFailure)"
+            throw "Smoke mode exceeded $timeoutSeconds seconds and dump failed: $Mode ($dumpFailure)"
         }
-        throw "Smoke mode exceeded 30 seconds: $Mode. Hang dump: $dumpPath. Thread stacks: $stackPath"
+        throw "Smoke mode exceeded $timeoutSeconds seconds: $Mode. Hang dump: $dumpPath. Thread stacks: $stackPath"
     }
     $standardError = $process.StandardError.ReadToEnd()
     if (-not [string]::IsNullOrWhiteSpace($standardError)) {
@@ -207,6 +212,7 @@ try {
         @($Mode)
     } else {
         @(
+        "--smoke-wallpaper-async",
         "--smoke-collapse-selection-logic",
         "--smoke-scan",
         "--smoke-desktop-snapshot",
@@ -226,8 +232,8 @@ try {
         "--smoke-image-thumbnail",
         "--smoke-widget-alignment",
         "--smoke-widget-desktop-layer",
-        "--smoke-desktop-icon-fidelity",
-        "--smoke-desktop-display-takeover",
+        "--smoke-native-desktop-host",
+        "--smoke-desktop-grid-and-drag-plan",
         "--smoke-desktop-double-click",
         "--smoke-widget-interaction",
         "--smoke-widget-normal-exit",
@@ -239,6 +245,46 @@ try {
     }
     foreach ($mode in $modes) {
         Invoke-SmokeMode $mode
+    }
+    if ($S0LedgerOutput -ne '') {
+        if ($Mode -ne '--smoke-resource-idle') {
+            throw 'S0LedgerOutput requires resource-idle mode.'
+        }
+        $ledgerSource = Join-Path $managedItemsSmokeDir 'resource-s0-ledger.txt'
+        $ledgerRoot = Join-Path $projectRoot '.workspace\resource-s0'
+        New-Item -ItemType Directory -Path $ledgerRoot -Force | Out-Null
+        $resolvedParent = (Resolve-Path -LiteralPath (Split-Path -Parent $S0LedgerOutput)).Path
+        $resolvedLedgerRoot = (Resolve-Path -LiteralPath $ledgerRoot).Path
+        if (!($resolvedParent.Equals($resolvedLedgerRoot, [StringComparison]::OrdinalIgnoreCase) -or
+              $resolvedParent.StartsWith($resolvedLedgerRoot + '\', [StringComparison]::OrdinalIgnoreCase)) -or
+            !(Test-Path -LiteralPath $ledgerSource)) {
+            throw 'S0 ledger source or workspace destination invalid.'
+        }
+        Copy-Item -LiteralPath $ledgerSource -Destination $S0LedgerOutput
+        foreach($scene in @('preview','files','image-replace','wallpaper','full-refresh','pointer-hover','pointer-box','pointer-drag','pointer-dispatch','save-profile','wallpaper-profile','shell-open','shell-menu','shell-pointer','concurrent-wallpaper','roi-diagnostic')) {
+            $sceneLedger = Join-Path $managedItemsSmokeDir "resource-s0-$scene.csv"
+            if (Test-Path -LiteralPath $sceneLedger) {
+                Copy-Item -LiteralPath $sceneLedger -Destination ($S0LedgerOutput + ".$scene.csv")
+            }
+        }
+        $refreshErrors = Join-Path $managedItemsSmokeDir 'resource-s0-full-refresh-error.txt'
+        $shellDiagnostic = Join-Path $managedItemsSmokeDir 'resource-s0-shell-open-diagnostic.txt'
+        $menuDiagnostic = Join-Path $managedItemsSmokeDir 'resource-s0-shell-menu-diagnostic.txt'
+        if(Test-Path -LiteralPath $menuDiagnostic){Copy-Item -LiteralPath $menuDiagnostic -Destination ($S0LedgerOutput+'.shell-menu-diagnostic.txt')}
+        if(Test-Path -LiteralPath $shellDiagnostic){Copy-Item -LiteralPath $shellDiagnostic -Destination ($S0LedgerOutput+'.shell-open-diagnostic.txt')}
+        $shellReceipts = Join-Path $managedItemsSmokeDir 's0-open-receipts'
+        if(Test-Path -LiteralPath $shellReceipts){
+            if(@(Get-ChildItem -LiteralPath $shellReceipts -Recurse -Force|Where-Object {($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0}).Count){throw 'Refusing reparse receipt tree'}
+            Copy-Item -LiteralPath $shellReceipts -Destination ($S0LedgerOutput+'.shell-receipts') -Recurse
+        }
+        if (Test-Path -LiteralPath $refreshErrors) {
+            Copy-Item -LiteralPath $refreshErrors -Destination ($S0LedgerOutput + '.full-refresh-error.txt')
+        }
+        $pointerDiagnostic = Join-Path $managedItemsSmokeDir 'resource-s0-pointer-diagnostic.txt'
+        if (Test-Path -LiteralPath $pointerDiagnostic) {
+            Copy-Item -LiteralPath $pointerDiagnostic -Destination ($S0LedgerOutput + '.pointer-diagnostic.txt')
+        }
+        Write-Output "S0_LEDGER=$S0LedgerOutput"
     }
     $runSucceeded = $true
     Write-Output "SMOKE_STATUS=PASS"

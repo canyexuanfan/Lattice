@@ -19,8 +19,10 @@
 #include "shell/ShellItemReference.h"
 #include "shell/ShellLauncher.h"
 #include "ui/WidgetView.h"
+#include "ui/NativeDesktopView.h"
 
 class DesktopSurfaceDropTarget;
+struct DesktopWallpaperAsyncState;
 
 struct HostedWidgetDescriptor {
     std::wstring categoryId;
@@ -96,6 +98,7 @@ public:
     void Show();
     void Hide();
     void Close();
+    bool PreTranslateMessage(MSG& message);
     bool Refresh(
         std::wstring& errorMessage,
         bool refreshWallpaper = true);
@@ -109,6 +112,10 @@ public:
         const std::vector<std::wstring>& assignedIdentities);
     void UpdateDisplayPositions(
         const std::vector<DesktopPosition>& viewPositions);
+    bool PlanReturnedDisplayPosition(
+        const std::wstring& identity,
+        POINT requestedViewPoint,
+        POINT& resolvedViewPoint) const;
     void SetDisplayPositionCommitHandler(
         DisplayPositionCommitHandler handler);
     void SetRenameCommitHandler(RenameCommitHandler handler);
@@ -141,6 +148,10 @@ public:
 
 private:
     friend struct DesktopSurfaceWindowSmokeAccess;
+#ifndef NDEBUG
+    unsigned debugRefreshRequests_=0, debugWallpaperRefreshes_=0;
+    std::vector<UINT> debugSettingNotifications_;
+#endif
     friend class DesktopSurfaceDropTarget;
 
     static constexpr WallpaperBackdropDrawMode
@@ -304,9 +315,25 @@ private:
     void RebuildVisibleItems(
         const std::vector<std::wstring>& newlyObserved = {});
     void MaintainDesktopLayer();
+    void UpdateNativeDesktop();
+    void UpdateNativeWidgetRegion();
+    Microsoft::WRL::ComPtr<NativeDesktopView> nativeDesktop_;
+    bool nativeShowRequested_ = false;
+    bool nativeDragSession_ = false;
+    bool nativeWidgetRegionSet_ = false;
+    std::vector<RECT> nativeWidgetRegion_;
     void UpdateViewMetrics();
     void ConfigurePixelRenderTarget();
     bool RefreshWallpaperForCurrentTarget();
+    void QueueWallpaperRefresh();
+    void StartAsyncWallpaperRefresh();
+    void HandleAsyncWallpaperReady(WPARAM token);
+    void CancelAsyncWallpaperRefresh(bool close);
+    std::shared_ptr<DesktopWallpaperAsyncState> wallpaperAsyncState_;
+    ID2D1RenderTarget* wallpaperAsyncTarget_ = nullptr;
+    bool wallpaperAsyncRunning_ = false;
+    bool wallpaperRefreshRequested_ = false;
+    bool wallpaperAsyncRecovery_ = false;
     void RecoverWallpaperAfterRenderFailure();
     void StartWallpaperRecovery(bool hideSurface);
     void StopWallpaperRecovery() noexcept;
@@ -347,7 +374,8 @@ private:
         const RECT& viewBounds,
         int cellWidth,
         int cellHeight,
-        const std::vector<std::wstring>& newlyObserved = {});
+        const std::vector<std::wstring>& newlyObserved = {},
+        bool snapDisplayOverridesToGrid = false);
 
     struct PositionOverride {
         std::wstring identity;
@@ -426,6 +454,14 @@ private:
     int hostedDragInsertionIndex_ = -1;
     std::uint64_t hostedDragGhostGeneration_ = 0;
 #ifndef NDEBUG
+    bool s0TraceEnabled_ = false;
+    std::uint64_t s0RenderCount_ = 0;
+    std::uint64_t s0DrawPixels_ = 0;
+    std::uint64_t s0DirtyPixels_ = 0;
+    std::uint64_t s0QpcFrequency_ = 0;
+    std::vector<std::uint64_t> s0FrameMicroseconds_;
+    mutable std::uint64_t s0NativeQueryCount_ = 0;
+    mutable double s0NativeQueryMaxMs_ = 0;
     InternalDropStage internalDropStage_ = InternalDropStage::None;
     std::unique_ptr<WidgetView> hostedWidgetSlice_;
     int hostedWidgetPublishFailureIndex_ = -1;
@@ -437,6 +473,8 @@ private:
     POINT doubleClickPointForSmoke_{};
     size_t desktopOpenRequestCountForSmoke_ = 0;
     std::wstring desktopOpenPathForSmoke_;
+    size_t desktopMenuRequestCountForSmoke_ = 0;
+    std::wstring desktopMenuPathForSmoke_;
 #endif
     bool dropTargetRegistered_ = false;
     Microsoft::WRL::ComPtr<IDropTarget> desktopDropTarget_;

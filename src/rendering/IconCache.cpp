@@ -654,6 +654,17 @@ public:
         return true;
     }
 
+    bool SubmitWallpaperWork(std::function<void()> task) {
+        if (!task) { return false; }
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (stop_ || wallpaperTask_) { return false; }
+            wallpaperTask_ = std::move(task);
+        }
+        condition_.notify_one();
+        return true;
+    }
+
     void Shutdown() {
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -706,14 +717,31 @@ private:
         Microsoft::WRL::ComPtr<IShellFolder> desktopFolder;
         for (;;) {
             Request request;
+            std::function<void()> wallpaperTask;
             {
                 std::unique_lock<std::mutex> lock(mutex_);
-                condition_.wait(lock, [&]() { return stop_ || !requests_.empty(); });
-                if (stop_ && requests_.empty()) {
+                condition_.wait(lock, [&]() { return stop_ || !requests_.empty() ||
+                    (wallpaperTask_ && !wallpaperRunning_); });
+                if (wallpaperTask_ && !wallpaperRunning_) {
+                    wallpaperTask = std::move(wallpaperTask_);
+                    wallpaperRunning_ = true;
+                } else if (!requests_.empty()) {
+                    request = std::move(requests_.front());
+                    requests_.pop();
+                } else if (stop_) {
                     break;
+                } else {
+                    continue;
                 }
-                request = std::move(requests_.front());
-                requests_.pop();
+            }
+            if (wallpaperTask) {
+                wallpaperTask();
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    wallpaperRunning_ = false;
+                }
+                condition_.notify_all();
+                continue;
             }
 
             const std::shared_ptr<IconAsyncState> state = request.state.lock();
@@ -920,6 +948,8 @@ private:
     std::mutex mutex_;
     std::condition_variable condition_;
     std::queue<Request> requests_;
+    std::function<void()> wallpaperTask_;
+    bool wallpaperRunning_ = false;
     bool stop_ = false;
 };
 
@@ -951,6 +981,10 @@ void IconCache::ShutdownSharedLoader() {
     if (sharedIconLoaderInstance != nullptr) {
         sharedIconLoaderInstance->Shutdown();
     }
+}
+
+bool IconCache::SubmitWallpaperWork(std::function<void()> task) {
+    return SharedIconLoader::Instance().SubmitWallpaperWork(std::move(task));
 }
 
 ID2D1Bitmap* IconCache::GetIcon(
@@ -1236,6 +1270,40 @@ size_t IconCache::PendingCountForTesting() const noexcept {
     std::lock_guard<std::mutex> lock(asyncState_->mutex);
     return asyncState_->pendingById.size();
 }
+
+#ifndef NDEBUG
+HICON IconCache::CopyCachedIconForTesting(const std::wstring& path) const {
+    std::lock_guard<std::mutex> lock(cacheMutex_);
+    const auto icon = dragIconCache_.find(path);
+    if (cache_.find(path) == cache_.end() ||
+        icon == dragIconCache_.end() || icon->second == nullptr) {
+        return nullptr;
+    }
+    return CopyIcon(icon->second);
+}
+
+size_t IconCache::DragIconCountForTesting() const noexcept {
+    std::lock_guard<std::mutex> lock(cacheMutex_);
+    return dragIconCache_.size();
+}
+
+std::uint64_t IconCache::BitmapPixelBytesForTesting() const noexcept {
+    std::lock_guard<std::mutex> lock(cacheMutex_);
+    std::uint64_t bytes = 0;
+    const auto add = [&bytes](ID2D1Bitmap* bitmap) {
+        if (bitmap != nullptr) {
+            const D2D1_SIZE_U size = bitmap->GetPixelSize();
+            bytes += static_cast<std::uint64_t>(size.width) * size.height * 4;
+        }
+    };
+    for (const auto& entry : cache_) {
+        add(entry.second.Get());
+    }
+    add(filePlaceholder_.Get());
+    add(folderPlaceholder_.Get());
+    return bytes;
+}
+#endif
 
 size_t IconCache::Capacity() const noexcept {
     std::lock_guard<std::mutex> lock(cacheMutex_);

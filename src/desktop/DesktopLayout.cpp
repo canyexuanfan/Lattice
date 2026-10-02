@@ -23,6 +23,18 @@ namespace {
 
 using Microsoft::WRL::ComPtr;
 
+#ifndef NDEBUG
+void S0SnapshotDiagnostic(const char* text) {
+    wchar_t enabled[2]{};
+    if (GetEnvironmentVariableW(L"DESKTOP_ORGANIZER_S0_WALLPAPER_DIAGNOSTIC",
+            enabled, ARRAYSIZE(enabled)) == 1 && enabled[0] == L'1') {
+        DWORD written = 0;
+        WriteFile(GetStdHandle(STD_ERROR_HANDLE), text,
+            static_cast<DWORD>(std::char_traits<char>::length(text)), &written, nullptr);
+    }
+}
+#endif
+
 std::wstring FullPath(const std::wstring& path) {
     if (path.empty()) {
         return {};
@@ -101,7 +113,13 @@ HRESULT GetDesktopFolderViewOnce(
         *viewWindow = nullptr;
     }
     ComPtr<IShellWindows> shellWindows;
+#ifndef NDEBUG
+    S0SnapshotDiagnostic("S0_SNAPSHOT_STAGE qualified=false,stage=ShellWindows.CoCreateInstance,phase=begin\n");
+#endif
     HRESULT result = CoCreateInstance(CLSID_ShellWindows, nullptr, CLSCTX_ALL, IID_PPV_ARGS(&shellWindows));
+#ifndef NDEBUG
+    S0SnapshotDiagnostic("S0_SNAPSHOT_STAGE qualified=false,stage=ShellWindows.CoCreateInstance,phase=returned\n");
+#endif
     if (FAILED(result)) {
         return result;
     }
@@ -113,7 +131,13 @@ HRESULT GetDesktopFolderViewOnce(
     root.vt = VT_EMPTY;
     long desktopHwnd = 0;
     ComPtr<IDispatch> dispatch;
+#ifndef NDEBUG
+    S0SnapshotDiagnostic("S0_SNAPSHOT_STAGE qualified=false,stage=FindWindowSW,phase=begin\n");
+#endif
     result = shellWindows->FindWindowSW(&location, &root, SWC_DESKTOP, &desktopHwnd, SWFO_NEEDDISPATCH, &dispatch);
+#ifndef NDEBUG
+    S0SnapshotDiagnostic("S0_SNAPSHOT_STAGE qualified=false,stage=FindWindowSW,phase=returned\n");
+#endif
     if (FAILED(result) || dispatch == nullptr) {
         return FAILED(result) ? result : E_NOINTERFACE;
     }
@@ -124,12 +148,24 @@ HRESULT GetDesktopFolderViewOnce(
         return result;
     }
     ComPtr<IShellBrowser> shellBrowser;
+#ifndef NDEBUG
+    S0SnapshotDiagnostic("S0_SNAPSHOT_STAGE qualified=false,stage=QueryService,phase=begin\n");
+#endif
     result = serviceProvider->QueryService(SID_STopLevelBrowser, IID_PPV_ARGS(&shellBrowser));
+#ifndef NDEBUG
+    S0SnapshotDiagnostic("S0_SNAPSHOT_STAGE qualified=false,stage=QueryService,phase=returned\n");
+#endif
     if (FAILED(result)) {
         return result;
     }
     ComPtr<IShellView> shellView;
+#ifndef NDEBUG
+    S0SnapshotDiagnostic("S0_SNAPSHOT_STAGE qualified=false,stage=QueryActiveShellView,phase=begin\n");
+#endif
     result = shellBrowser->QueryActiveShellView(&shellView);
+#ifndef NDEBUG
+    S0SnapshotDiagnostic("S0_SNAPSHOT_STAGE qualified=false,stage=QueryActiveShellView,phase=returned\n");
+#endif
     if (FAILED(result)) {
         return result;
     }
@@ -307,6 +343,22 @@ public:
             (item.state & LVIS_OVERLAYMASK) >> 8U);
         return true;
     }
+
+#ifndef NDEBUG
+    bool ReadPosition(int viewIndex, POINT& point) {
+        if (!available_ || viewIndex < 0 || !IsWindow(listViewWindow_)) return false;
+        DWORD currentProcess = 0;
+        GetWindowThreadProcessId(listViewWindow_, &currentProcess);
+        if (currentProcess != processId_) { Reset(); return false; }
+        DWORD_PTR result = 0;
+        if (!SendMessageTimeoutW(listViewWindow_, LVM_GETITEMPOSITION,
+                static_cast<WPARAM>(viewIndex), reinterpret_cast<LPARAM>(remoteBuffer_),
+                SMTO_ABORTIFHUNG | SMTO_BLOCK, 100, &result) || !result) return false;
+        SIZE_T read = 0;
+        return ReadProcessMemory(process_, remoteBuffer_, &point, sizeof(point), &read) &&
+            read == sizeof(point);
+    }
+#endif
 
 private:
     void Reset() {
@@ -491,12 +543,18 @@ bool PositionViewItemAndConfirm(
 bool CaptureViewSnapshotCore(
     DesktopViewSnapshot& snapshot,
     std::wstring& errorMessage) {
+#ifndef NDEBUG
+    S0SnapshotDiagnostic("S0_SNAPSHOT_STAGE qualified=false,stage=GetDesktopFolderView,phase=begin\n");
+#endif
     errorMessage.clear();
     snapshot = {};
     ComPtr<IFolderView> view;
     HWND shellViewWindow = nullptr;
     const HRESULT viewResult =
         GetDesktopFolderView(view, &shellViewWindow);
+#ifndef NDEBUG
+    S0SnapshotDiagnostic("S0_SNAPSHOT_STAGE qualified=false,stage=GetDesktopFolderView,phase=returned\n");
+#endif
     if (FAILED(viewResult) ||
         view == nullptr || shellViewWindow == nullptr) {
         errorMessage =
@@ -515,6 +573,9 @@ bool CaptureViewSnapshotCore(
         return false;
     }
     std::vector<ShellDesktopItem> shellItems;
+#ifndef NDEBUG
+    S0SnapshotDiagnostic("S0_SNAPSHOT_STAGE qualified=false,stage=EnumerateDesktopItems,phase=begin\n");
+#endif
     if (!EnumerateDesktopItems(view.Get(), shellItems, errorMessage)) {
         if (errorMessage.empty()) {
             errorMessage =
@@ -523,6 +584,9 @@ bool CaptureViewSnapshotCore(
         snapshot = {};
         return false;
     }
+#ifndef NDEBUG
+    S0SnapshotDiagnostic("S0_SNAPSHOT_STAGE qualified=false,stage=EnumerateDesktopItems,phase=returned\n");
+#endif
     ComPtr<IShellFolder> folder;
     if (FAILED(view->GetFolder(IID_PPV_ARGS(&folder))) || folder == nullptr) {
         errorMessage =
@@ -625,6 +689,22 @@ struct DesktopSnapshotState {
 };
 
 }  // namespace
+
+#ifndef NDEBUG
+bool DesktopLayout::CaptureNativeControlPositionsForTesting(
+    const DesktopViewSnapshot& snapshot,
+    std::vector<DesktopPosition>& positions) const {
+    positions.clear();
+    ExplorerListViewImageReader reader;
+    if (!reader.Initialize(snapshot.listViewWindow)) return false;
+    for (const auto& item : snapshot.items) {
+        POINT point{};
+        if (!reader.ReadPosition(item.viewIndex, point)) return false;
+        positions.push_back({item.path, point});
+    }
+    return true;
+}
+#endif
 
 DWORD DesktopLayout::FlagsWithSnapToGrid(DWORD flags) noexcept {
     return flags | static_cast<DWORD>(FWF_SNAPTOGRID);

@@ -1,8 +1,11 @@
 #include <Windows.h>
+#include <windowsx.h>
 #include <commctrl.h>
 #include <commoncontrols.h>
 #include <dwmapi.h>
 #include <d2d1helper.h>
+#include <dxgi1_4.h>
+#include <psapi.h>
 #include <process.h>
 #include <shellapi.h>
 #include <ShlObj.h>
@@ -34,6 +37,8 @@
 #include <thread>
 #include <unordered_set>
 #include <vector>
+
+#pragma comment(lib, "dxgi.lib")
 
 #include "app/App.h"
 #include "app/resource.h"
@@ -71,6 +76,11 @@
 #pragma comment(lib, "dwmapi.lib")
 
 struct DragGhostWindowSmokeAccess {
+    static std::pair<long long, long long> ResourceCountsForS0(const DragGhostWindow& ghost) {
+        return {ghost.surfaceBitmap_ == nullptr ? 0LL :
+            static_cast<long long>(ghost.surfaceSizePixels_.cx) * ghost.surfaceSizePixels_.cy * 4,
+            ghost.icon_ == nullptr ? 0LL : 1LL};
+    }
     static bool CaptureStagedPixels(
         DragGhostWindow& ghost,
         HINSTANCE instance,
@@ -276,6 +286,17 @@ bool CaptureExplorerSelectionForSmoke(
 }  // namespace
 
 struct AutoOrganizePreviewWindowSmokeAccess {
+    static void WriteS0Metrics(
+        const AutoOrganizePreviewWindow& window, std::ostream& output) {
+        output << window.iconCache_.Size() << ','
+               << window.iconCache_.BitmapPixelBytesForTesting() << ','
+               << window.iconCache_.DragIconCountForTesting() << ','
+               << window.iconCache_.PendingCountForTesting() << ','
+               << (window.d2d_.Target() != nullptr) << ','
+               << window.scanThread_.joinable() << ','
+               << InvisibleResourcesReleased(window);
+    }
+
     static bool Ready(const AutoOrganizePreviewWindow& window) {
         return window.state_ == AutoOrganizePreviewWindow::ViewState::Ready;
     }
@@ -1017,6 +1038,506 @@ struct WidgetWindowSmokeAccess {
 };
 
 struct DesktopSurfaceWindowSmokeAccess {
+    static bool NativeReady(const DesktopSurfaceWindow& surface) {
+        return surface.nativeDesktop_ && surface.nativeDesktop_->Ready();
+    }
+    static HWND NativeList(const DesktopSurfaceWindow& surface) {
+        return surface.nativeDesktop_ ? surface.nativeDesktop_->ListWindow() : nullptr;
+    }
+    static std::vector<std::wstring> NativeSelected(const DesktopSurfaceWindow& surface) {
+        return surface.nativeDesktop_ ? surface.nativeDesktop_->SelectedIdentities() : std::vector<std::wstring>{};
+    }
+    static bool NativeRefresh(DesktopSurfaceWindow& surface) {
+        return surface.nativeDesktop_ && surface.nativeDesktop_->view_ &&
+            SUCCEEDED(surface.nativeDesktop_->view_->Refresh());
+    }
+    static std::array<unsigned,9> NativeOpenCounters(const DesktopSurfaceWindow& surface) {
+        const auto& n=*surface.nativeDesktop_.Get();
+        return {n.debugNavigationRequests_,n.debugViewsCreated_,n.debugMembershipBuilds_,
+            n.debugPaintRecoveries_,n.debugShows_,n.debugHides_,n.debugPositionApplications_,
+            surface.debugRefreshRequests_,surface.debugWallpaperRefreshes_};
+    }
+    static const std::vector<UINT>& SettingNotifications(const DesktopSurfaceWindow& surface) {
+        return surface.debugSettingNotifications_;
+    }
+    static HWND NativeParent(const DesktopSurfaceWindow& surface) { return surface.nativeDesktop_->Window(); }
+    static unsigned NativeParentPaints(const DesktopSurfaceWindow& surface) { return surface.nativeDesktop_->debugParentPaints_; }
+    static std::string NativeRefreshState(const DesktopSurfaceWindow& surface) {
+        const auto& n=*surface.nativeDesktop_.Get();
+        return " ready="+std::to_string(n.ready_)+" membership="+std::to_string(n.membershipDirty_)+
+            " rebuilding="+std::to_string(n.rebuildingMembership_)+" queued="+std::to_string(n.queued_)+
+            " list="+std::to_string(reinterpret_cast<UINT_PTR>(n.list_))+" list_live="+std::to_string(n.Owns(n.list_))+
+            " visible_list="+std::to_string(reinterpret_cast<UINT_PTR>(FindWindowExW(n.viewWindow_,nullptr,L"SysListView32",nullptr)));
+    }
+    static bool NativeWidgetHit(const DesktopSurfaceWindow& surface) {
+        if(surface.hostedWidgets_.empty()) return false;
+        const RECT rect=surface.hostedWidgets_.front()->view.HostPixelBounds();
+        POINT point{rect.left+20,rect.top+12};
+        return ClientToScreen(surface.hwnd_,&point) && IsWindowVisible(surface.hwnd_) && WindowFromPoint(point)==surface.hwnd_;
+    }
+    static bool NativeSelect(DesktopSurfaceWindow& surface, const std::wstring& identity, UINT flags) {
+        if (!NativeReady(surface)) return false;
+        auto& native=*surface.nativeDesktop_.Get();
+        if(identity.empty()) return SUCCEEDED(native.view_->SelectItem(nullptr,flags));
+        int count=0; native.folderView_->ItemCount(SVGIO_ALLVIEW,&count);
+        for(int i=0;i<count;++i) if(native.IdentityAt(i)==identity) {
+            PITEMID_CHILD child=nullptr;
+            if(FAILED(native.folderView_->Item(i,&child))) return false;
+            const bool ok=SUCCEEDED(native.view_->SelectItem(child,flags));
+            CoTaskMemFree(child); return ok;
+        }
+        return false;
+    }
+    static bool NativePoint(const DesktopSurfaceWindow& surface, const std::wstring& identity, POINT& point) {
+        if (!NativeReady(surface)) return false;
+        auto& native = *surface.nativeDesktop_.Get();
+        int count = 0;
+        if (FAILED(native.folderView_->ItemCount(SVGIO_ALLVIEW, &count))) return false;
+        for (int i=0; i<count; ++i) if (native.IdentityAt(i) == identity) {
+            PITEMID_CHILD child = nullptr;
+            if (FAILED(native.folderView_->Item(i, &child))) return false;
+            const bool ok = SUCCEEDED(native.folderView_->GetItemPosition(child, &point));
+            CoTaskMemFree(child); return ok && ClientToScreen(native.list_, &point);
+        }
+        return false;
+    }
+    static void FailNativePaint(DesktopSurfaceWindow& surface) {
+        if (surface.nativeDesktop_) SendMessageW(surface.nativeDesktop_->Window(), WM_PRINTCLIENT, 0, PRF_CLIENT);
+    }
+    static void NativeRenameFixture(DesktopSurfaceWindow& surface, const std::wstring& identity,POINT screen,
+        NativeDesktopView::RenameHandler handler) {
+        surface.nativeDesktop_->SetRenameHandler(std::move(handler));
+        surface.nativeDesktop_->Update({{identity,screen}});
+    }
+    static void WriteS0GpuLedger(std::ostream& output) {
+        Microsoft::WRL::ComPtr<IDXGIFactory1> factory;
+        const HRESULT factoryResult = CreateDXGIFactory1(
+            IID_PPV_ARGS(factory.GetAddressOf()));
+        output << "gpu_factory_hresult=" << factoryResult << "\n";
+        if (FAILED(factoryResult)) {
+            return;
+        }
+        for (UINT index = 0; index < 16; ++index) {
+            Microsoft::WRL::ComPtr<IDXGIAdapter1> adapter;
+            const HRESULT enumResult = factory->EnumAdapters1(
+                index, adapter.GetAddressOf());
+            if (enumResult == DXGI_ERROR_NOT_FOUND) {
+                break;
+            }
+            output << "gpu_" << index << "_enum_hresult="
+                   << enumResult << "\n";
+            if (FAILED(enumResult)) {
+                break;
+            }
+            DXGI_ADAPTER_DESC1 description{};
+            const HRESULT descriptionResult = adapter->GetDesc1(&description);
+            output << "gpu_" << index << "_description_hresult="
+                   << descriptionResult << "\n";
+            if (SUCCEEDED(descriptionResult)) {
+                output << "gpu_" << index << "_luid_high="
+                       << description.AdapterLuid.HighPart << "\n"
+                       << "gpu_" << index << "_luid_low="
+                       << description.AdapterLuid.LowPart << "\n"
+                       << "gpu_" << index << "_flags="
+                       << description.Flags << "\n";
+            }
+            Microsoft::WRL::ComPtr<IDXGIAdapter3> adapter3;
+            const HRESULT interfaceResult = adapter.As(&adapter3);
+            output << "gpu_" << index << "_interface_hresult="
+                   << interfaceResult << "\n";
+            if (FAILED(interfaceResult)) {
+                continue;
+            }
+            for (const DXGI_MEMORY_SEGMENT_GROUP group : {
+                     DXGI_MEMORY_SEGMENT_GROUP_LOCAL,
+                     DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL}) {
+                DXGI_QUERY_VIDEO_MEMORY_INFO info{};
+                const HRESULT queryResult = adapter3->QueryVideoMemoryInfo(
+                    0, group, &info);
+                const char* name = group == DXGI_MEMORY_SEGMENT_GROUP_LOCAL
+                    ? "local" : "nonlocal";
+                output << "gpu_" << index << "_" << name << "_hresult="
+                       << queryResult << "\n";
+                if (SUCCEEDED(queryResult)) {
+                    output << "gpu_" << index << "_" << name
+                           << "_usage_bytes=" << info.CurrentUsage << "\n"
+                           << "gpu_" << index << "_" << name
+                           << "_budget_bytes=" << info.Budget << "\n";
+                }
+            }
+        }
+    }
+
+    static void ResetS0Frames(DesktopSurfaceWindow& surface) {
+        surface.s0FrameMicroseconds_.clear();
+        surface.s0RenderCount_ = 0;
+        surface.s0DrawPixels_ = 0;
+        surface.s0DirtyPixels_ = 0;
+    }
+
+    static bool HoverS0Fixture(DesktopSurfaceWindow& surface, size_t step) {
+        if (surface.hostedWidgets_.empty() ||
+            surface.hostedWidgets_.front() == nullptr ||
+            surface.hostedWidgets_.front()->descriptor.categoryId !=
+                L"resource-category-0" || surface.hwnd_ == nullptr) {
+            return false;
+        }
+        const RECT cell = surface.hostedWidgets_.front()->view.ItemHostCell(
+            step % 4);
+        if (cell.right <= cell.left || cell.bottom <= cell.top) {
+            return false;
+        }
+        SendMessageW(surface.hwnd_, WM_MOUSEMOVE, 0, MAKELPARAM(
+            (cell.left + cell.right) / 2, (cell.top + cell.bottom) / 2));
+        return true;
+    }
+
+    struct S0PointerTarget {
+        POINT client{}, screen{};
+        RECT screenCell{};
+        size_t widgetIndex = 0;
+        int itemIndex = 0;
+    };
+
+    static std::optional<S0PointerTarget> S0HostedItemTarget(
+        DesktopSurfaceWindow& surface, const std::wstring& categoryId, const std::wstring& itemId) {
+        if (surface.iconCache_.PendingCountForTesting() != 0) return std::nullopt;
+        for (size_t index = 0; index < surface.hostedWidgets_.size(); ++index) {
+            const auto& widget = surface.hostedWidgets_[index];
+            if (!widget || widget->descriptor.categoryId != categoryId) continue;
+            for (size_t item = 0; item < widget->descriptor.items.size(); ++item) {
+                const auto* actual = widget->view.ItemAt(item);
+                if (!actual || actual->id != itemId) continue;
+                const RECT cell = widget->view.ItemHostCell(item);
+                S0PointerTarget target;
+                target.widgetIndex = index; target.itemIndex = static_cast<int>(item);
+                target.client = POINT{(cell.left + cell.right) / 2, (cell.top + cell.bottom) / 2};
+                const auto hit = widget->view.HitTestHostPoint(target.client);
+                if (cell.right <= cell.left || cell.bottom <= cell.top || hit.itemIndex != target.itemIndex ||
+                    (hit.kind != WidgetViewHitKind::ItemIcon && hit.kind != WidgetViewHitKind::ItemCellGap)) return std::nullopt;
+                target.screen = target.client;
+                POINT first{cell.left, cell.top}, last{cell.right, cell.bottom};
+                if (!ClientToScreen(surface.hwnd_, &target.screen) || !ClientToScreen(surface.hwnd_, &first) ||
+                    !ClientToScreen(surface.hwnd_, &last)) return std::nullopt;
+                target.screenCell = RECT{first.x, first.y, last.x, last.y};
+                return target;
+            }
+        }
+        return std::nullopt;
+    }
+
+    static std::optional<S0PointerTarget> S0DesktopItemTarget(
+        DesktopSurfaceWindow& surface, const std::wstring& identity,
+        std::ostream* diagnostic = nullptr) {
+        const size_t pending = surface.iconCache_.PendingCountForTesting();
+        const auto reject = [&](const char* reason,
+                                size_t index = SIZE_MAX,
+                                HRESULT result = S_OK)
+            -> std::optional<S0PointerTarget> {
+            if (diagnostic != nullptr) {
+                const auto matches = [&](const auto& items) {
+                    return std::count_if(items.begin(), items.end(),
+                        [&](const auto& item) {
+                            return CompareStringOrdinal(item.path.c_str(), -1,
+                                identity.c_str(), -1, TRUE) == CSTR_EQUAL;
+                        });
+                };
+                *diagnostic << "desktop_target_reject=" << reason
+                    << ",icon_pending=" << pending
+                    << ",snapshot_items=" << surface.snapshot_.items.size()
+                    << ",snapshot_matches=" << matches(surface.snapshot_.items)
+                    << ",visible_items=" << surface.visibleItems_.size()
+                    << ",visible_matches=" << matches(surface.visibleItems_)
+                    << ",item_index=" << index
+                    << ",resolve_hr=" << static_cast<long>(result) << '\n';
+            }
+            return std::nullopt;
+        };
+        if (pending != 0) return reject("icons-pending");
+        std::optional<S0PointerTarget> result;
+        for (size_t index = 0; index < surface.visibleItems_.size(); ++index) {
+            const auto& item = surface.visibleItems_[index];
+            if (CompareStringOrdinal(item.path.c_str(), -1, identity.c_str(), -1, TRUE) != CSTR_EQUAL) continue;
+            std::wstring resolved;
+            if (result) return reject("duplicate-identity", index);
+            if (item.shellChildPidl.empty()) return reject("empty-child-pidl", index);
+            const HRESULT resolveResult = ResolveDesktopShellItemReferenceParsingName(
+                {item.path, item.shellChildPidl}, resolved);
+            if (FAILED(resolveResult)) return reject("pidl-resolve-failed", index, resolveResult);
+            if (CompareStringOrdinal(resolved.c_str(), -1, identity.c_str(), -1, TRUE) != CSTR_EQUAL)
+                return reject("pidl-identity-mismatch", index, resolveResult);
+            const RECT cell = surface.CellRect(item);
+            const LONG left = cell.left + (surface.cellWidth_ - surface.iconSize_) / 2;
+            S0PointerTarget target;
+            target.itemIndex = static_cast<int>(index);
+            target.client = {left + surface.iconSize_ / 2, cell.top + surface.iconSize_ / 2};
+            if (surface.HitTest(target.client) != target.itemIndex) return reject("paint-hit-identity-mismatch", index);
+            if (surface.HostedWidgetIndexAt(target.client) >= 0) return reject("hosted-overlap", index);
+            target.screen = target.client;
+            POINT first{left, cell.top}, last{left + surface.iconSize_, cell.top + surface.iconSize_};
+            if (!ClientToScreen(surface.hwnd_, &target.screen) || !ClientToScreen(surface.hwnd_, &first) ||
+                !ClientToScreen(surface.hwnd_, &last)) return reject("screen-conversion-failed", index);
+            target.screenCell = {first.x, first.y, last.x, last.y};
+            result = target;
+        }
+        return result ? result : reject("identity-not-visible");
+    }
+
+    static std::pair<size_t, std::wstring> S0DesktopRequest(const DesktopSurfaceWindow& surface, bool menu) {
+        return menu ? std::make_pair(surface.desktopMenuRequestCountForSmoke_, surface.desktopMenuPathForSmoke_) :
+            std::make_pair(surface.desktopOpenRequestCountForSmoke_, surface.desktopOpenPathForSmoke_);
+    }
+
+    static DesktopSurfaceWindow::HostedWidgetCommandHandler ExchangeS0CommandObserver(
+        DesktopSurfaceWindow& surface, DesktopSurfaceWindow::HostedWidgetCommandHandler handler) {
+        auto original = std::move(surface.hostedWidgetCommandHandler_);
+        surface.hostedWidgetCommandHandler_ = std::move(handler);
+        return original;
+    }
+
+    static bool S0PointerTargetExposed(const DesktopSurfaceWindow& surface, const S0PointerTarget& target) {
+        const RECT& cell = target.screenCell;
+        for (const POINT point : {target.screen, POINT{cell.left, cell.top},
+                 POINT{cell.right - 1, cell.top}, POINT{cell.left, cell.bottom - 1},
+                 POINT{cell.right - 1, cell.bottom - 1}}) {
+            if (WindowFromPoint(point) != surface.hwnd_) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    static std::vector<S0PointerTarget> ExposedS0PointerTargets(
+        DesktopSurfaceWindow& surface, const std::filesystem::path& desktopRoot,
+        std::ostream* diagnostics = nullptr, bool fixedDragTargets = false) {
+        std::vector<S0PointerTarget> targets;
+        if (diagnostics != nullptr) {
+            *diagnostics << "icon_pending=" << surface.iconCache_.PendingCountForTesting()
+                << "\nhosted_widgets=" << surface.hostedWidgets_.size() << "\n";
+        }
+        if (surface.iconCache_.PendingCountForTesting() != 0) {
+            return targets;
+        }
+        for (size_t index = 0; index < surface.hostedWidgets_.size() && targets.size() < 4; ++index) {
+            const auto& widget = surface.hostedWidgets_[index];
+            if (widget == nullptr || widget->descriptor.categoryId.find(L"resource-category-") != 0) {
+                continue;
+            }
+            if (fixedDragTargets && widget->descriptor.categoryId != L"resource-category-0" &&
+                widget->descriptor.categoryId != L"resource-category-5") continue;
+            for (size_t item = 0; item < (std::min<size_t>)(4, widget->descriptor.items.size()) && targets.size() < 4; ++item) {
+                if (fixedDragTargets && item >= 2) continue;
+                if (std::filesystem::path(widget->descriptor.items[item].path).parent_path() != desktopRoot) {
+                    continue;
+                }
+                const RECT cell = widget->view.ItemHostCell(item);
+                if (cell.right <= cell.left || cell.bottom <= cell.top) {
+                    continue;
+                }
+                S0PointerTarget target;
+                target.client = {(cell.left + cell.right) / 2, (cell.top + cell.bottom) / 2};
+                const WidgetViewHit hit = widget->view.HitTestHostPoint(target.client);
+                if ((hit.kind != WidgetViewHitKind::ItemIcon && hit.kind != WidgetViewHitKind::ItemCellGap) ||
+                    hit.itemIndex != static_cast<int>(item)) {
+                    continue;
+                }
+                POINT topLeft{cell.left, cell.top}, bottomRight{cell.right, cell.bottom};
+                target.screen = target.client;
+                if (!ClientToScreen(surface.hwnd_, &target.screen) ||
+                    !ClientToScreen(surface.hwnd_, &topLeft) || !ClientToScreen(surface.hwnd_, &bottomRight)) {
+                    continue;
+                }
+                target.screenCell = {topLeft.x, topLeft.y, bottomRight.x, bottomRight.y};
+                const bool exposed = S0PointerTargetExposed(surface, target);
+                if (diagnostics != nullptr) {
+                    const HWND centerWindow = WindowFromPoint(target.screen);
+                    DWORD centerPid = 0;
+                    GetWindowThreadProcessId(centerWindow, &centerPid);
+                    wchar_t centerClass[128]{};
+                    GetClassNameW(centerWindow, centerClass, static_cast<int>(_countof(centerClass)));
+                    *diagnostics << "candidate=" << index << ',' << item << ',' << target.screen.x << ','
+                        << target.screen.y << ',' << topLeft.x << ',' << topLeft.y << ','
+                        << bottomRight.x << ',' << bottomRight.y << ",fully_exposed=" << exposed
+                        << ",center_pid=" << centerPid << ",center_class=" << Utf8Text(centerClass) << "\n";
+                }
+                if (exposed) {
+                    target.widgetIndex = index;
+                    target.itemIndex = static_cast<int>(item);
+                    targets.push_back(target);
+                }
+            }
+        }
+        return targets;
+    }
+
+    static std::pair<std::wstring, std::wstring> S0BoxIdentity(
+        const DesktopSurfaceWindow& surface, const S0PointerTarget& target) {
+        if (target.widgetIndex >= surface.hostedWidgets_.size() ||
+            surface.hostedWidgets_[target.widgetIndex] == nullptr) {
+            return {};
+        }
+        const auto& entry = *surface.hostedWidgets_[target.widgetIndex];
+        const auto* item = entry.view.ItemAt(static_cast<size_t>(target.itemIndex));
+        return item == nullptr ? std::pair<std::wstring, std::wstring>{} :
+            std::pair<std::wstring, std::wstring>{entry.descriptor.categoryId, item->id};
+    }
+
+    static bool S0BoxStart(const DesktopSurfaceWindow& surface,
+        const S0PointerTarget& target, const std::wstring& categoryId, POINT& screen, std::ostream* diagnostic = nullptr) {
+        const auto entry = std::find_if(surface.hostedWidgets_.begin(), surface.hostedWidgets_.end(),
+            [&](const auto& widget) { return widget != nullptr && widget->descriptor.categoryId == categoryId; });
+        if (entry == surface.hostedWidgets_.end()) { return false; }
+        const auto& view = (*entry)->view;
+        const RECT first = view.ItemHostCell(0), second = view.ItemHostCell(1), next = view.ItemHostCell(2);
+        if (target.itemIndex < 0 || target.itemIndex > 1 || first.top != second.top ||
+            first.bottom != second.bottom || (!IsRectEmpty(&next) && next.top < first.bottom)) { return false; }
+        for (const LONG inset : {2L, 4L, 6L}) {
+            POINT point{second.right + inset, target.client.y};
+            if (diagnostic != nullptr) {
+                *diagnostic << "start_candidate=" << point.x << ',' << point.y << ",hit="
+                    << static_cast<int>(view.HitTestHostPoint(point).kind) << '\n';
+            }
+            if (view.ContainsHostPoint(point) &&
+                view.HitTestHostPoint(point).kind == WidgetViewHitKind::Empty) {
+                screen = point;
+                return ClientToScreen(surface.hwnd_, &screen) &&
+                    WindowFromPoint(screen) == surface.hwnd_;
+            }
+        }
+        return false;
+    }
+
+    static bool S0BoxState(const DesktopSurfaceWindow& surface,
+        const S0PointerTarget& target, const std::pair<std::wstring, std::wstring>& identity,
+        const std::vector<std::wstring>& expected, int stage) {
+        const auto found = std::find_if(surface.hostedWidgets_.begin(), surface.hostedWidgets_.end(),
+            [&](const auto& widget) { return widget != nullptr && widget->descriptor.categoryId == identity.first; });
+        if (found == surface.hostedWidgets_.end()) { return false; }
+        const auto& entry = **found;
+        const auto& selected = entry.view.SelectedItemIds();
+        const DesktopItem* item = entry.view.ItemAt(static_cast<size_t>(target.itemIndex));
+        const bool selection = item != nullptr && item->id == identity.second && selected == expected;
+        if (stage == 0) {
+            return item != nullptr && item->id == identity.second && selected.empty() && GetCapture() == surface.hwnd_ &&
+                surface.hostedPointerGesture_ == DesktopSurfaceWindow::HostedPointerGesture::MarqueePending;
+        }
+        if (stage == 1) {
+            return selection && GetCapture() == surface.hwnd_ &&
+                surface.hostedPointerGesture_ == DesktopSurfaceWindow::HostedPointerGesture::MarqueeActive;
+        }
+        return selection && GetCapture() == nullptr &&
+            surface.hostedPointerGesture_ == DesktopSurfaceWindow::HostedPointerGesture::None;
+    }
+
+    static std::vector<std::wstring> S0BoxExpected(const DesktopSurfaceWindow& surface,
+        const S0PointerTarget& target) {
+        if (target.widgetIndex >= surface.hostedWidgets_.size() ||
+            surface.hostedWidgets_[target.widgetIndex] == nullptr || target.itemIndex < 0 || target.itemIndex > 1) { return {}; }
+        std::vector<std::wstring> expected;
+        for (int index = target.itemIndex; index <= 1; ++index) {
+            const auto* item = surface.hostedWidgets_[target.widgetIndex]->view.ItemAt(static_cast<size_t>(index));
+            if (item == nullptr) { return {}; }
+            expected.push_back(item->id);
+        }
+        return expected;
+    }
+
+    static size_t S0BoxSelectedCount(const DesktopSurfaceWindow& surface, const std::wstring& categoryId) {
+        const auto found = std::find_if(surface.hostedWidgets_.begin(), surface.hostedWidgets_.end(),
+            [&](const auto& widget) { return widget != nullptr && widget->descriptor.categoryId == categoryId; });
+        return found == surface.hostedWidgets_.end() ? SIZE_MAX : (*found)->view.SelectedItemIds().size();
+    }
+
+    static bool S0DragEnd(const DesktopSurfaceWindow& surface, const S0PointerTarget& target,
+        const std::wstring& categoryId, const std::vector<std::wstring>& ids, POINT& screen) {
+        const auto found = std::find_if(surface.hostedWidgets_.begin(), surface.hostedWidgets_.end(),
+            [&](const auto& widget) { return widget != nullptr && widget->descriptor.categoryId == categoryId; });
+        if (found == surface.hostedWidgets_.end()) { return false; }
+        const auto& view = (*found)->view;
+        const LONG displacement = (std::max)(12, GetSystemMetrics(SM_CXDRAG) + 2);
+        if (displacement >= target.screenCell.right - target.screen.x - 2) { return false; }
+        POINT point{target.client.x + displacement, target.client.y};
+        const auto action = view.BuildDropAction(point, ids);
+        if (action.type != WidgetViewActionType::ReorderSelection || action.insertionIndex < 0 ||
+            view.ReorderedItemIds(ids, static_cast<size_t>(action.insertionIndex)) != view.ReorderedItemIds({}, 0)) { return false; }
+        screen = point;
+        return ClientToScreen(surface.hwnd_, &screen) && WindowFromPoint(screen) == surface.hwnd_;
+    }
+
+    static bool S0DragState(const DesktopSurfaceWindow& surface, const S0PointerTarget& target,
+        const std::pair<std::wstring, std::wstring>& identity, const std::vector<std::wstring>& expected, int stage) {
+        const auto found = std::find_if(surface.hostedWidgets_.begin(), surface.hostedWidgets_.end(),
+            [&](const auto& widget) { return widget != nullptr && widget->descriptor.categoryId == identity.first; });
+        if (found == surface.hostedWidgets_.end()) { return false; }
+        const auto& entry = **found;
+        const auto* item = entry.view.ItemAt(static_cast<size_t>(target.itemIndex));
+        if (item == nullptr || item->id != identity.second || entry.view.SelectedItemIds() != expected) { return false; }
+        const auto& ghost = DragGhostWindow::Instance();
+        if (stage == 2) {
+            return surface.hostedPointerGesture_ == DesktopSurfaceWindow::HostedPointerGesture::None &&
+                GetCapture() == nullptr && !ghost.IsVisible();
+        }
+        if (GetCapture() != surface.hwnd_ || surface.hostedDraggingItemIds_ != expected ||
+            surface.hostedPointerWidgetIndex_ < 0 ||
+            static_cast<size_t>(surface.hostedPointerWidgetIndex_) >= surface.hostedWidgets_.size() ||
+            surface.hostedWidgets_[static_cast<size_t>(surface.hostedPointerWidgetIndex_)].get() != found->get()) { return false; }
+        if (stage == 0) {
+            return surface.hostedPointerGesture_ == DesktopSurfaceWindow::HostedPointerGesture::ItemPressed && !ghost.IsVisible();
+        }
+        return surface.hostedPointerGesture_ == DesktopSurfaceWindow::HostedPointerGesture::ItemDragging &&
+            surface.hostedPointerTargetWidgetIndex_ == surface.hostedPointerWidgetIndex_ &&
+            surface.hostedDragInsertionIndex_ >= 0 && ghost.IsVisible() &&
+            entry.view.ReorderedItemIds(expected, static_cast<size_t>(surface.hostedDragInsertionIndex_)) == entry.view.ReorderedItemIds({}, 0);
+    }
+
+    static void WriteS0Ledger(
+        const DesktopSurfaceWindow& surface,
+        const std::filesystem::path& path,
+        size_t hoverCount = 0) {
+        auto frames = surface.s0FrameMicroseconds_;
+        std::sort(frames.begin(), frames.end());
+        const auto percentile = [&frames](size_t percent) {
+            return frames.empty() ? std::uint64_t{0} :
+                frames[(frames.size() - 1) * percent / 100];
+        };
+        std::ofstream output(path, std::ios::trunc);
+        output << "trace_enabled=" << surface.s0TraceEnabled_ << "\n"
+               << "fixture_hover_count=" << hoverCount << "\n"
+               << "hosted_widgets=" << surface.hostedWidgets_.size() << "\n"
+               << "visible_desktop_items=" << surface.visibleItems_.size() << "\n"
+               << "icon_bitmaps=" << surface.iconCache_.Size() << "\n"
+               << "icon_bitmap_pixel_bytes="
+               << surface.iconCache_.BitmapPixelBytesForTesting() << "\n"
+               << "drag_hicons="
+               << surface.iconCache_.DragIconCountForTesting() << "\n"
+               << "icon_pending="
+               << surface.iconCache_.PendingCountForTesting() << "\n"
+               << "wallpaper_bitmap_pixel_bytes="
+               << surface.wallpaper_.PixelBytesForTesting() << "\n"
+               << "render_count=" << surface.s0RenderCount_ << "\n"
+               << "draw_pixels=" << surface.s0DrawPixels_ << "\n"
+               << "paint_dirty_pixels=" << surface.s0DirtyPixels_ << "\n"
+               << "frame_sample_count=" << frames.size() << "\n"
+               << "frame_p50_us=" << percentile(50) << "\n"
+               << "frame_p95_us=" << percentile(95) << "\n"
+               << "frame_p99_us=" << percentile(99) << "\n";
+        WriteS0GpuLedger(output);
+    }
+
+    static HICON CopyNaturalImageForS0(
+        DesktopSurfaceWindow& surface, const std::wstring& path) {
+        return surface.iconCache_.CopyCachedIconForTesting(path);
+    }
+
+    static void WriteS0ObjectCounters(
+        const DesktopSurfaceWindow& surface, std::ostream& output) {
+        output << surface.iconCache_.Size() << ','
+               << surface.iconCache_.BitmapPixelBytesForTesting() << ','
+               << surface.iconCache_.DragIconCountForTesting() << ','
+               << surface.iconCache_.PendingCountForTesting() << ','
+               << surface.wallpaper_.PixelBytesForTesting();
+    }
+
     static constexpr WallpaperBackdropDrawMode
     WallpaperDrawMode() {
         return DesktopSurfaceWindow::kWallpaperDrawMode;
@@ -1143,6 +1664,12 @@ struct DesktopSurfaceWindowSmokeAccess {
             message, keys, MAKELPARAM(point.x, point.y));
     }
 
+    static int HostedWidgetIndexAt(
+        const DesktopSurfaceWindow& surface,
+        POINT point) {
+        return surface.HostedWidgetIndexAt(point);
+    }
+
     static void DoubleClickHostedPoint(
         DesktopSurfaceWindow& surface,
         POINT point) {
@@ -1220,6 +1747,15 @@ struct DesktopSurfaceWindowSmokeAccess {
         return surface.HitTest(point);
     }
 
+    static void ResetNativeQueryTiming(DesktopSurfaceWindow& surface) {
+        surface.s0NativeQueryCount_ = 0;
+        surface.s0NativeQueryMaxMs_ = 0;
+    }
+
+    static std::pair<std::uint64_t, double> NativeQueryTiming(const DesktopSurfaceWindow& surface) {
+        return {surface.s0NativeQueryCount_, surface.s0NativeQueryMaxMs_};
+    }
+
     static bool PressHostedPoint(
         DesktopSurfaceWindow& surface,
         POINT point,
@@ -1268,6 +1804,15 @@ struct DesktopSurfaceWindowSmokeAccess {
         surface.Render();
         return surface.d2d_.Target() != nullptr &&
             surface.wallpaperReadyForTarget_;
+    }
+
+    static bool RenderDirtyProductionHost(DesktopSurfaceWindow& surface) {
+        if (GetUpdateRect(surface.hwnd_, nullptr, FALSE) == FALSE) {
+            return false;
+        }
+        surface.Render();
+        ValidateRect(surface.hwnd_, nullptr);
+        return true;
     }
 
     static bool ConfigureHostedWidgetSlice(
@@ -1372,6 +1917,29 @@ struct DesktopSurfaceWindowSmokeAccess {
         return surface.wallpaper_.Generation();
     }
 
+    static void WriteS0WallpaperProfile(
+        const DesktopSurfaceWindow& surface, std::ostream& output, size_t event) {
+        const auto& profile = surface.wallpaper_.LastRefreshProfileForTesting();
+        output << event << ',' << profile.enabled;
+        if (!profile.enabled) {
+            for (size_t field = 0; field < 15; ++field) { output << ",-1"; }
+        } else {
+            output << ',' << profile.complete << ',' << profile.succeeded << ',' << profile.threadId
+                << ',' << profile.generation << ',' << profile.outputWidth << ',' << profile.outputHeight
+                << ',' << profile.blur << ',' << profile.sampledCapacityBytes << ',' << profile.outputCapacityBytes;
+            for (const auto value : profile.stageMicroseconds) { output << ',' << value; }
+        }
+        output << '\n';
+        output.flush();
+    }
+
+    static bool AsyncWallpaperRunning(const DesktopSurfaceWindow& surface) {
+        return surface.wallpaperAsyncRunning_;
+    }
+    static DWORD WallpaperPrepareThread(const DesktopSurfaceWindow& surface) {
+        return surface.wallpaper_.LastRefreshProfileForTesting().threadId;
+    }
+
     static bool RefreshWallpaper(
         DesktopSurfaceWindow& surface) {
         return surface.RefreshWallpaperForCurrentTarget();
@@ -1390,6 +1958,26 @@ struct DesktopSurfaceWindowSmokeAccess {
     static bool WallpaperRecoveryActive(
         const DesktopSurfaceWindow& surface) {
         return surface.wallpaperRecoveryActive_;
+    }
+
+    static unsigned int WallpaperRecoveryAttemptsForS0(
+        const DesktopSurfaceWindow& surface) {
+        return surface.wallpaperRecoveryAttempts_;
+    }
+
+    static void WriteS0WallpaperCounters(
+        const DesktopSurfaceWindow& surface, std::ostream& output, bool trace) {
+        output << (IsWindowVisible(surface.hwnd_) != FALSE) << ','
+               << WallpaperReady(surface) << ','
+               << surface.wallpaperRecoveryActive_ << ','
+               << surface.wallpaperRecoveryAttempts_ << ','
+               << surface.wallpaper_.Generation() << ','
+               << (surface.d2d_.Target() != nullptr) << ',';
+        if (trace) {
+            WriteS0ObjectCounters(surface, output);
+        } else {
+            output << "-1,-1,-1,-1,-1";
+        }
     }
 
     static IDropTarget* DropTarget(DesktopSurfaceWindow& surface) {
@@ -1808,6 +2396,82 @@ struct DesktopSurfaceWindowSmokeAccess {
         return surface.SelectedShellItemsInVisibleOrder();
     }
 
+    static bool SelectExplorerIdentities(
+        DesktopSurfaceWindow& surface,
+        const std::vector<std::wstring>& identities) {
+        surface.selectedIdentities_.clear();
+        surface.selectedIdentities_.insert(
+            identities.begin(), identities.end());
+        return surface.SynchronizeExplorerSelection();
+    }
+
+    static bool NativeAndPaintedSelectionRect(
+        DesktopSurfaceWindow& surface,
+        const std::wstring& identity,
+        RECT& nativeRect,
+        RECT& paintedRect) {
+        const auto item = std::find_if(
+            surface.visibleItems_.begin(),
+            surface.visibleItems_.end(),
+            [&](const DesktopViewItem& value) {
+                return CompareStringOrdinal(
+                    value.path.c_str(), -1,
+                    identity.c_str(), -1, TRUE) == CSTR_EQUAL;
+            });
+        if (item == surface.visibleItems_.end() ||
+            !surface.TryNativeInteractionRect(*item, nativeRect)) {
+            return false;
+        }
+        const size_t index = static_cast<size_t>(
+            std::distance(surface.visibleItems_.begin(), item));
+        paintedRect = surface.InteractionRect(index);
+        return true;
+    }
+
+    static void RebuildSelectionRects(DesktopSurfaceWindow& surface) {
+        surface.RebuildInteractionRects();
+    }
+
+    static bool HoverIdentity(
+        DesktopSurfaceWindow& surface,
+        const std::wstring& identity) {
+        const auto item = std::find_if(
+            surface.visibleItems_.begin(),
+            surface.visibleItems_.end(),
+            [&](const DesktopViewItem& value) {
+                return CompareStringOrdinal(
+                    value.path.c_str(), -1,
+                    identity.c_str(), -1, TRUE) == CSTR_EQUAL;
+            });
+        if (item == surface.visibleItems_.end()) return false;
+        surface.hoverIndex_ = static_cast<int>(
+            std::distance(surface.visibleItems_.begin(), item));
+        return true;
+    }
+
+    static bool ExcludeVisibleIdentityForReturnPlan(
+        DesktopSurfaceWindow& surface,
+        const std::wstring& identity) {
+        const auto item = std::find_if(
+            surface.visibleItems_.begin(),
+            surface.visibleItems_.end(),
+            [&](const DesktopViewItem& value) {
+                return CompareStringOrdinal(
+                    value.path.c_str(), -1,
+                    identity.c_str(), -1, TRUE) == CSTR_EQUAL;
+            });
+        if (item == surface.visibleItems_.end()) return false;
+        surface.visibleItems_.erase(item);
+        return true;
+    }
+
+    static void ReleaseWallpaperForNativeSurfacePoc(
+        DesktopSurfaceWindow& surface) {
+        surface.wallpaper_.Release();
+        RedrawWindow(surface.Window(), nullptr, nullptr,
+            RDW_INVALIDATE | RDW_UPDATENOW | RDW_ERASE);
+    }
+
     static std::vector<ShellItemReference>
     VisibleShellItems(
         const DesktopSurfaceWindow& surface,
@@ -2012,10 +2676,11 @@ struct DesktopSurfaceWindowSmokeAccess {
         const RECT& bounds,
         int cellWidth,
         int cellHeight,
-        const std::vector<std::wstring>& newlyObserved = {}) {
+        const std::vector<std::wstring>& newlyObserved = {},
+        bool snapDisplayOverridesToGrid = false) {
         return DesktopSurfaceWindow::ResolveVisiblePositionCollisions(
             nativePositions, overrides, bounds, cellWidth, cellHeight,
-            newlyObserved);
+            newlyObserved, snapDisplayOverridesToGrid);
     }
 
     static bool NewlyObservedUsesVisibleFirstFree(
@@ -2203,6 +2868,9 @@ struct DesktopSurfaceWindowSmokeAccess {
 };
 
 struct MainWindowSmokeAccess {
+    static std::pair<unsigned, std::array<long long,4>> S0SaveProfile(const MainWindow& window) {
+        return {window.s0SaveProfileRevision_, {window.s0SaveProfileNanoseconds_[0], window.s0SaveProfileNanoseconds_[1], window.s0SaveProfileNanoseconds_[2], window.s0SaveProfileNanoseconds_[3]}};
+    }
     static void SetWindowForMoveOut(MainWindow& window, HWND hwnd) {
         window.hwnd_ = hwnd;
     }
@@ -2387,6 +3055,129 @@ struct MainWindowSmokeAccess {
         if (window.autoOrganizePreview_ != nullptr) {
             window.autoOrganizePreview_->Close();
         }
+    }
+
+    static AutoOrganizePreviewWindow* PreviewForS0(MainWindow& window) {
+        return window.autoOrganizePreview_.get();
+    }
+
+    static void WriteS0SamplePrefix(
+        std::ostream& output, const char* stage, size_t cycle,
+        long long elapsedUs, long long operationUs) {
+        FILETIME utc{};
+        GetSystemTimePreciseAsFileTime(&utc);
+        output << stage << ',' << cycle << ',' << elapsedUs << ','
+               << operationUs << ','
+               << ((static_cast<std::uint64_t>(utc.dwHighDateTime) << 32) |
+                   utc.dwLowDateTime) << ',';
+    }
+
+    static void WriteS0ProcessCounters(std::ostream& output, bool trace) {
+        const auto ticks = [](FILETIME time) {
+            return (static_cast<std::uint64_t>(time.dwHighDateTime) << 32) |
+                time.dwLowDateTime;
+        };
+        if (trace) {
+            PROCESS_MEMORY_COUNTERS_EX memory{};
+            memory.cb = sizeof(memory);
+            const bool memoryOk = GetProcessMemoryInfo(
+                GetCurrentProcess(),
+                reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&memory),
+                sizeof(memory)) != FALSE;
+            FILETIME created{}, exited{}, kernel{}, user{};
+            const bool cpuOk = GetProcessTimes(
+                GetCurrentProcess(), &created, &exited, &kernel, &user) != FALSE;
+            DWORD handles = 0;
+            const bool handlesOk = GetProcessHandleCount(
+                GetCurrentProcess(), &handles) != FALSE;
+            output << (memoryOk ? static_cast<long long>(memory.PrivateUsage) : -1)
+                   << ',' << (memoryOk ? static_cast<long long>(memory.WorkingSetSize) : -1)
+                   << ',' << (memoryOk ? static_cast<long long>(memory.PeakPagefileUsage) : -1)
+                   << ',' << (cpuOk ? static_cast<long long>(ticks(kernel) + ticks(user)) : -1)
+                   << ',' << (handlesOk ? static_cast<long long>(handles) : -1)
+                   << ',' << GetGuiResources(GetCurrentProcess(), GR_GDIOBJECTS)
+                   << ',' << GetGuiResources(GetCurrentProcess(), GR_USEROBJECTS)
+                   << ',';
+        } else {
+            output << "-1,-1,-1,-1,-1,-1,-1,";
+        }
+    }
+
+    static void WriteS0PreviewSample(
+        MainWindow& window, std::ostream& output, const char* stage,
+        size_t cycle, long long elapsedUs, long long operationUs,
+        bool trace) {
+        WriteS0SamplePrefix(output, stage, cycle, elapsedUs, operationUs);
+        WriteS0ProcessCounters(output, trace);
+        if (trace) {
+            AutoOrganizePreviewWindow* preview = PreviewForS0(window);
+            if (preview != nullptr) {
+                AutoOrganizePreviewWindowSmokeAccess::WriteS0Metrics(*preview, output);
+            } else {
+                output << "0,0,0,0,0,0,1";
+            }
+        } else {
+            output << "-1,-1,-1,-1,-1,-1,-1";
+        }
+        output << '\n';
+    }
+
+    static std::uint64_t SnapshotRevisionForS0(const MainWindow& window) {
+        return window.desktopSnapshot_ == nullptr ? 0 : window.desktopSnapshot_->Revision();
+    }
+
+    static bool MembersPreservedForS0(const MainWindow& window, const AppConfig& fixture) {
+        if (window.organizerConfig_.categories.size() != fixture.categories.size()) {
+            return false;
+        }
+        for (size_t index = 0; index < fixture.categories.size(); ++index) {
+            if (window.organizerConfig_.categories[index].id != fixture.categories[index].id ||
+                window.organizerConfig_.categories[index].itemIds != fixture.categories[index].itemIds) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    static void WriteS0FileSample(
+        MainWindow& window, const AppConfig& fixture, const std::wstring& addedPath,
+        std::ostream& output, const char* stage, size_t event, long long elapsedUs,
+        bool trace) {
+        WriteS0SamplePrefix(output, stage, event, elapsedUs, 0);
+        WriteS0ProcessCounters(output, trace);
+        const auto& source = fixture.items.front();
+        const std::wstring currentId = DesktopItemIdAtPath(window, source.path);
+        output << SnapshotRevisionForS0(window) << ','
+               << DesktopScanner::ScanCountForTesting() << ','
+               << window.DesktopItems().size() << ','
+               << !currentId.empty() << ',' << (currentId == source.id) << ','
+               << HasRegisteredItem(window, source.id) << ','
+               << MembersPreservedForS0(window, fixture) << ','
+               << !DesktopItemIdAtPath(window, addedPath).empty() << ',';
+        DesktopSurfaceWindow* surface = DesktopSurface(window);
+        if (trace && surface != nullptr) {
+            DesktopSurfaceWindowSmokeAccess::WriteS0ObjectCounters(*surface, output);
+        } else {
+            output << "-1,-1,-1,-1,-1";
+        }
+        output << '\n';
+    }
+
+    static void WriteS0WallpaperSample(
+        MainWindow& window, const AppConfig& fixture, DesktopSurfaceWindow& surface,
+        std::ostream& output, const char* stage, size_t event, long long elapsedUs,
+        long long operationUs, bool trace) {
+        WriteS0SamplePrefix(output, stage, event, elapsedUs, operationUs);
+        WriteS0ProcessCounters(output, trace);
+        output << SnapshotRevisionForS0(window) << ','
+               << DesktopScanner::ScanCountForTesting() << ','
+               << window.DesktopItems().size() << ','
+               << (DesktopItemIdAtPath(window, fixture.items.front().path) ==
+                   fixture.items.front().id) << ','
+               << HasRegisteredItem(window, fixture.items.front().id) << ','
+               << MembersPreservedForS0(window, fixture) << ',';
+        DesktopSurfaceWindowSmokeAccess::WriteS0WallpaperCounters(surface, output, trace);
+        output << '\n';
     }
 
     static void ApplyAutoOrganize(
@@ -2696,14 +3487,14 @@ bool SetWindowScreenBounds(
 
 bool CaptureScreenPixels(
     const RECT& rect,
-    std::vector<std::uint32_t>& pixels) {
+    std::vector<std::uint32_t>& pixels, HDC sourceDc = nullptr) {
     const int width = rect.right - rect.left;
     const int height = rect.bottom - rect.top;
     if (width <= 0 || height <= 0) {
         return false;
     }
 
-    HDC screen = GetDC(nullptr);
+    HDC screen = sourceDc == nullptr ? GetDC(nullptr) : sourceDc;
     if (screen == nullptr) {
         return false;
     }
@@ -2760,11 +3551,26 @@ bool CaptureScreenPixels(
     if (memory != nullptr) {
         DeleteDC(memory);
     }
-    ReleaseDC(nullptr, screen);
+    if (sourceDc == nullptr) ReleaseDC(nullptr, screen);
     if (!succeeded) {
         pixels.clear();
     }
     return succeeded;
+}
+
+bool CapturePaintDesktopPixels(const RECT& rect, std::vector<std::uint32_t>& pixels) {
+    HDC screen = GetDC(nullptr);
+    HDC memory = screen == nullptr ? nullptr : CreateCompatibleDC(screen);
+    HBITMAP bitmap = memory == nullptr ? nullptr : CreateCompatibleBitmap(screen,
+        GetSystemMetrics(SM_CXVIRTUALSCREEN), GetSystemMetrics(SM_CYVIRTUALSCREEN));
+    HGDIOBJ previous = bitmap == nullptr ? nullptr : SelectObject(memory, bitmap);
+    const bool captured = previous != nullptr && PaintDesktop(memory) != FALSE &&
+        CaptureScreenPixels(rect, pixels, memory);
+    if (previous != nullptr) SelectObject(memory, previous);
+    if (bitmap != nullptr) DeleteObject(bitmap);
+    if (memory != nullptr) DeleteDC(memory);
+    if (screen != nullptr) ReleaseDC(nullptr, screen);
+    return captured;
 }
 
 bool SaveCapturedPixelsBmp(
@@ -7932,11 +8738,16 @@ int RunSmokeDesktopDisplayTakeover(HINSTANCE instance) {
             MOUSEEVENTF_VIRTUALDESK | MOUSEEVENTF_MOVE | flags;
         return SendInput(1, &input, sizeof(input)) == 1;
     };
+    const size_t activationDownBefore = DesktopSurfaceWindowSmokeAccess::LeftDownMessageCountForSmoke(surface);
+    const size_t activationUpBefore = DesktopSurfaceWindowSmokeAccess::LeftUpMessageCountForSmoke(surface);
+    POINT actualActivationCursor{}, physicalActivationCursor{};
     const bool activationReady =
         activationPoint.has_value() &&
         GetCursorPos(&activationCursor) != FALSE &&
         injectActivationMouse(*activationPoint, 0);
     pumpMessagesFor(40);
+    GetCursorPos(&actualActivationCursor);
+    GetPhysicalCursorPos(&physicalActivationCursor);
     const bool activationRouted = activationReady &&
         WindowFromPoint(*activationPoint) == surfaceWindow;
     const bool activationInjected = activationRouted &&
@@ -7956,6 +8767,30 @@ int RunSmokeDesktopDisplayTakeover(HINSTANCE instance) {
         DesktopSurfaceWindowSmokeAccess::RenameEditor(surface);
     if (renameEditor == nullptr ||
         IsWindowVisible(renameEditor) == FALSE) {
+        wchar_t diagnosticRoot[32768]{};
+        const DWORD diagnosticRootSize = GetEnvironmentVariableW(
+            L"DESKTOP_ORGANIZER_SMOKE_ITEMS_DIR", diagnosticRoot, 32768);
+        if (diagnosticRootSize != 0 && diagnosticRootSize < 32768) {
+            std::ofstream diagnostic(std::filesystem::path(diagnosticRoot) /
+                L"desktop-f2-input-result.txt", std::ios::trunc);
+            const auto selected = DesktopSurfaceWindowSmokeAccess::SelectedPaths(surface);
+            diagnostic << "selected=" << selected.size()
+                << " expectedSelected=" << (std::find(selected.begin(), selected.end(), renameIdentity) != selected.end())
+                << " down=" << DesktopSurfaceWindowSmokeAccess::LeftDownMessageCountForSmoke(surface) - activationDownBefore
+                << " up=" << DesktopSurfaceWindowSmokeAccess::LeftUpMessageCountForSmoke(surface) - activationUpBefore
+                << " expectedCursor=" << activationPoint->x << ',' << activationPoint->y
+                << " actualCursor=" << actualActivationCursor.x << ',' << actualActivationCursor.y
+                << " physicalCursor=" << physicalActivationCursor.x << ',' << physicalActivationCursor.y
+                << " virtualSize=" << GetSystemMetrics(SM_CXVIRTUALSCREEN) << ',' << GetSystemMetrics(SM_CYVIRTUALSCREEN)
+                << " dpiAwareness=" << GetAwarenessFromDpiAwarenessContext(GetThreadDpiAwarenessContext())
+                << " pmv2=" << AreDpiAwarenessContextsEqual(GetThreadDpiAwarenessContext(), DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)
+                << " surface=" << reinterpret_cast<ULONG_PTR>(surfaceWindow)
+                << " foreground=" << reinterpret_cast<ULONG_PTR>(GetForegroundWindow())
+                << " active=" << reinterpret_cast<ULONG_PTR>(GetActiveWindow())
+                << " focus=" << reinterpret_cast<ULONG_PTR>(GetFocus())
+                << " editor=" << reinterpret_cast<ULONG_PTR>(renameEditor)
+                << " alt=" << GetAsyncKeyState(VK_MENU) << '\n';
+        }
         surface.Close();
         std::wcerr
             << L"Desktop F2 did not show the rename editor\n";
@@ -8391,11 +9226,19 @@ int RunSmokeDesktopDisplayTakeover(HINSTANCE instance) {
             surface);
     DesktopSurfaceWindowSmokeAccess::SuppressShellDragForSmoke(
         surface, true);
+    POINT nativeLastMove{};
+    WPARAM nativeLastMoveKeys = 0;
+    size_t nativeMoveMessages = 0;
     const auto pumpInput = [&]() {
         const ULONGLONG end = GetTickCount64() + 100;
         do {
             MSG message{};
             while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+                if (message.hwnd == surfaceWindow && message.message == WM_MOUSEMOVE) {
+                    nativeLastMove = POINT{GET_X_LPARAM(message.lParam), GET_Y_LPARAM(message.lParam)};
+                    nativeLastMoveKeys = message.wParam;
+                    ++nativeMoveMessages;
+                }
                 TranslateMessage(&message);
                 DispatchMessageW(&message);
             }
@@ -8425,6 +9268,12 @@ int RunSmokeDesktopDisplayTakeover(HINSTANCE instance) {
         pressedAtStart && GetCapture() == surfaceWindow;
     const bool movedToEnd =
         capturedAtStart && injectMouse(inputEnd, 0);
+    POINT nativeCursorAtEnd{};
+    const bool nativeCursorRead = GetCursorPos(&nativeCursorAtEnd) != FALSE;
+    const POINT nativeMoveAtEnd = nativeLastMove;
+    const WPARAM nativeKeysAtEnd = nativeLastMoveKeys;
+    const size_t nativeMessagesAtEnd = nativeMoveMessages;
+    const bool nativeLeftHeldAtEnd = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
     const bool marqueeActive =
         movedToEnd &&
         DesktopSurfaceWindowSmokeAccess::IsMarqueeActive(surface);
@@ -8480,6 +9329,12 @@ int RunSmokeDesktopDisplayTakeover(HINSTANCE instance) {
                     << " dragAfter=" << shellDragCountAfter
                     << " start=" << inputStart.x << ',' << inputStart.y
                     << " end=" << inputEnd.x << ',' << inputEnd.y
+                    << " cursorRead=" << nativeCursorRead
+                    << " cursorAtEnd=" << nativeCursorAtEnd.x << ',' << nativeCursorAtEnd.y
+                    << " moveAtEnd=" << nativeMoveAtEnd.x << ',' << nativeMoveAtEnd.y
+                    << " moveKeys=" << nativeKeysAtEnd
+                    << " moveCount=" << nativeMessagesAtEnd
+                    << " leftHeld=" << nativeLeftHeldAtEnd
                     << '\n';
             }
         }
@@ -8885,17 +9740,10 @@ int RunSmokeDesktopDoubleClick(HINSTANCE instance) {
                 0, nullptr, FALSE, 10, QS_ALLINPUT);
         } while (GetTickCount64() < deadline);
     };
-    pumpFor(180);
-    std::wstring identity;
-    std::optional<POINT> hitPoint;
-    for (const DesktopViewItem& item : surface.Snapshot().items) {
-        hitPoint = DesktopSurfaceWindowSmokeAccess::
-            FindExposedCenterHitPointForIdentity(surface, item.path);
-        if (hitPoint.has_value()) {
-            identity = item.path;
-            break;
-        }
-    }
+    const ULONGLONG readyUntil=GetTickCount64()+5500;
+    while(!DesktopSurfaceWindowSmokeAccess::NativeReady(surface) && GetTickCount64()<readyUntil) pumpFor(10);
+    if(!DesktopSurfaceWindowSmokeAccess::NativeReady(surface)) return 321;
+    const std::optional<POINT> hitPoint=POINT{950,550};
     POINT savedCursor{};
     if (!hitPoint.has_value() ||
         GetCursorPos(&savedCursor) == FALSE ||
@@ -8907,6 +9755,7 @@ int RunSmokeDesktopDoubleClick(HINSTANCE instance) {
         std::wcerr << L"Double-click exposed-item input precondition failed\n";
         return 322;
     }
+    std::string inputTrace;
     const auto sendMouse = [&](POINT point, DWORD flags) {
         INPUT input{};
         input.type = INPUT_MOUSE;
@@ -8922,8 +9771,24 @@ int RunSmokeDesktopDoubleClick(HINSTANCE instance) {
         } else {
             input.mi.dwFlags = flags;
         }
+        LASTINPUTINFO lastBefore{sizeof(LASTINPUTINFO)}, lastAfter{sizeof(LASTINPUTINFO)};
+        GetLastInputInfo(&lastBefore);
         const bool injected = SendInput(1, &input, sizeof(input)) == 1;
         pumpFor(25);
+        POINT actual{}, physical{};
+        GetCursorPos(&actual);
+        GetPhysicalCursorPos(&physical);
+        GetLastInputInfo(&lastAfter);
+        inputTrace += "flags=" + std::to_string(flags) +
+            " expected=" + std::to_string(point.x) + "," + std::to_string(point.y) +
+            " actual=" + std::to_string(actual.x) + "," + std::to_string(actual.y) +
+            " physical=" + std::to_string(physical.x) + "," + std::to_string(physical.y) +
+            " inputTicks=" + std::to_string(lastBefore.dwTime) + "," + std::to_string(lastAfter.dwTime) +
+            " button=" + std::to_string(GetAsyncKeyState(VK_LBUTTON)) +
+            " cursorWindow=" + std::to_string(reinterpret_cast<ULONG_PTR>(WindowFromPoint(actual))) +
+            " foreground=" + std::to_string(reinterpret_cast<ULONG_PTR>(GetForegroundWindow())) +
+            " virtualSize=" + std::to_string(GetSystemMetrics(SM_CXVIRTUALSCREEN)) + "," + std::to_string(GetSystemMetrics(SM_CYVIRTUALSCREEN)) +
+            " pmv2=" + std::to_string(AreDpiAwarenessContextsEqual(GetThreadDpiAwarenessContext(), DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)) + "\n";
         return injected;
     };
     bool firstClickStillOnSurface = false;
@@ -8975,36 +9840,6 @@ int RunSmokeDesktopDoubleClick(HINSTANCE instance) {
         pumpFor(80);
         return injected;
     };
-    DesktopSurfaceWindowSmokeAccess::SuppressDesktopOpenForSmoke(
-        surface, true);
-    const size_t messageBefore = DesktopSurfaceWindowSmokeAccess::
-        DoubleClickMessageCountForSmoke(surface);
-    const size_t desktopDownBefore = DesktopSurfaceWindowSmokeAccess::
-        LeftDownMessageCountForSmoke(surface);
-    const size_t desktopUpBefore = DesktopSurfaceWindowSmokeAccess::
-        LeftUpMessageCountForSmoke(surface);
-    const bool desktopInput = doubleClick(*hitPoint);
-    const bool desktopFirstHit = firstClickStillOnSurface;
-    const bool desktopFirstCandidate =
-        !firstClickCandidateIdentity.empty();
-    const size_t desktopDownCount = DesktopSurfaceWindowSmokeAccess::
-        LeftDownMessageCountForSmoke(surface) - desktopDownBefore;
-    const size_t desktopUpCount = DesktopSurfaceWindowSmokeAccess::
-        LeftUpMessageCountForSmoke(surface) - desktopUpBefore;
-    const size_t desktopMessageAfter =
-        DesktopSurfaceWindowSmokeAccess::
-            DoubleClickMessageCountForSmoke(surface);
-    const size_t desktopOpenCount =
-        DesktopSurfaceWindowSmokeAccess::
-            DesktopOpenRequestCountForSmoke(surface);
-    const bool desktopRoute =
-        desktopMessageAfter == messageBefore + 1 &&
-        desktopOpenCount == 1 &&
-        CompareStringOrdinal(
-            DesktopSurfaceWindowSmokeAccess::
-                DesktopOpenPathForSmoke(surface).c_str(), -1,
-            identity.c_str(), -1, TRUE) == CSTR_EQUAL;
-
     HostedWidgetDescriptor widget;
     widget.categoryId = L"smoke-double-click-widget";
     widget.title = L"Double-click smoke";
@@ -9151,17 +9986,7 @@ int RunSmokeDesktopDoubleClick(HINSTANCE instance) {
                 std::filesystem::path(root) /
                     L"desktop-double-click-result.txt",
                 std::ios::trunc);
-            diagnostic << "desktopInput=" << desktopInput
-                       << " desktopRoute=" << desktopRoute
-                       << " desktopFirstHit=" << desktopFirstHit
-                       << " desktopFirstCandidate="
-                       << desktopFirstCandidate
-                       << " desktopDown=" << desktopDownCount
-                       << " desktopUp=" << desktopUpCount
-                       << " desktopMessages="
-                       << desktopMessageAfter - messageBefore
-                       << " desktopOpenCount=" << desktopOpenCount
-                       << " widgetReady=" << widgetReady
+            diagnostic << "widgetReady=" << widgetReady
                        << " widgetInput=" << widgetInput
                        << " widgetRoute=" << widgetRoute
                        << " widgetInitialHit="
@@ -9196,16 +10021,14 @@ int RunSmokeDesktopDoubleClick(HINSTANCE instance) {
                        << " oracleDoubleClicks=" << oracleDoubleClicks
                        << " classStyle="
                        << surfaceClassStyle
-                       << '\n';
+                       << '\n' << inputTrace;
         }
     }
-    std::wcout << L"desktopInput=" << desktopInput
-               << L" desktopRoute=" << desktopRoute
-               << L" widgetReady=" << widgetReady
+    std::wcout << L"widgetReady=" << widgetReady
                << L" widgetInput=" << widgetInput
                << L" widgetRoute=" << widgetRoute
                << L"\n";
-    return desktopInput && desktopRoute && widgetReady &&
+    return widgetReady &&
         widgetInput && widgetRoute ? 0 : 323;
 }
 
@@ -16241,6 +17064,973 @@ int RunSmokeShellDesktopBridge() {
     return 0;
 }
 
+    struct S0PointerRestoreScope {
+        POINT saved{}, last{};
+        std::atomic<DWORD> lastInputTick{0};
+        std::atomic<bool> ownsLeft{false}, ownsRight{false};
+        bool enabled = false, hasLast = false;
+        ~S0PointerRestoreScope() {
+            POINT cursor{};
+            LASTINPUTINFO inputInfo{sizeof(LASTINPUTINFO)};
+            if ((ownsLeft || ownsRight) && GetLastInputInfo(&inputInfo) && inputInfo.dwTime == lastInputTick) {
+                INPUT input{};
+                input.type = INPUT_MOUSE;
+                input.mi.dwFlags = (ownsLeft ? MOUSEEVENTF_LEFTUP : 0) | (ownsRight ? MOUSEEVENTF_RIGHTUP : 0);
+                input.mi.time = GetTickCount();
+                if (SendInput(1, &input, sizeof(input)) == 1) {
+                    lastInputTick = input.mi.time;
+                    ownsLeft = false; ownsRight = false;
+                }
+            }
+            if (enabled && hasLast && GetCursorPos(&cursor) &&
+                GetLastInputInfo(&inputInfo) && inputInfo.dwTime == lastInputTick &&
+                std::abs(cursor.x - last.x) <= 1 && std::abs(cursor.y - last.y) <= 1 &&
+                ((GetAsyncKeyState(VK_LBUTTON) | GetAsyncKeyState(VK_RBUTTON) |
+                  GetAsyncKeyState(VK_MBUTTON) | GetAsyncKeyState(VK_XBUTTON1) |
+                  GetAsyncKeyState(VK_XBUTTON2)) & 0x8000) == 0) {
+                SetCursorPos(saved.x, saved.y);
+            }
+        }
+    };
+
+struct S0MenuObservation {
+    HWND owner = nullptr, menu = nullptr;
+    HHOOK inputHook = nullptr;
+    HWINEVENTHOOK popupHook = nullptr, showHook = nullptr;
+    DWORD inputTick = 0;
+    bool trace = false, inputChanged = false, cancelled = false, fallback = false, exposed = false;
+    unsigned suppressed = 0, paintCount = 0;
+    LONGLONG paintQpc = 0, flushQpc = 0, observedQpc = 0;
+    HRESULT flushResult = E_PENDING;
+    std::ostream* diagnostic = nullptr;
+    bool timerDiagnosticWritten = false;
+    unsigned messageDiagnosticCount = 0;
+    unsigned pixelColors = 0;
+    bool allowFrameProbe = false;
+    unsigned presentationSource = 0, frameProbeCount = 0;
+    long long captureUs = 0;
+    RECT bounds{};
+    long long privateBytes = -1, workingSet = -1, peakPrivate = -1, cpu = -1, handles = -1, gdi = -1, user = -1;
+    static constexpr UINT_PTR kAfterPaint = 0x53304D31, kFallback = 0x53304D32, kObserveFrame = 0x53304D33;
+};
+thread_local S0MenuObservation* gS0MenuObservation = nullptr;
+void CALLBACK S0ObserveOwnedMenuPresentation(HWINEVENTHOOK, DWORD, HWND, LONG, LONG, DWORD, DWORD);
+
+void CALLBACK S0CancelOwnedMenu(HWND, UINT, UINT_PTR timer, DWORD) {
+    auto* state = gS0MenuObservation;
+    if (!state) return;
+    LASTINPUTINFO input{sizeof(LASTINPUTINFO)};
+    if (!GetLastInputInfo(&input) || input.dwTime != state->inputTick) state->inputChanged = true;
+    GUITHREADINFO gui{sizeof(GUITHREADINFO)};
+    const bool guiReady = GetGUIThreadInfo(GetCurrentThreadId(), &gui) != FALSE;
+    if (timer == S0MenuObservation::kFallback && state->paintQpc && state->exposed &&
+        SUCCEEDED(state->flushResult)) {
+        KillTimer(state->owner, S0MenuObservation::kFallback);
+        return;
+    }
+    if (timer == S0MenuObservation::kObserveFrame) {
+        if (state->inputChanged) S0CancelOwnedMenu(nullptr, 0, S0MenuObservation::kAfterPaint, 0);
+        else {
+            ++state->frameProbeCount;
+            S0ObserveOwnedMenuPresentation(nullptr, 0, nullptr, 0, 0, GetCurrentThreadId(), 0);
+        }
+        return;
+    }
+    if (timer == S0MenuObservation::kFallback && !state->timerDiagnosticWritten && state->diagnostic) {
+        *state->diagnostic << "fallback_probe_gui=" << guiReady << ",flags=" << gui.flags
+            << ",expected_owner=" << reinterpret_cast<std::uintptr_t>(state->owner)
+            << ",actual_owner=" << reinterpret_cast<std::uintptr_t>(gui.hwndMenuOwner)
+            << ",paint_count=" << state->paintCount << '\n';
+        state->diagnostic->flush(); state->timerDiagnosticWritten = true;
+        EnumThreadWindows(GetCurrentThreadId(), [](HWND window, LPARAM parameter) -> BOOL {
+            auto* observed = reinterpret_cast<S0MenuObservation*>(parameter);
+            wchar_t name[32]{}; DWORD pid = 0;
+            GetWindowThreadProcessId(window, &pid);
+            if (pid == GetCurrentProcessId() && GetClassNameW(window, name, _countof(name)) && wcscmp(name, L"#32768") == 0) {
+                RECT rectangle{}; GetWindowRect(window, &rectangle);
+                const POINT center{(rectangle.left + rectangle.right) / 2, (rectangle.top + rectangle.bottom) / 2};
+                *observed->diagnostic << "fallback_menu_window=" << reinterpret_cast<std::uintptr_t>(window)
+                    << ",visible=" << IsWindowVisible(window) << ",width=" << rectangle.right-rectangle.left
+                    << ",height=" << rectangle.bottom-rectangle.top << ",center_own=" << (WindowFromPoint(center) == window) << '\n';
+            }
+            return TRUE;
+        }, reinterpret_cast<LPARAM>(state));
+    }
+    if (guiReady && (gui.flags & GUI_INMENUMODE) && gui.hwndMenuOwner == state->owner) {
+        state->fallback = timer == S0MenuObservation::kFallback;
+        state->cancelled = EndMenu() != FALSE;
+        KillTimer(state->owner, S0MenuObservation::kAfterPaint);
+        KillTimer(state->owner, S0MenuObservation::kFallback);
+        KillTimer(state->owner, S0MenuObservation::kObserveFrame);
+    }
+}
+
+LRESULT CALLBACK S0FilterOwnedMenuInput(int code, WPARAM w, LPARAM l) {
+    auto* state = gS0MenuObservation;
+    if (state && code == MSGF_MENU) {
+        const auto* message = reinterpret_cast<const MSG*>(l);
+        if ((message->message >= WM_MOUSEFIRST && message->message <= WM_MOUSELAST) ||
+            (message->message >= WM_KEYFIRST && message->message <= WM_KEYLAST)) {
+            ++state->suppressed;
+            LASTINPUTINFO input{sizeof(LASTINPUTINFO)};
+            if (!GetLastInputInfo(&input) || input.dwTime != state->inputTick) {
+                state->inputChanged = true;
+                S0CancelOwnedMenu(nullptr, 0, S0MenuObservation::kAfterPaint, 0);
+            }
+            return 1;
+        }
+    }
+    return CallNextHookEx(nullptr, code, w, l);
+}
+
+void CALLBACK S0ObserveOwnedMenuPresentation(HWINEVENTHOOK, DWORD event, HWND eventWindow,
+    LONG, LONG, DWORD eventThread, DWORD) {
+    auto* state = gS0MenuObservation;
+    if (state && !state->paintQpc && eventThread == GetCurrentThreadId() &&
+        (event == EVENT_SYSTEM_MENUPOPUPSTART || event == EVENT_OBJECT_SHOW || (state->allowFrameProbe && event == 0))) {
+        HWND menuWindow = eventWindow;
+        wchar_t eventClass[32]{};
+        if (!GetClassNameW(menuWindow, eventClass, _countof(eventClass)) || wcscmp(eventClass, L"#32768") != 0) {
+            menuWindow = nullptr;
+            EnumThreadWindows(GetCurrentThreadId(), [](HWND window, LPARAM output) -> BOOL {
+                wchar_t name[32]{}; DWORD pid = 0; GetWindowThreadProcessId(window, &pid);
+                if (pid == GetCurrentProcessId() && IsWindowVisible(window) &&
+                    GetClassNameW(window, name, _countof(name)) && wcscmp(name, L"#32768") == 0) {
+                    *reinterpret_cast<HWND*>(output) = window; return FALSE;
+                }
+                return TRUE;
+            }, reinterpret_cast<LPARAM>(&menuWindow));
+        }
+        if (menuWindow) {
+            wchar_t className[32]{}; DWORD pid = 0;
+            const DWORD thread = GetWindowThreadProcessId(menuWindow, &pid);
+            if (thread == GetCurrentThreadId() && pid == GetCurrentProcessId() &&
+                GetClassNameW(menuWindow, className, _countof(className)) && wcscmp(className, L"#32768") == 0) {
+                if (event != 0) ++state->paintCount;
+                if (!state->paintQpc) {
+                    GUITHREADINFO gui{sizeof(GUITHREADINFO)};
+                    if (GetGUIThreadInfo(thread, &gui) && gui.hwndMenuOwner == state->owner &&
+                        (gui.flags & GUI_INMENUMODE) && IsWindowVisible(menuWindow) && GetWindowRect(menuWindow, &state->bounds)) {
+                        state->menu = menuWindow;
+                        LARGE_INTEGER clock{}; QueryPerformanceCounter(&clock); state->paintQpc = clock.QuadPart;
+                        state->flushResult = DwmFlush();
+                        QueryPerformanceCounter(&clock); state->flushQpc = clock.QuadPart;
+                        const auto& bounds = state->bounds;
+                        const std::array<POINT, 5> points{
+                            POINT{(bounds.left + bounds.right) / 2, (bounds.top + bounds.bottom) / 2},
+                            POINT{bounds.left + 16, bounds.top + 16}, POINT{bounds.right - 17, bounds.top + 16},
+                            POINT{bounds.left + 16, bounds.bottom - 17}, POINT{bounds.right - 17, bounds.bottom - 17}};
+                        state->exposed = std::all_of(points.begin(), points.end(), [&](POINT point) {
+                            return WindowFromPoint(point) == menuWindow;
+                        });
+                        if (!state->exposed && state->diagnostic) {
+                            for (const POINT point : points) {
+                                const HWND hit = WindowFromPoint(point); DWORD hitPid = 0; GetWindowThreadProcessId(hit, &hitPid);
+                                *state->diagnostic << "menu_exposure_point=" << point.x << '/' << point.y
+                                    << ",hit=" << reinterpret_cast<std::uintptr_t>(hit) << ",pid=" << hitPid
+                                    << ",self=" << (hit == menuWindow) << '\n';
+                            }
+                        }
+                        if (state->exposed) {
+                            const RECT roi{bounds.left + 16, bounds.top + 16,
+                                std::min(bounds.right - 16, bounds.left + 272),
+                                std::min(bounds.bottom - 16, bounds.top + 112)};
+                            std::vector<std::uint32_t> pixels;
+                            LARGE_INTEGER captureStart{}, captureEnd{}, frequency{};
+                            QueryPerformanceCounter(&captureStart);
+                            if (roi.right > roi.left && roi.bottom > roi.top && CaptureScreenPixels(roi, pixels)) {
+                                for (auto& pixel : pixels) pixel &= 0x00FFFFFFU;
+                                std::sort(pixels.begin(), pixels.end());
+                                state->pixelColors = static_cast<unsigned>(std::unique(pixels.begin(), pixels.end()) - pixels.begin());
+                            }
+                            QueryPerformanceCounter(&captureEnd); QueryPerformanceFrequency(&frequency);
+                            state->captureUs = (captureEnd.QuadPart - captureStart.QuadPart) * 1000000 / frequency.QuadPart;
+                            state->exposed = state->pixelColors > 1 && std::all_of(points.begin(), points.end(), [&](POINT point) {
+                                return WindowFromPoint(point) == menuWindow;
+                            });
+                            QueryPerformanceCounter(&clock); state->observedQpc = clock.QuadPart;
+                        }
+                        if (state->trace) {
+                            PROCESS_MEMORY_COUNTERS_EX memory{}; memory.cb = sizeof(memory);
+                            FILETIME created{}, exited{}, kernel{}, user{}; DWORD handles = 0;
+                            const auto ticks = [](FILETIME time) { return (static_cast<std::uint64_t>(time.dwHighDateTime) << 32) | time.dwLowDateTime; };
+                            if (GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&memory), sizeof(memory))) {
+                                state->privateBytes = static_cast<long long>(memory.PrivateUsage);
+                                state->workingSet = static_cast<long long>(memory.WorkingSetSize);
+                                state->peakPrivate = static_cast<long long>(memory.PeakPagefileUsage);
+                            }
+                            if (GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user)) state->cpu = static_cast<long long>(ticks(kernel) + ticks(user));
+                            if (GetProcessHandleCount(GetCurrentProcess(), &handles)) state->handles = handles;
+                            state->gdi = GetGuiResources(GetCurrentProcess(), GR_GDIOBJECTS);
+                            state->user = GetGuiResources(GetCurrentProcess(), GR_USEROBJECTS);
+                        }
+                        if (state->allowFrameProbe) {
+                            if (!state->exposed || FAILED(state->flushResult)) {
+                                state->paintQpc = 0; state->flushQpc = 0; state->observedQpc = 0;
+                                return;
+                            }
+                            state->presentationSource = event != 0 ? 1U : 2U;
+                            KillTimer(state->owner, S0MenuObservation::kObserveFrame);
+                        }
+                        KillTimer(state->owner, S0MenuObservation::kFallback);
+                        SetTimer(state->owner, S0MenuObservation::kAfterPaint, 150, S0CancelOwnedMenu);
+                    }
+                }
+            }
+        }
+    }
+}
+
+bool InvokeS0HostedPointer(DesktopSurfaceWindow& surface, const HostedWidgetCommand& expected,
+    S0PointerRestoreScope& restore, DWORD& inputTick, ULONGLONG deadline,
+    size_t sample, std::ostream& csv, std::ostream& diagnostic, DWORD* menuInputTick = nullptr,
+    const std::wstring& desktopIdentity = {}) {
+    if (expected.itemIds.size() != 1) return false;
+    const bool menu = expected.type == HostedWidgetCommandType::ShowSelectionMenu;
+    const bool desktop = !desktopIdentity.empty();
+    const auto target = desktop ? DesktopSurfaceWindowSmokeAccess::S0DesktopItemTarget(surface, desktopIdentity, &diagnostic) :
+        DesktopSurfaceWindowSmokeAccess::S0HostedItemTarget(surface, expected.categoryId, expected.itemIds.front());
+    LASTINPUTINFO current{sizeof(LASTINPUTINFO)};
+    const bool exposed = target && DesktopSurfaceWindowSmokeAccess::S0PointerTargetExposed(surface, *target);
+    const bool inputReady = GetLastInputInfo(&current) != FALSE;
+    const bool held = ((GetAsyncKeyState(VK_LBUTTON) | GetAsyncKeyState(VK_RBUTTON) | GetAsyncKeyState(VK_MBUTTON) |
+          GetAsyncKeyState(VK_XBUTTON1) | GetAsyncKeyState(VK_XBUTTON2) | GetAsyncKeyState(VK_CONTROL) |
+          GetAsyncKeyState(VK_SHIFT) | GetAsyncKeyState(VK_MENU)) & 0x8000) != 0;
+    if (!target || !exposed || !inputReady || current.dwTime != inputTick || GetCapture() != nullptr || held) {
+        diagnostic << "failure=pointer-precondition,sample=" << sample << ",target=" << target.has_value()
+            << ",exposed=" << exposed << ",input_ready=" << inputReady << ",expected_tick=" << inputTick
+            << ",actual_tick=" << current.dwTime << ",capture=" << reinterpret_cast<std::uintptr_t>(GetCapture())
+            << ",held=" << held << '\n'; return false;
+    }
+    if (!restore.enabled) { if (!GetCursorPos(&restore.saved)) return false; restore.enabled = true; }
+    const DWORD initialTick = inputTick;
+    const size_t handlerDoubleBefore = DesktopSurfaceWindowSmokeAccess::DoubleClickMessageCountForSmoke(surface);
+    const auto desktopRequestBefore = DesktopSurfaceWindowSmokeAccess::S0DesktopRequest(surface, menu);
+    size_t commandCount = 0, bringToFrontCount = 0;
+    bool commandExact = true, accepted = false, auxiliaryAccepted = true;
+    DesktopSurfaceWindow::HostedWidgetCommandHandler original;
+    auto observer = [&](const HostedWidgetCommand& actual) {
+        if (actual.type == HostedWidgetCommandType::BringToFront) {
+            ++bringToFrontCount;
+            const bool exact = actual.categoryId == expected.categoryId && actual.itemIds.empty() &&
+                bringToFrontCount <= (menu ? 1U : 2U);
+            auxiliaryAccepted = auxiliaryAccepted && exact;
+            if (!exact) return false;
+            const bool result = original && original(actual);
+            auxiliaryAccepted = auxiliaryAccepted && result;
+            return result;
+        }
+        ++commandCount;
+        commandExact = commandExact && actual.type == expected.type && actual.categoryId == expected.categoryId && actual.itemIds == expected.itemIds;
+        if (!commandExact || commandCount != 1) return false;
+        const bool result = original && original(actual);
+        accepted = result;
+        return result;
+    };
+    original = DesktopSurfaceWindowSmokeAccess::ExchangeS0CommandObserver(surface, observer);
+    struct CommandScope {
+        DesktopSurfaceWindow& surface;
+        DesktopSurfaceWindow::HostedWidgetCommandHandler& original;
+        ~CommandScope() { DesktopSurfaceWindowSmokeAccess::ExchangeS0CommandObserver(surface, std::move(original)); }
+    } scope{surface, original};
+    if (!original) return false;
+    unsigned leftDown = 0, leftUp = 0, doubleClick = 0, rightDown = 0, rightUp = 0;
+    const auto send = [&](DWORD flags, UINT expectedMessage, unsigned step) {
+        if (GetTickCount64() >= deadline || !GetLastInputInfo(&current) || current.dwTime != inputTick ||
+            !DesktopSurfaceWindowSmokeAccess::S0PointerTargetExposed(surface, *target)) return false;
+        INPUT input{}; input.type = INPUT_MOUSE;
+        input.mi.dx = MulDiv(target->screen.x - GetSystemMetrics(SM_XVIRTUALSCREEN), 65535, (std::max)(1, GetSystemMetrics(SM_CXVIRTUALSCREEN) - 1));
+        input.mi.dy = MulDiv(target->screen.y - GetSystemMetrics(SM_YVIRTUALSCREEN), 65535, (std::max)(1, GetSystemMetrics(SM_CYVIRTUALSCREEN) - 1));
+        input.mi.dwFlags = flags | MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
+        input.mi.dwExtraInfo = static_cast<ULONG_PTR>(0x53304F00U + sample * 8 + step);
+        input.mi.time = GetTickCount();
+        if (SendInput(1, &input, sizeof(input)) != 1) return false;
+        inputTick = input.mi.time; restore.lastInputTick = inputTick;
+        restore.last = target->screen; restore.hasLast = true;
+        if (menuInputTick) *menuInputTick = inputTick;
+        if (flags & MOUSEEVENTF_LEFTDOWN) restore.ownsLeft = true;
+        if (flags & MOUSEEVENTF_LEFTUP) restore.ownsLeft = false;
+        if (flags & MOUSEEVENTF_RIGHTDOWN) restore.ownsRight = true;
+        if (flags & MOUSEEVENTF_RIGHTUP) restore.ownsRight = false;
+        const ULONGLONG stop = (std::min)(deadline, GetTickCount64() + 2000);
+        bool seen = false;
+        while (GetTickCount64() < stop) {
+            MSG message{};
+            while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+                if (message.message == WM_QUIT) { PostQuitMessage(static_cast<int>(message.wParam)); return false; }
+                const bool tagged = message.hwnd == surface.Window() && static_cast<ULONG_PTR>(GetMessageExtraInfo()) == input.mi.dwExtraInfo;
+                if (tagged && (message.message == expectedMessage ||
+                        (expectedMessage == WM_LBUTTONDBLCLK && message.message == WM_LBUTTONDOWN))) {
+                    if (std::abs(GET_X_LPARAM(message.lParam) - target->client.x) > 1 ||
+                        std::abs(GET_Y_LPARAM(message.lParam) - target->client.y) > 1) return false;
+                    seen = true;
+                }
+                if (tagged) {
+                    leftDown += message.message == WM_LBUTTONDOWN; leftUp += message.message == WM_LBUTTONUP;
+                    doubleClick += message.message == WM_LBUTTONDBLCLK; rightDown += message.message == WM_RBUTTONDOWN;
+                    rightUp += message.message == WM_RBUTTONUP;
+                }
+                TranslateMessage(&message); DispatchMessageW(&message);
+            }
+            if (seen) return GetLastInputInfo(&current) && current.dwTime == inputTick;
+            MsgWaitForMultipleObjects(0, nullptr, FALSE, 5, QS_ALLINPUT);
+        }
+        diagnostic << "failure=pointer-message-timeout,sample=" << sample << ",step=" << step << ",expected=" << expectedMessage << '\n';
+        return false;
+    };
+    bool sequence = menu ?
+        send(MOUSEEVENTF_RIGHTDOWN, WM_RBUTTONDOWN, 0) && send(MOUSEEVENTF_RIGHTUP, WM_RBUTTONUP, 1) :
+        send(MOUSEEVENTF_LEFTDOWN, WM_LBUTTONDOWN, 0) && GetCapture() == surface.Window() &&
+        send(MOUSEEVENTF_LEFTUP, WM_LBUTTONUP, 1) && send(MOUSEEVENTF_LEFTDOWN, WM_LBUTTONDBLCLK, 2) &&
+        send(MOUSEEVENTF_LEFTUP, WM_LBUTTONUP, 3);
+    const size_t handlerDoubleCount = DesktopSurfaceWindowSmokeAccess::DoubleClickMessageCountForSmoke(surface) - handlerDoubleBefore;
+    if (desktop) {
+        const auto actual = DesktopSurfaceWindowSmokeAccess::S0DesktopRequest(surface, menu);
+        commandExact = commandCount == 0 && bringToFrontCount == 0 && actual.second == desktopIdentity;
+        commandCount = actual.first - desktopRequestBefore.first;
+        accepted = commandExact && commandCount == 1;
+    }
+    sequence = sequence && commandCount == 1 && commandExact && accepted && auxiliaryAccepted &&
+        bringToFrontCount == (desktop ? 0U : menu ? 1U : 2U) && handlerDoubleCount == (menu ? 0U : 1U) && GetCapture() == nullptr &&
+        ((GetAsyncKeyState(VK_LBUTTON) | GetAsyncKeyState(VK_RBUTTON)) & 0x8000) == 0 &&
+        (menu ? rightDown == 1 && rightUp == 1 && leftDown == 0 && leftUp == 0 && doubleClick == 0 :
+         leftDown >= 1 && leftDown <= 2 && leftDown + doubleClick == 2 && leftUp == 2 && rightDown == 0 && rightUp == 0);
+    if (!sequence) {
+        diagnostic << "failure=pointer-sequence,sample=" << sample << ",commands=" << commandCount << ",exact=" << commandExact
+            << ",accepted=" << accepted << ",left_down=" << leftDown << ",left_up=" << leftUp << ",double=" << doubleClick
+            << ",right_down=" << rightDown << ",right_up=" << rightUp << ",handler_double=" << handlerDoubleCount
+            << ",bring_to_front=" << bringToFrontCount << ",auxiliary_accepted=" << auxiliaryAccepted << '\n'; return false;
+    }
+    csv << sample << ',' << (desktop ? "desktop" : Utf8Text(expected.categoryId)) << ','
+        << Utf8Text(desktop ? desktopIdentity : expected.itemIds.front()) << ','
+        << target->screen.x << ',' << target->screen.y << ',' << target->screenCell.left << ',' << target->screenCell.top << ','
+        << target->screenCell.right << ',' << target->screenCell.bottom << ',' << leftDown << ',' << leftUp << ',' << doubleClick << ','
+        << rightDown << ',' << rightUp << ',' << commandCount << ",1,1," << initialTick << ',' << inputTick << ",1,1,"
+        << handlerDoubleCount << ',' << bringToFrontCount << '\n';
+    csv.flush(); return true;
+}
+
+void WriteS0ShellPointerHeader(std::ostream& csv) {
+    csv << "sample,category_id,item_id,screen_x,screen_y,cell_left,cell_top,cell_right,cell_bottom,"
+        "left_down,left_up,double_click,right_down,right_up,command_count,command_exact,accepted,"
+        "initial_input_tick,last_input_tick,input_stable,capture_released,handler_double_click,bring_to_front_count\n";
+}
+
+bool S0ShellStatePreserved(MainWindow& owner, DesktopSurfaceWindow& surface, const AppConfig& config,
+    DWORD expectedInput, std::uint64_t revision, size_t scans, std::uint64_t generation, std::ostream& diagnostic) {
+    LASTINPUTINFO current{sizeof(LASTINPUTINFO)};
+    const bool inputReady = GetLastInputInfo(&current) != FALSE;
+    const auto actualRevision = MainWindowSmokeAccess::SnapshotRevisionForS0(owner);
+    const auto actualScans = DesktopScanner::ScanCountForTesting();
+    const auto actualGeneration = DesktopSurfaceWindowSmokeAccess::WallpaperGeneration(surface);
+    const bool members = MainWindowSmokeAccess::MembersPreservedForS0(owner, config);
+    const bool ready = DesktopSurfaceWindowSmokeAccess::WallpaperReady(surface);
+    const bool visible = IsWindowVisible(surface.Window()) != FALSE;
+    const bool preserved = inputReady && current.dwTime == expectedInput && actualRevision == revision &&
+        actualScans == scans && members && actualGeneration == generation && ready && visible;
+    if (!preserved) diagnostic << "failure=shell-state-guard,input_ready=" << inputReady << ",expected_input=" << expectedInput
+        << ",actual_input=" << current.dwTime << ",expected_revision=" << revision << ",actual_revision=" << actualRevision
+        << ",expected_scans=" << scans << ",actual_scans=" << actualScans << ",members=" << members
+        << ",expected_wallpaper=" << generation << ",actual_wallpaper=" << actualGeneration << ",ready=" << ready << ",visible=" << visible << '\n';
+    return preserved;
+}
+
+bool SampleS0ShellMenuCommand(MainWindow& owner, DesktopSurfaceWindow& surface,
+    const AppConfig& config, const std::filesystem::path& outputRoot,
+    ULONGLONG deadline, size_t& completed, bool trace, S0PointerRestoreScope* pointerRestore = nullptr, DWORD* lastOwnTick = nullptr, bool frameControl = false,
+    const std::wstring& desktopIdentity = {}) {
+    std::ofstream csv(outputRoot / L"resource-s0-shell-menu.csv", std::ios::trunc);
+    std::ofstream diagnostic(outputRoot / L"resource-s0-shell-menu-diagnostic.txt", std::ios::trunc);
+    if (!csv || !diagnostic || gS0MenuObservation) return false;
+    std::ofstream pointerCsv;
+    if (pointerRestore) {
+        pointerCsv.open(outputRoot / L"resource-s0-shell-pointer.csv", std::ios::trunc);
+        if (!pointerCsv) return false;
+        WriteS0ShellPointerHeader(pointerCsv);
+    }
+    csv << "sample,call_utc_ticks,call_qpc,return_qpc,call_us,visible_qpc,flush_qpc,visible_us,flush_us,qpc_frequency,"
+        "menu_width,menu_height,event_count,filtered_input_messages,cancelled,fallback,input_tick,input_stable,menu_exposed,"
+        "menu_private_bytes,menu_working_set_bytes,menu_peak_private_bytes,menu_cpu_100ns,menu_handles,menu_gdi,menu_user,"
+        "private_bytes,working_set_bytes,peak_private_bytes,cpu_100ns,handles,gdi,user,snapshot_revision,scan_count,snapshot_items,members_preserved,menu_pixel_colors,menu_capture_us,observed_qpc,observed_us";
+    const bool frameProbe = pointerRestore != nullptr || frameControl;
+    if (frameProbe) csv << ",presentation_source,frame_probe_count";
+    csv << '\n';
+    LARGE_INTEGER frequency{};
+    LASTINPUTINFO initial{sizeof(LASTINPUTINFO)};
+    if (!QueryPerformanceFrequency(&frequency) || !GetLastInputInfo(&initial)) return false;
+    const auto revision = MainWindowSmokeAccess::SnapshotRevisionForS0(owner);
+    const auto scans = DesktopScanner::ScanCountForTesting();
+    const auto generation = DesktopSurfaceWindowSmokeAccess::WallpaperGeneration(surface);
+    const auto stable = [&]() {
+        return S0ShellStatePreserved(owner, surface, config, initial.dwTime, revision, scans, generation, diagnostic);
+    };
+    MONITORINFO monitor{sizeof(MONITORINFO)};
+    if (!GetMonitorInfoW(MonitorFromWindow(surface.Window(), MONITOR_DEFAULTTONEAREST), &monitor)) return false;
+    const ULONGLONG phaseStarted = GetTickCount64();
+    for (size_t sample = 0; sample < 30; ++sample) {
+        while (GetTickCount64() < phaseStarted + sample * 500) {
+            MSG message{};
+            while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+                if (message.message == WM_QUIT) return false;
+                TranslateMessage(&message); DispatchMessageW(&message);
+            }
+            if (!stable() || GetTickCount64() >= deadline) return false;
+            Sleep(1);
+        }
+        if (!stable() || GetTickCount64() >= deadline) return false;
+        S0MenuObservation observation{};
+        observation.owner = surface.Window(); observation.inputTick = initial.dwTime; observation.trace = trace;
+        observation.diagnostic = &diagnostic;
+        observation.allowFrameProbe = frameProbe;
+        struct MenuScope {
+            S0MenuObservation& value;
+            ~MenuScope() {
+                KillTimer(value.owner, S0MenuObservation::kAfterPaint); KillTimer(value.owner, S0MenuObservation::kFallback);
+                KillTimer(value.owner, S0MenuObservation::kObserveFrame);
+                if (value.popupHook) UnhookWinEvent(value.popupHook);
+                if (value.showHook) UnhookWinEvent(value.showHook);
+                if (value.inputHook) UnhookWindowsHookEx(value.inputHook);
+                gS0MenuObservation = nullptr;
+            }
+        } scope{observation};
+        gS0MenuObservation = &observation;
+        observation.popupHook = SetWinEventHook(EVENT_SYSTEM_MENUPOPUPSTART, EVENT_SYSTEM_MENUPOPUPSTART, nullptr,
+            S0ObserveOwnedMenuPresentation, GetCurrentProcessId(), GetCurrentThreadId(), WINEVENT_OUTOFCONTEXT);
+        observation.showHook = SetWinEventHook(EVENT_OBJECT_SHOW, EVENT_OBJECT_SHOW, nullptr,
+            S0ObserveOwnedMenuPresentation, GetCurrentProcessId(), GetCurrentThreadId(), WINEVENT_OUTOFCONTEXT);
+        observation.inputHook = SetWindowsHookExW(WH_MSGFILTER, S0FilterOwnedMenuInput, nullptr, GetCurrentThreadId());
+        if (!observation.popupHook || !observation.showHook || !observation.inputHook ||
+            !SetTimer(observation.owner, S0MenuObservation::kFallback, 2000, S0CancelOwnedMenu) ||
+            (frameProbe && !SetTimer(observation.owner, S0MenuObservation::kObserveFrame, 25, S0CancelOwnedMenu))) return false;
+        FILETIME utc{}; GetSystemTimePreciseAsFileTime(&utc);
+        LARGE_INTEGER before{}, after{}; QueryPerformanceCounter(&before);
+        HostedWidgetCommand command{}; command.type = HostedWidgetCommandType::ShowSelectionMenu;
+        command.categoryId = config.categories.front().id; command.itemIds = {config.items.front().id};
+        command.screenPoint = POINT{monitor.rcWork.right - 32, monitor.rcWork.bottom - 32};
+        const bool accepted = pointerRestore ? InvokeS0HostedPointer(surface, command, *pointerRestore, initial.dwTime,
+            deadline, sample, pointerCsv, diagnostic, &observation.inputTick, desktopIdentity) : MainWindowSmokeAccess::ExecuteHostedCommand(owner, command);
+        if (lastOwnTick) *lastOwnTick = initial.dwTime;
+        QueryPerformanceCounter(&after);
+        GUITHREADINFO gui{sizeof(GUITHREADINFO)};
+        if (!accepted || !observation.cancelled || observation.fallback || observation.inputChanged ||
+            !observation.paintQpc || !observation.exposed || FAILED(observation.flushResult) || !stable() ||
+            !GetGUIThreadInfo(GetCurrentThreadId(), &gui) || (gui.flags & GUI_INMENUMODE) || GetCapture() != nullptr) {
+            diagnostic << "failure=menu-observation,sample=" << sample << ",accepted=" << accepted
+                << ",cancelled=" << observation.cancelled << ",fallback=" << observation.fallback
+                << ",input_changed=" << observation.inputChanged << ",paint_count=" << observation.paintCount
+                << ",paint_qpc=" << observation.paintQpc << ",exposed=" << observation.exposed << ",flush_hr=" << observation.flushResult
+                << ",bounds=" << observation.bounds.left << '/' << observation.bounds.top << '/' << observation.bounds.right << '/' << observation.bounds.bottom
+                << ",pixel_colors=" << observation.pixelColors << ",capture_us=" << observation.captureUs << '\n';
+            return false;
+        }
+        const auto us = [&](LONGLONG qpc) { return (qpc - before.QuadPart) * 1000000 / frequency.QuadPart; };
+        const auto utcTicks = (static_cast<std::uint64_t>(utc.dwHighDateTime) << 32) | utc.dwLowDateTime;
+        csv << sample << ',' << utcTicks << ',' << before.QuadPart << ',' << after.QuadPart << ',' << us(after.QuadPart) << ','
+            << observation.paintQpc << ',' << observation.flushQpc << ',' << us(observation.paintQpc) << ',' << us(observation.flushQpc) << ','
+            << frequency.QuadPart << ',' << observation.bounds.right - observation.bounds.left << ',' << observation.bounds.bottom - observation.bounds.top << ','
+            << observation.paintCount << ',' << observation.suppressed << ",1,0," << initial.dwTime << ",1,1,"
+            << observation.privateBytes << ',' << observation.workingSet << ',' << observation.peakPrivate << ',' << observation.cpu << ','
+            << observation.handles << ',' << observation.gdi << ',' << observation.user << ',';
+        MainWindowSmokeAccess::WriteS0ProcessCounters(csv, trace);
+        csv << revision << ',' << scans << ',' << config.items.size() << ",1," << observation.pixelColors << ',' << observation.captureUs
+            << ',' << observation.observedQpc << ',' << us(observation.observedQpc);
+        if (frameProbe) csv << ',' << observation.presentationSource << ',' << observation.frameProbeCount;
+        csv << '\n';
+        csv.flush(); ++completed;
+    }
+    for (const auto& item : config.items) {
+        std::ifstream input(std::filesystem::path(item.path), std::ios::binary);
+        const std::string contents(std::istreambuf_iterator<char>(input), {});
+        if (contents != "resource fixture") { diagnostic << "failure=fixture-content-changed\n"; return false; }
+    }
+    diagnostic << "files_original=1\n";
+    return completed == 30;
+}
+
+bool ReadS0RecipientNumber(const std::string& json, const char* field, std::uint64_t& number) {
+    const std::string key = std::string("\"") + field + "\":";
+    const auto begin = json.find(key);
+    if (begin == std::string::npos || json.find(key, begin + key.size()) != std::string::npos) return false;
+    const auto digits = begin + key.size();
+    const auto end = json.find_first_not_of("0123456789", digits);
+    if (end == digits || end == std::string::npos || (json[end] != ',' && json[end] != '}')) return false;
+    try { number = std::stoull(json.substr(digits, end - digits)); } catch (...) { return false; }
+    return true;
+}
+
+bool SampleS0ShellOpenCommand(MainWindow& owner, DesktopSurfaceWindow& surface,
+    const AppConfig& config, const std::filesystem::path& outputRoot,
+    const std::filesystem::path& recipient, const std::string& token,
+    ULONGLONG deadline, size_t& completed, bool trace, S0PointerRestoreScope* pointerRestore = nullptr, DWORD* lastOwnTick = nullptr,
+    const std::wstring& desktopIdentity = {}, const std::filesystem::path& externalReceipts = {}) {
+    const auto receiptRoot = externalReceipts.empty() ? outputRoot / L"s0-open-receipts" : externalReceipts;
+    std::ofstream csv(outputRoot / L"resource-s0-shell-open.csv", std::ios::trunc);
+    std::ofstream diagnostic(outputRoot / L"resource-s0-shell-open-diagnostic.txt", std::ios::trunc);
+    if (!csv || !diagnostic) return false;
+    std::ofstream pointerCsv;
+    if (pointerRestore) {
+        pointerCsv.open(outputRoot / L"resource-s0-shell-pointer.csv", std::ios::trunc);
+        if (!pointerCsv) return false;
+        WriteS0ShellPointerHeader(pointerCsv);
+    }
+    csv << "sample,call_utc_ticks,call_qpc,call_return_qpc,call_us,child_pid,child_start_utc_ticks,"
+        "child_entered_qpc,child_paint_qpc,child_flush_qpc,paint_us,flush_us,observed_us,"
+        "qpc_frequency,child_exit,child_cpu_100ns,receipt_cpu_100ns,child_private_bytes,"
+        "child_peak_private_bytes,child_working_set_bytes,child_handles,child_threads,child_gdi,child_user,"
+        "private_bytes,working_set_bytes,peak_private_bytes,cpu_100ns,handles,gdi,user,"
+        "snapshot_revision,scan_count,snapshot_items,members_preserved,input_stable\n";
+    const auto ticks = [](FILETIME time) {
+        return (static_cast<std::uint64_t>(time.dwHighDateTime) << 32) | time.dwLowDateTime;
+    };
+    LARGE_INTEGER frequency{};
+    LASTINPUTINFO initial{sizeof(LASTINPUTINFO)};
+    if (!QueryPerformanceFrequency(&frequency) || !GetLastInputInfo(&initial)) return false;
+    const auto revision = MainWindowSmokeAccess::SnapshotRevisionForS0(owner);
+    const auto scans = DesktopScanner::ScanCountForTesting();
+    const auto generation = DesktopSurfaceWindowSmokeAccess::WallpaperGeneration(surface);
+    const auto stable = [&]() {
+        return S0ShellStatePreserved(owner, surface, config, initial.dwTime, revision, scans, generation, diagnostic);
+    };
+    const auto pump = [&]() {
+        MSG message{};
+        while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+            if (message.message == WM_QUIT) return false;
+            TranslateMessage(&message); DispatchMessageW(&message);
+        }
+        return stable() && GetTickCount64() < deadline;
+    };
+    const auto read = [](const std::filesystem::path& path) {
+        std::ifstream input(path, std::ios::binary);
+        return std::string(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
+    };
+    const std::string tokenField = "\"Token\":\"" + token + "\"";
+    std::unordered_set<std::wstring> previous;
+    if (!externalReceipts.empty()) {
+        std::error_code error;
+        for (const auto& entry : std::filesystem::directory_iterator(receiptRoot, error)) previous.insert(entry.path().filename().wstring());
+        if (error) return false;
+    }
+    std::unordered_set<std::wstring> childIdentities;
+    const ULONGLONG phaseStarted = GetTickCount64();
+    for (size_t sample = 0; sample < 30; ++sample) {
+        const DWORD cadence = pointerRestore ? (std::max<DWORD>)(500, GetDoubleClickTime() + 100) : 500;
+        while (GetTickCount64() < phaseStarted + sample * cadence ||
+            (pointerRestore && sample > 0 && static_cast<DWORD>(GetTickCount() - initial.dwTime) < cadence)) {
+            if (!pump()) return false;
+            Sleep(1);
+        }
+        if (!stable()) { diagnostic << "failure=pre-call-state,sample=" << sample << '\n'; return false; }
+        FILETIME utc{}; GetSystemTimePreciseAsFileTime(&utc);
+        LARGE_INTEGER before{}, after{}; QueryPerformanceCounter(&before);
+        HostedWidgetCommand command{};
+        command.type = HostedWidgetCommandType::OpenSelection;
+        command.categoryId = config.categories.front().id;
+        command.itemIds = {config.items.front().id};
+        const bool accepted = pointerRestore ? InvokeS0HostedPointer(surface, command, *pointerRestore, initial.dwTime,
+            deadline, sample, pointerCsv, diagnostic, nullptr, desktopIdentity) : MainWindowSmokeAccess::ExecuteHostedCommand(owner, command);
+        if (lastOwnTick) *lastOwnTick = initial.dwTime;
+        QueryPerformanceCounter(&after);
+        if (!accepted) { diagnostic << "failure=actual-command-rejected,sample=" << sample << '\n'; return false; }
+        const ULONGLONG childDeadline = (std::min)(deadline, GetTickCount64() + 2000);
+        std::filesystem::path startup;
+        while (GetTickCount64() < childDeadline && startup.empty()) {
+            std::error_code error;
+            for (const auto& entry : std::filesystem::directory_iterator(receiptRoot, error)) {
+                const auto name = entry.path().filename().wstring();
+                const std::wstring suffix = L".started.json";
+                if (name.size() >= suffix.size() && name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0 &&
+                    previous.count(name) == 0) {
+                    if (!startup.empty()) { diagnostic << "failure=duplicate-startup\n"; return false; }
+                    startup = entry.path();
+                }
+            }
+            if (error || !pump()) return false;
+            if (startup.empty()) Sleep(1);
+        }
+        if (startup.empty()) { diagnostic << "failure=startup-timeout,sample=" << sample << '\n'; return false; }
+        const auto started = read(startup);
+        std::uint64_t childPid = 0, startedUtc = 0;
+        if (started.size() > 4096 || started.find(tokenField) == std::string::npos ||
+            !ReadS0RecipientNumber(started, "Pid", childPid) || childPid == 0 || childPid > MAXDWORD ||
+            !ReadS0RecipientNumber(started, "StartUtcTicks", startedUtc) || startedUtc < ticks(utc)) return false;
+        const auto stem = L"recipient-" + std::wstring(token.begin(), token.end()) + L"-" + std::to_wstring(childPid) + L"-" + std::to_wstring(startedUtc);
+        if (!childIdentities.insert(stem).second) return false;
+        if (startup.filename() != stem + L".started.json") return false;
+        struct ChildHandle {
+            HANDLE value = nullptr;
+            ~ChildHandle() { if (value) { WaitForSingleObject(value, 1000); CloseHandle(value); } }
+        } child{OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, static_cast<DWORD>(childPid))};
+        FILETIME created{}, exited{}, kernel{}, user{};
+        wchar_t image[32768]{}; DWORD imageLength = _countof(image);
+        if (!child.value || !GetProcessTimes(child.value, &created, &exited, &kernel, &user) || ticks(created) != startedUtc ||
+            !QueryFullProcessImageNameW(child.value, 0, image, &imageLength) ||
+            CompareStringOrdinal(image, -1, recipient.c_str(), -1, TRUE) != CSTR_EQUAL) {
+            diagnostic << "failure=os-child-identity,sample=" << sample << '\n'; return false;
+        }
+        while (GetTickCount64() < childDeadline && WaitForSingleObject(child.value, 0) == WAIT_TIMEOUT) {
+            if (!pump()) return false;
+            Sleep(1);
+        }
+        DWORD exitCode = STILL_ACTIVE;
+        if (WaitForSingleObject(child.value, 0) != WAIT_OBJECT_0 ||
+            !GetExitCodeProcess(child.value, &exitCode) || exitCode != 0 ||
+            !GetProcessTimes(child.value, &created, &exited, &kernel, &user)) {
+            diagnostic << "failure=child-natural-exit,sample=" << sample << '\n'; return false;
+        }
+        const auto final = read(receiptRoot / (stem + L".json"));
+        const std::array<const char*, 15> names{"Pid", "StartUtcTicks", "PaintUtcTicks", "EnteredQpc", "PaintQpc", "FlushQpc",
+            "QpcFrequency", "FlushHresult", "Cpu100ns", "PrivateBytes", "PeakPrivateBytes", "WorkingSetBytes", "Handles", "Threads", "Gdi"};
+        std::array<std::uint64_t, 15> values{};
+        for (size_t index = 0; index < names.size(); ++index) {
+            if (!ReadS0RecipientNumber(final, names[index], values[index])) return false;
+        }
+        std::uint64_t childUser = 0;
+        const auto wholeCpu = ticks(kernel) + ticks(user);
+        if (final.size() > 4096 || final.find(tokenField) == std::string::npos ||
+            !ReadS0RecipientNumber(final, "User", childUser) || values[0] != childPid || values[1] != startedUtc ||
+            values[2] <= startedUtc || values[3] < static_cast<std::uint64_t>(before.QuadPart) ||
+            values[4] <= values[3] || values[5] < values[4] || values[6] != static_cast<std::uint64_t>(frequency.QuadPart) ||
+            values[7] != 0 || values[8] > wholeCpu || !stable()) return false;
+        if (!externalReceipts.empty()) {
+            std::error_code error;
+            const auto exported = outputRoot / L"s0-open-receipts";
+            std::filesystem::copy_file(startup, exported / startup.filename(), std::filesystem::copy_options::none, error);
+            if (error) return false;
+            std::filesystem::copy_file(receiptRoot / (stem + L".json"), exported / (stem + L".json"), std::filesystem::copy_options::none, error);
+            if (error) return false;
+        }
+        LARGE_INTEGER observed{}; QueryPerformanceCounter(&observed);
+        const auto us = [&](std::uint64_t qpc) {
+            return (qpc - static_cast<std::uint64_t>(before.QuadPart)) * 1000000 / static_cast<std::uint64_t>(frequency.QuadPart);
+        };
+        csv << sample << ',' << ticks(utc) << ',' << before.QuadPart << ',' << after.QuadPart << ','
+            << us(static_cast<std::uint64_t>(after.QuadPart)) << ',' << childPid << ',' << startedUtc << ','
+            << values[3] << ',' << values[4] << ',' << values[5] << ',' << us(values[4]) << ',' << us(values[5]) << ','
+            << us(static_cast<std::uint64_t>(observed.QuadPart)) << ',' << frequency.QuadPart << ',' << exitCode << ',' << wholeCpu << ','
+            << values[8] << ',' << values[9] << ',' << values[10] << ',' << values[11] << ',' << values[12] << ',' << values[13] << ','
+            << values[14] << ',' << childUser << ',';
+        MainWindowSmokeAccess::WriteS0ProcessCounters(csv, trace);
+        csv << revision << ',' << scans << ',' << config.items.size() << ",1,1\n";
+        csv.flush(); previous.insert(startup.filename().wstring()); ++completed;
+    }
+    return completed == 30;
+}
+
+template<typename Restore>
+bool SampleS0PointerGesture(MainWindow& owner, DesktopSurfaceWindow& surface,
+    const AppConfig& config, const std::filesystem::path& desktopRoot,
+    const std::filesystem::path& outputRoot, ULONGLONG deadline,
+    Restore& restore, size_t& completed, unsigned dragItems = 0, bool trace = false, bool fixedDragTargets = false) {
+    std::ofstream diagnostic(outputRoot / L"resource-s0-pointer-diagnostic.txt", std::ios::trunc);
+    std::ofstream csv(outputRoot / (dragItems ? L"resource-s0-pointer-drag.csv" : L"resource-s0-pointer-box.csv"), std::ios::trunc);
+    std::ofstream dispatchCsv(outputRoot / L"resource-s0-pointer-dispatch.csv", std::ios::trunc);
+    std::ofstream saveCsv(outputRoot / L"resource-s0-save-profile.csv", std::ios::trunc);
+    if (!diagnostic || !csv || !dispatchCsv || !saveCsv) { return false; }
+    saveCsv << "sample,release_utc_ticks,revision_before,revision_after,load_us,build_us,write_us,publish_us,release_handler_us\n";
+    dispatchCsv << "sample,action,utc_ticks,queue_us,handler_us,return_us\n";
+    diagnostic << "PID=" << GetCurrentProcessId() << '\n';
+    const auto targets = DesktopSurfaceWindowSmokeAccess::ExposedS0PointerTargets(
+        surface, desktopRoot, &diagnostic, fixedDragTargets);
+    diagnostic << "exposed_targets=" << targets.size() << '\n';
+    if (targets.size() != 4 || !GetCursorPos(&restore.saved)) { return false; }
+    std::vector<std::pair<std::wstring, std::wstring>> identities;
+    std::vector<std::vector<std::wstring>> expectedSelections;
+    for (const auto& target : targets) {
+        identities.push_back(DesktopSurfaceWindowSmokeAccess::S0BoxIdentity(surface, target));
+        if (identities.back().first.empty() || identities.back().second.empty()) { return false; }
+        auto selectionTarget = target;
+        if (dragItems == 2) { selectionTarget.itemIndex = 0; }
+        expectedSelections.push_back(dragItems == 1 ? std::vector<std::wstring>{identities.back().second} :
+            DesktopSurfaceWindowSmokeAccess::S0BoxExpected(surface, selectionTarget));
+        if (expectedSelections.back().size() != (dragItems ? dragItems : static_cast<size_t>(2 - target.itemIndex))) { return false; }
+        diagnostic << "target_identity=" << identities.size() - 1 << ',' << Utf8Text(identities.back().first)
+            << ',' << Utf8Text(identities.back().second) << '\n';
+    }
+    restore.enabled = true;
+    struct HeldInputWatch {
+        Restore& state;
+        std::ostream& diagnostic;
+        std::atomic<bool> stop{false};
+        std::atomic<unsigned> releases{0};
+        std::thread thread;
+        HeldInputWatch(Restore& value, std::ostream& output) : state(value), diagnostic(output), thread([this]() {
+            while (!stop.load()) {
+                const DWORD tick = state.lastInputTick.load();
+                LASTINPUTINFO last{sizeof(LASTINPUTINFO)};
+                if (state.ownsLeft.load() && static_cast<DWORD>(GetTickCount() - tick) >= 2000 &&
+                    GetLastInputInfo(&last) && last.dwTime == tick &&
+                    (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0) {
+                    INPUT input{};
+                    input.type = INPUT_MOUSE;
+                    input.mi.dwFlags = MOUSEEVENTF_LEFTUP;
+                    input.mi.dwExtraInfo = 0x4C42FFFFUL;
+                    input.mi.time = GetTickCount();
+                    if (SendInput(1, &input, sizeof(input)) == 1) {
+                        state.lastInputTick.store(input.mi.time);
+                        state.ownsLeft.store(false);
+                        releases.fetch_add(1);
+                    }
+                }
+                Sleep(10);
+            }
+        }) {}
+        ~HeldInputWatch() {
+            stop.store(true);
+            thread.join();
+            diagnostic << "held_input_watch_releases=" << releases.load() << '\n';
+        }
+    } heldInputWatch(restore, diagnostic);
+    const auto revision = MainWindowSmokeAccess::SnapshotRevisionForS0(owner);
+    const auto scans = DesktopScanner::ScanCountForTesting();
+    const auto generation = DesktopSurfaceWindowSmokeAccess::WallpaperGeneration(surface);
+    LASTINPUTINFO initialInput{sizeof(LASTINPUTINFO)};
+    if (!GetLastInputInfo(&initialInput)) { return false; }
+    const auto preserved = [&]() {
+        return MainWindowSmokeAccess::SnapshotRevisionForS0(owner) == revision &&
+            DesktopScanner::ScanCountForTesting() == scans &&
+            MainWindowSmokeAccess::MembersPreservedForS0(owner, config) &&
+            DesktopSurfaceWindowSmokeAccess::WallpaperGeneration(surface) == generation &&
+            DesktopSurfaceWindowSmokeAccess::WallpaperReady(surface) && IsWindowVisible(surface.Window());
+    };
+    const auto inputStable = [&]() {
+        LASTINPUTINFO input{sizeof(LASTINPUTINFO)};
+        return GetLastInputInfo(&input) && input.dwTime ==
+            (restore.hasLast ? restore.lastInputTick.load() : initialInput.dwTime) &&
+            ((GetAsyncKeyState(VK_RBUTTON) | GetAsyncKeyState(VK_MBUTTON) |
+              GetAsyncKeyState(VK_XBUTTON1) | GetAsyncKeyState(VK_XBUTTON2) |
+              GetAsyncKeyState(VK_CONTROL) | GetAsyncKeyState(VK_SHIFT) | GetAsyncKeyState(VK_MENU)) & 0x8000) == 0;
+    };
+    struct Receipt {
+        long long message = 0, paint = 0, observed = 0, flush = 0, capture = 0;
+        size_t probes = 0;
+        std::uint64_t utc = 0;
+        std::chrono::steady_clock::time_point sent{};
+        long long queue = 0, handler = 0;
+    };
+    const auto inject = [&](POINT point, DWORD flags, UINT expected, ULONG_PTR tag, Receipt& receipt) {
+        if (heldInputWatch.releases.load() != 0) {
+            diagnostic << "inject_rejected_after_watch=" << expected << '\n'; return false;
+        }
+        INPUT input{};
+        input.type = INPUT_MOUSE;
+        input.mi.dx = MulDiv(point.x - GetSystemMetrics(SM_XVIRTUALSCREEN), 65535,
+            (std::max)(1, GetSystemMetrics(SM_CXVIRTUALSCREEN) - 1));
+        input.mi.dy = MulDiv(point.y - GetSystemMetrics(SM_YVIRTUALSCREEN), 65535,
+            (std::max)(1, GetSystemMetrics(SM_CYVIRTUALSCREEN) - 1));
+        input.mi.dwFlags = flags | MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
+        input.mi.dwExtraInfo = tag;
+        input.mi.time = GetTickCount();
+        FILETIME utc{}; GetSystemTimeAsFileTime(&utc);
+        receipt.utc = (static_cast<std::uint64_t>(utc.dwHighDateTime) << 32) | utc.dwLowDateTime;
+        const auto start = std::chrono::steady_clock::now();
+        receipt.sent = start;
+        if (SendInput(1, &input, sizeof(input)) != 1) { return false; }
+        restore.lastInputTick = input.mi.time; restore.last = point; restore.hasLast = true;
+        if (flags & MOUSEEVENTF_LEFTDOWN) { restore.ownsLeft = true; }
+        if (flags & MOUSEEVENTF_LEFTUP) { restore.ownsLeft = false; }
+        bool seen = false;
+        while (GetTickCount64() < deadline && std::chrono::steady_clock::now() - start < std::chrono::seconds(2)) {
+            MSG message{};
+            while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+                if (message.message == WM_QUIT) { PostQuitMessage(static_cast<int>(message.wParam)); return false; }
+                const bool matched = message.hwnd == surface.Window() && message.message == expected &&
+                    static_cast<ULONG_PTR>(GetMessageExtraInfo()) == tag;
+                if (matched && (std::abs(GET_X_LPARAM(message.lParam) - (point.x - targets.front().screen.x + targets.front().client.x)) > 1 ||
+                    std::abs(GET_Y_LPARAM(message.lParam) - (point.y - targets.front().screen.y + targets.front().client.y)) > 1)) { return false; }
+                const auto dispatchStarted = std::chrono::steady_clock::now();
+                TranslateMessage(&message); DispatchMessageW(&message);
+                const auto dispatchEnded = std::chrono::steady_clock::now();
+                const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(dispatchEnded - start).count();
+                if (matched) {
+                    seen = true; receipt.message = elapsed;
+                    receipt.queue = std::chrono::duration_cast<std::chrono::microseconds>(dispatchStarted - start).count();
+                    receipt.handler = std::chrono::duration_cast<std::chrono::microseconds>(dispatchEnded - dispatchStarted).count();
+                }
+                if (seen && message.hwnd == surface.Window() && message.message == WM_PAINT) {
+                    receipt.paint = elapsed;
+                    const bool stable = inputStable(), stateOk = preserved();
+                    if (!stable || !stateOk) {
+                        LASTINPUTINFO last{sizeof(LASTINPUTINFO)};
+                        GetLastInputInfo(&last);
+                        diagnostic << "inject_guard=" << expected << ",input=" << stable << ",state=" << stateOk
+                            << ",own_tick=" << restore.lastInputTick.load() << ",actual_tick=" << last.dwTime << '\n';
+                    }
+                    return stable && stateOk;
+                }
+            }
+            MsgWaitForMultipleObjects(0, nullptr, FALSE, 5, QS_ALLINPUT);
+        }
+        LASTINPUTINFO last{sizeof(LASTINPUTINFO)};
+        GetLastInputInfo(&last);
+        diagnostic << "inject_timeout=" << expected << ",seen=" << seen << ",message_us=" << receipt.message
+            << ",paint_us=" << receipt.paint << ",own_tick=" << restore.lastInputTick.load()
+            << ",actual_tick=" << last.dwTime << ",owns_left=" << restore.ownsLeft.load()
+            << ",actual_left=" << ((GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0)
+            << ",watch_releases=" << heldInputWatch.releases.load() << '\n';
+        return false;
+    };
+    csv << "sample,widget,item,move_utc_ticks,move_return_us,move_paint_us,move_observed_us,move_flush_us,move_capture_us,"
+        "release_utc_ticks,release_return_us,release_paint_us,release_observed_us,release_flush_us,release_capture_us,"
+        "move_rgb_changed,release_rgb_changed,state_preserved,selection_exact,capture_released,input_tick,last_input_tick,input_stable,"
+        "baseline_flush_us,baseline_capture_us,move_probe_count,release_probe_count,expected_selection_count,selected_count";
+    if (dragItems) { csv << ",preparation_utc_ticks,preparation_us,drag_items,move_ghost_pixel_bytes,move_ghost_hicons,release_ghost_pixel_bytes,release_ghost_hicons"; }
+    csv << '\n';
+    DesktopSurfaceWindowSmokeAccess::ResetS0Frames(surface);
+    for (completed = 0; completed < 100; ++completed) {
+        const auto& target = targets[completed % targets.size()];
+        const auto& identity = identities[completed % targets.size()];
+        const auto& expected = expectedSelections[completed % targets.size()];
+        POINT start{}, end{target.screenCell.left + 2, target.screenCell.bottom - 2};
+        const bool stateOk = preserved(), inputOk = inputStable(), captureOk = GetCapture() == nullptr;
+        const bool buttonOk = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) == 0;
+        const bool exposed = DesktopSurfaceWindowSmokeAccess::S0PointerTargetExposed(surface, target);
+        const bool startOk = dragItems ? (start = target.screen,
+            DesktopSurfaceWindowSmokeAccess::S0DragEnd(surface, target, identity.first, expected, end)) :
+            DesktopSurfaceWindowSmokeAccess::S0BoxStart(surface, target, identity.first, start,
+                completed == 0 ? &diagnostic : nullptr);
+        if (!stateOk || !inputOk || !captureOk || !buttonOk || !exposed || !startOk) {
+            diagnostic << "failure=box-precondition\nsample=" << completed << "\nstate=" << stateOk
+                << "\ninput=" << inputOk << "\ncapture=" << captureOk << "\nbutton=" << buttonOk
+                << "\nexposed=" << exposed << "\nstart=" << startOk << '\n'; return false;
+        }
+        const ULONG_PTR tag = 0x4C420000UL | ((completed + 1) << 2);
+        Receipt down, move, release;
+        std::uint64_t preparationUtc = 0;
+        long long preparationUs = 0;
+        if (dragItems == 2 && !DesktopSurfaceWindowSmokeAccess::S0DragState(surface, target, identity, expected, 2)) {
+            POINT prepareStart{}, prepareEnd{target.screenCell.left + 2, target.screenCell.bottom - 2};
+            auto prepareTarget = target;
+            prepareTarget.itemIndex = 0;
+            auto prepareIdentity = identity;
+            prepareIdentity.second = expected.front();
+            if (target.itemIndex == 1) { prepareEnd.x -= target.screenCell.right - target.screenCell.left; }
+            if (!DesktopSurfaceWindowSmokeAccess::S0BoxStart(surface, prepareTarget, identity.first, prepareStart)) { return false; }
+            Receipt prepareDown, prepareMove, prepareRelease;
+            const auto prepareAt = std::chrono::steady_clock::now();
+            if (!inject(prepareStart, MOUSEEVENTF_LEFTDOWN, WM_LBUTTONDOWN, tag ^ 0x00800000UL, prepareDown) ||
+                !DesktopSurfaceWindowSmokeAccess::S0BoxState(surface, prepareTarget, prepareIdentity, expected, 0) ||
+                !inject(prepareEnd, 0, WM_MOUSEMOVE, (tag + 1) ^ 0x00800000UL, prepareMove) ||
+                !DesktopSurfaceWindowSmokeAccess::S0BoxState(surface, prepareTarget, prepareIdentity, expected, 1) ||
+                !inject(prepareEnd, MOUSEEVENTF_LEFTUP, WM_LBUTTONUP, (tag + 2) ^ 0x00800000UL, prepareRelease) ||
+                !DesktopSurfaceWindowSmokeAccess::S0BoxState(surface, prepareTarget, prepareIdentity, expected, 2)) {
+                diagnostic << "failure=drag-prepare\nsample=" << completed << '\n'; return false;
+            }
+            preparationUtc = prepareDown.utc;
+            preparationUs = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - prepareAt).count();
+        }
+        const auto gestureState = [&](int stage) {
+            return dragItems ? DesktopSurfaceWindowSmokeAccess::S0DragState(surface, target, identity, expected, stage) :
+                DesktopSurfaceWindowSmokeAccess::S0BoxState(surface, target, identity, expected, stage);
+        };
+        const bool downInjected = inject(start, MOUSEEVENTF_LEFTDOWN, WM_LBUTTONDOWN, tag, down);
+        const bool downState = gestureState(0);
+        if (!downInjected || !downState) {
+            diagnostic << "failure=box-down\nsample=" << completed << "\ninjected=" << downInjected
+                << "\nstate=" << downState << "\nmessage_us=" << down.message << "\npaint_us=" << down.paint << '\n'; return false;
+        }
+        std::vector<std::uint32_t> before, afterMove, afterRelease;
+        const auto baselineStarted = std::chrono::steady_clock::now();
+        const HRESULT baselineFlush = DwmFlush();
+        const auto baselineCaptureStarted = std::chrono::steady_clock::now();
+        const bool baselineCaptured = CaptureScreenPixels(target.screenCell, before);
+        const auto baselineEnded = std::chrono::steady_clock::now();
+        const auto baselineFlushUs = std::chrono::duration_cast<std::chrono::microseconds>(baselineCaptureStarted - baselineStarted).count();
+        const auto baselineCaptureUs = std::chrono::duration_cast<std::chrono::microseconds>(baselineEnded - baselineCaptureStarted).count();
+        if (FAILED(baselineFlush) || !baselineCaptured) { return false; }
+        if (heldInputWatch.releases.load() != 0 || !restore.ownsLeft.load() ||
+            (GetAsyncKeyState(VK_LBUTTON) & 0x8000) == 0 || !inputStable() || GetTickCount64() >= deadline) {
+            diagnostic << "failure=gesture-baseline-guard\nsample=" << completed
+                << "\nflush_us=" << baselineFlushUs << "\ncapture_us=" << baselineCaptureUs
+                << "\ndown_return_us=" << down.message << "\ndown_paint_us=" << down.paint
+                << "\nowns_left=" << restore.ownsLeft.load()
+                << "\nactual_left=" << ((GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0)
+                << "\nwatch_releases=" << heldInputWatch.releases.load() << '\n'; return false;
+        }
+        const auto changed = [](const auto& reference, const auto& pixels) {
+            return reference.size() == pixels.size() && !std::equal(reference.begin(), reference.end(), pixels.begin(),
+                [](std::uint32_t a, std::uint32_t b) { return (a & 0xFFFFFFU) == (b & 0xFFFFFFU); });
+        };
+        const auto observe = [&](Receipt& receipt, std::vector<std::uint32_t>& pixels,
+                                 const std::vector<std::uint32_t>& reference, int stage) {
+          while (GetTickCount64() < deadline && std::chrono::steady_clock::now() - receipt.sent < std::chrono::seconds(2)) {
+            const auto flushStart = std::chrono::steady_clock::now();
+            const HRESULT hr = DwmFlush();
+            const auto captureStart = std::chrono::steady_clock::now();
+            const bool captured = CaptureScreenPixels(target.screenCell, pixels);
+            const auto endAt = std::chrono::steady_clock::now();
+            receipt.flush += std::chrono::duration_cast<std::chrono::microseconds>(captureStart - flushStart).count();
+            receipt.capture += std::chrono::duration_cast<std::chrono::microseconds>(endAt - captureStart).count();
+            ++receipt.probes;
+            receipt.observed = std::chrono::duration_cast<std::chrono::microseconds>(endAt - receipt.sent).count();
+            POINT cursor{};
+            const bool cursorMatches = GetCursorPos(&cursor) &&
+                std::abs(cursor.x - end.x) <= 1 && std::abs(cursor.y - end.y) <= 1;
+            if (FAILED(hr) || !captured || !cursorMatches || pixels.size() != before.size() || !inputStable() || !preserved() ||
+                !DesktopSurfaceWindowSmokeAccess::S0PointerTargetExposed(surface, target) ||
+                !gestureState(stage)) { return false; }
+            if (changed(reference, pixels) && (dragItems || changed(before, pixels))) { return true; }
+            MSG message{};
+            while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+                if (message.message == WM_QUIT) { PostQuitMessage(static_cast<int>(message.wParam)); return false; }
+                TranslateMessage(&message); DispatchMessageW(&message);
+            }
+            MsgWaitForMultipleObjects(0, nullptr, FALSE, 10, QS_ALLINPUT);
+          }
+          return false;
+        };
+        const bool moveInjected = inject(end, 0, WM_MOUSEMOVE, tag + 1, move);
+        const bool moveState = moveInjected && gestureState(1);
+        const bool moveObserved = moveState && observe(move, afterMove, before, 1);
+        if (!moveObserved) {
+            POINT actual{}, physical{};
+            GetCursorPos(&actual); GetPhysicalCursorPos(&physical);
+            LASTINPUTINFO last{sizeof(LASTINPUTINFO)}; GetLastInputInfo(&last);
+            diagnostic << "failure=gesture-move\nsample=" << completed
+                << "\ninjected=" << moveInjected << "\nstate=" << moveState << "\nobserved=" << moveObserved
+                << "\nmessage_us=" << move.message << "\npaint_us=" << move.paint
+                << "\ninput_stable=" << inputStable() << "\nstate_preserved=" << preserved()
+                << "\nexposed=" << DesktopSurfaceWindowSmokeAccess::S0PointerTargetExposed(surface, target)
+                << "\nexpected_cursor=" << end.x << ',' << end.y
+                << "\nactual_cursor=" << actual.x << ',' << actual.y
+                << "\nphysical_cursor=" << physical.x << ',' << physical.y
+                << "\nown_tick=" << restore.lastInputTick.load() << "\nactual_tick=" << last.dwTime << '\n';
+            return false;
+        }
+        const auto moveGhost = dragItems && trace ? DragGhostWindowSmokeAccess::ResourceCountsForS0(DragGhostWindow::Instance()) : std::pair<long long,long long>{-1,-1};
+        const auto saveBefore = MainWindowSmokeAccess::S0SaveProfile(owner);
+        if (
+            !inject(end, MOUSEEVENTF_LEFTUP, WM_LBUTTONUP, tag + 2, release) ||
+            !gestureState(2) || !observe(release, afterRelease, afterMove, 2)) {
+            diagnostic << "failure=box-move-or-release\nsample=" << completed << '\n'; return false;
+        }
+        LASTINPUTINFO last{sizeof(LASTINPUTINFO)};
+        if (!GetLastInputInfo(&last) || !changed(before, afterMove) || !changed(afterMove, afterRelease)) {
+            diagnostic << "failure=box-pixels\nsample=" << completed << '\n'; return false;
+        }
+        csv << completed + 1 << ',' << target.widgetIndex << ',' << target.itemIndex << ','
+            << move.utc << ',' << move.message << ',' << move.paint << ',' << move.observed << ',' << move.flush << ',' << move.capture << ','
+            << release.utc << ',' << release.message << ',' << release.paint << ',' << release.observed << ',' << release.flush << ',' << release.capture
+            << ",1,1,1,1,1," << restore.lastInputTick.load() << ',' << last.dwTime << ",1,"
+            << baselineFlushUs << ',' << baselineCaptureUs << ',' << move.probes << ',' << release.probes << ','
+            << expected.size() << ',' << DesktopSurfaceWindowSmokeAccess::S0BoxSelectedCount(surface, identity.first);
+        if (dragItems) {
+            const auto released = trace ? DragGhostWindowSmokeAccess::ResourceCountsForS0(DragGhostWindow::Instance()) : std::pair<long long,long long>{-1,-1};
+            csv << ',' << preparationUtc << ',' << preparationUs << ',' << dragItems << ',' << moveGhost.first << ',' << moveGhost.second << ',' << released.first << ',' << released.second;
+        }
+        csv << '\n';
+        csv.flush();
+        dispatchCsv << completed + 1 << ",move," << move.utc << ',' << move.queue << ',' << move.handler << ',' << move.message << '\n'
+            << completed + 1 << ",release," << release.utc << ',' << release.queue << ',' << release.handler << ',' << release.message << '\n';
+        dispatchCsv.flush();
+        const auto saveAfter = MainWindowSmokeAccess::S0SaveProfile(owner);
+        saveCsv << completed + 1 << ',' << release.utc << ',' << saveBefore.first << ',' << saveAfter.first;
+        for (long long segment : saveAfter.second) { saveCsv << ',' << segment / 1000; }
+        saveCsv << ',' << release.handler << '\n';
+        saveCsv.flush();
+    }
+    return true;
+}
+
 int RunSmokeResourceIdle(HINSTANCE instance) {
     AttachParentConsole();
     SetThreadDpiAwarenessContext(
@@ -16267,6 +18057,58 @@ int RunSmokeResourceIdle(HINSTANCE instance) {
         visibleValue,
         static_cast<DWORD>(_countof(visibleValue))) > 0 &&
         visibleValue[0] == L'1';
+    wchar_t s0SceneValue[32]{}, s0ItemValue[8]{}, s0KindValue[8]{};
+    GetEnvironmentVariableW(L"DESKTOP_ORGANIZER_S0_SCENE", s0SceneValue,
+        static_cast<DWORD>(_countof(s0SceneValue)));
+    const bool s0PreviewScene = visibleMode &&
+        wcscmp(s0SceneValue, L"Preview") == 0;
+    const bool s0FilesScene = visibleMode &&
+        wcscmp(s0SceneValue, L"Files") == 0;
+    const bool s0ReplaceScene = visibleMode &&
+        wcscmp(s0SceneValue, L"ImageReplace") == 0;
+    const bool s0WallpaperScene = visibleMode &&
+        wcscmp(s0SceneValue, L"WallpaperRecover") == 0;
+    const bool s0FullRefreshScene = visibleMode &&
+        wcscmp(s0SceneValue, L"FullRefresh") == 0;
+    const bool s0OpenPointer = visibleMode && wcscmp(s0SceneValue, L"ShellOpenPointer") == 0;
+    const bool s0MenuPointer = visibleMode && wcscmp(s0SceneValue, L"ShellMenuPointer") == 0;
+    const bool s0DesktopOpen = visibleMode && wcscmp(s0SceneValue, L"DesktopShellOpenPointer") == 0;
+    const bool s0DesktopMenu = visibleMode && wcscmp(s0SceneValue, L"DesktopShellMenuPointer") == 0;
+    const bool s0DesktopPointer = s0DesktopOpen || s0DesktopMenu;
+    const bool s0MenuFrame = visibleMode && wcscmp(s0SceneValue, L"ShellMenuFrameCommand") == 0;
+    const bool s0ShellPointer = s0OpenPointer || s0MenuPointer || s0DesktopPointer;
+    const bool s0OpenScene = s0OpenPointer || s0DesktopOpen || (visibleMode && wcscmp(s0SceneValue, L"ShellOpenCommand") == 0);
+    const bool s0MenuScene = s0MenuPointer || s0DesktopMenu || s0MenuFrame || (visibleMode && wcscmp(s0SceneValue, L"ShellMenuCommand") == 0);
+    const bool s0ShellScene = s0OpenScene || s0MenuScene;
+    const bool s0PointerScene = visibleMode &&
+        wcscmp(s0SceneValue, L"PointerHover") == 0;
+    const bool s0BoxScene = visibleMode &&
+        wcscmp(s0SceneValue, L"PointerBox") == 0;
+    const unsigned s0DragItems = !visibleMode ? 0U :
+        wcscmp(s0SceneValue, L"PointerDragSingle") == 0 ? 1U :
+        wcscmp(s0SceneValue, L"PointerDragMulti") == 0 ? 2U : 0U;
+    wchar_t s0FixedTargetsValue[2]{};
+    const bool s0FixedDragTargets = s0DragItems == 1 && GetEnvironmentVariableW(
+        L"DESKTOP_ORGANIZER_S0_FIXED_DRAG_TARGETS", s0FixedTargetsValue, 2) == 1 && s0FixedTargetsValue[0] == L'1';
+    const bool s0GestureScene = s0BoxScene || s0DragItems != 0;
+    GetEnvironmentVariableW(L"DESKTOP_ORGANIZER_S0_ITEM_KIND", s0KindValue,
+        static_cast<DWORD>(_countof(s0KindValue)));
+    const bool s0ImageScene = wcscmp(s0KindValue, L"Image") == 0;
+    if ((s0ImageScene && (!visibleMode || s0PreviewScene || s0FilesScene || s0WallpaperScene || s0FullRefreshScene || s0PointerScene || s0GestureScene || s0ShellScene)) ||
+        (s0ReplaceScene && !s0ImageScene) ||
+        (s0KindValue[0] != L'\0' && !s0ImageScene &&
+            wcscmp(s0KindValue, L"Text") != 0)) {
+        std::wcerr << L"S0 image fixture requires a visible non-preview scene\n";
+        return 148;
+    }
+    const DWORD s0ItemLength = GetEnvironmentVariableW(
+        L"DESKTOP_ORGANIZER_S0_ITEM_COUNT", s0ItemValue,
+        static_cast<DWORD>(_countof(s0ItemValue)));
+    const int s0ItemCount = s0ItemLength == 0 ? 80 : _wtoi(s0ItemValue);
+    if (s0ItemCount != 80 && s0ItemCount != 400) {
+        std::wcerr << L"S0 item count must be 80 or 400\n";
+        return 148;
+    }
     const std::filesystem::path fixtureRoot =
         std::filesystem::absolute(baseValue).lexically_normal() /
         (L"resource-idle-" + std::to_wstring(GetCurrentProcessId()));
@@ -16279,6 +18121,68 @@ int RunSmokeResourceIdle(HINSTANCE instance) {
     }
     SetEnvironmentVariableW(
         L"DESKTOP_ORGANIZER_DESKTOP_DIR", desktopRoot.c_str());
+    std::filesystem::path s0Recipient;
+    std::wstring s0OpenToken;
+    std::wstring s0DesktopIdentity;
+    std::filesystem::path s0ExternalReceipts;
+    if (s0DesktopPointer) {
+        wchar_t executable[32768]{}, authorized[2]{};
+        if (GetEnvironmentVariableW(L"DESKTOP_ORGANIZER_S0_DESKTOP_AUTHORIZED", authorized, 2) != 1 || authorized[0] != L'1' ||
+            !GetModuleFileNameW(nullptr, executable, _countof(executable))) return 160;
+        const auto project = std::filesystem::path(executable).parent_path().parent_path().parent_path();
+        const auto review = project / L".workspace" / L"resource-s0" / L"desktop-pointer-review-d6d7f1cfc7374941821bce6cfcba2166";
+        const auto source = review / L"Lattice-S0-ControlledOpen-d6d7f1cf.lnk";
+        s0DesktopIdentity = L"C:\\Users\\wzm33\\Desktop\\Lattice-S0-ControlledOpen-d6d7f1cf.lnk";
+        for (auto path : {source, std::filesystem::path(s0DesktopIdentity)}) {
+            for (auto ancestor = path; !ancestor.empty(); ancestor = ancestor.parent_path()) {
+                const auto attributes = GetFileAttributesW(ancestor.c_str());
+                if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_REPARSE_POINT)) return 160;
+                if (ancestor == ancestor.root_path()) break;
+            }
+        }
+        const auto bytes = [](const std::filesystem::path& path) {
+            std::ifstream stream(path, std::ios::binary);
+            return std::string(std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>());
+        };
+        const auto original = bytes(source);
+        if (original.empty() || original != bytes(s0DesktopIdentity)) return 160;
+        s0ExternalReceipts = review / L"receipts";
+        s0OpenToken = L"d6d7f1cfc7374941821bce6cfcba2166";
+        Microsoft::WRL::ComPtr<IShellLinkW> link;
+        Microsoft::WRL::ComPtr<IPersistFile> persisted;
+        wchar_t target[32768]{}, arguments[32768]{}, directory[32768]{};
+        const auto expectedRecipient = project / L".workspace" / L"build" / L"s0-open-recipient" / L"S0OpenRecipient.exe";
+        const auto expectedArguments = L"--receipt-directory \"" + s0ExternalReceipts.wstring() + L"\" --token " + s0OpenToken;
+        if (FAILED(CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(link.GetAddressOf()))) ||
+            FAILED(link.As(&persisted)) || FAILED(persisted->Load(s0DesktopIdentity.c_str(), STGM_READ)) ||
+            FAILED(link->GetPath(target, _countof(target), nullptr, SLGP_RAWPATH)) ||
+            FAILED(link->GetArguments(arguments, _countof(arguments))) || FAILED(link->GetWorkingDirectory(directory, _countof(directory))) ||
+            std::filesystem::path(target) != expectedRecipient || expectedArguments != arguments ||
+            std::filesystem::path(directory) != s0ExternalReceipts) return 160;
+    }
+    if (s0OpenScene) {
+        wchar_t executable[32768]{}, recipientValue[32768]{};
+        const DWORD length = GetEnvironmentVariableW(L"DESKTOP_ORGANIZER_S0_RECIPIENT",
+            recipientValue, _countof(recipientValue));
+        if (!length || length >= _countof(recipientValue) || !GetModuleFileNameW(nullptr, executable, _countof(executable))) return 160;
+        const auto project = std::filesystem::path(executable).parent_path().parent_path().parent_path();
+        s0Recipient = std::filesystem::absolute(recipientValue).lexically_normal();
+        if (s0Recipient != project / L".workspace" / L"build" / L"s0-open-recipient" / L"S0OpenRecipient.exe") return 160;
+        for (auto ancestor = s0Recipient; ancestor != project; ancestor = ancestor.parent_path()) {
+            const auto attributes = GetFileAttributesW(ancestor.c_str());
+            if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_REPARSE_POINT)) return 160;
+        }
+        if (!s0DesktopPointer) {
+            GUID token{}; wchar_t formatted[40]{};
+            if (FAILED(CoCreateGuid(&token)) || !StringFromGUID2(token, formatted, _countof(formatted))) return 160;
+            for (const wchar_t character : formatted) {
+                if ((character >= L'0' && character <= L'9') || (character >= L'A' && character <= L'F')) s0OpenToken.push_back(character);
+            }
+        }
+        if (s0OpenToken.size() != 32) return 160;
+        std::filesystem::create_directory(std::filesystem::path(baseValue) / L"s0-open-receipts", fileError);
+        if (fileError) return 160;
+    }
 
     HMONITOR monitor = MonitorFromPoint(
         POINT{0, 0}, MONITOR_DEFAULTTONEAREST);
@@ -16291,6 +18195,8 @@ int RunSmokeResourceIdle(HINSTANCE instance) {
     }
     AppConfig config;
     config.settings.startHidden = !visibleMode;
+    if (s0DesktopPointer) config.desktopDisplayLayout.push_back({s0DesktopIdentity,
+        monitorInfo.rcWork.right - 160, monitorInfo.rcWork.bottom - 180});
     config.settings.restoreHiddenState = false;
     config.settings.lastVisible = visibleMode;
     config.settings.iconCacheSize = 256;
@@ -16308,20 +18214,63 @@ int RunSmokeResourceIdle(HINSTANCE instance) {
             std::to_wstring(categoryIndex + 1);
         category.storageFolder = category.name;
         category.layout = config.window;
-        category.layout.width = 260;
+        category.layout.width = s0GestureScene ? 280 : 260;
         category.layout.height = 250;
         category.layout.normalHeight = 250;
         category.layout.x = monitorInfo.rcWork.left +
             40 + (categoryIndex % 5) * 285;
+        if ((s0DragItems && (categoryIndex == 0 || categoryIndex == 5)) || ((s0OpenPointer || s0MenuPointer) && categoryIndex == 0)) {
+            category.layout.x = monitorInfo.rcWork.right - category.layout.width;
+        }
         category.layout.y = monitorInfo.rcWork.top +
             80 + (categoryIndex / 5) * 285;
-        for (int itemIndex = 0; itemIndex < 8; ++itemIndex) {
+        if ((s0OpenPointer || s0MenuPointer) && categoryIndex == 0) category.layout.y = monitorInfo.rcWork.top;
+        for (int itemIndex = 0; itemIndex < s0ItemCount / 10; ++itemIndex) {
             const std::wstring itemId =
                 L"resource-item-" + std::to_wstring(categoryIndex) +
                 L"-" + std::to_wstring(itemIndex);
             const std::filesystem::path itemPath =
-                desktopRoot / (itemId + L".txt");
-            {
+                desktopRoot / (itemId + (s0ImageScene ? L".bmp" :
+                    s0OpenScene && !s0DesktopPointer && categoryIndex == 0 && itemIndex == 0 ? L".lnk" : L".txt"));
+            if (s0OpenScene && !s0DesktopPointer && categoryIndex == 0 && itemIndex == 0) {
+                Microsoft::WRL::ComPtr<IShellLinkW> shortcut;
+                Microsoft::WRL::ComPtr<IPersistFile> persisted;
+                const auto directory = std::filesystem::path(baseValue) / L"s0-open-receipts";
+                const auto arguments = L"--receipt-directory \"" + directory.wstring() + L"\" --token " + s0OpenToken;
+                if (FAILED(CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(shortcut.GetAddressOf()))) ||
+                    FAILED(shortcut->SetPath(s0Recipient.c_str())) || FAILED(shortcut->SetArguments(arguments.c_str())) ||
+                    FAILED(shortcut->SetWorkingDirectory(directory.c_str())) || FAILED(shortcut.As(&persisted)) ||
+                    FAILED(persisted->Save(itemPath.c_str(), TRUE))) return 160;
+            } else if (s0ImageScene) {
+                constexpr LONG width = 96, height = 64;
+                std::vector<std::uint32_t> pixels(static_cast<size_t>(width) * height);
+                const auto seed = static_cast<std::uint32_t>(
+                    categoryIndex * (s0ItemCount / 10) + itemIndex + 1);
+                const std::uint32_t variation = (seed * 0x010101U) & 0x00FFFFFFU;
+                for (LONG y = 0; y < height; ++y) {
+                    for (LONG x = 0; x < width; ++x) {
+                        pixels[static_cast<size_t>(y) * width + x] =
+                            ((((x / 12) + (y / 8)) % 2 == 0)
+                                ? 0x00E04030U : 0x0020A060U) ^ variation;
+                    }
+                }
+                if (!SaveCapturedPixelsBmp(RECT{0, 0, width, height}, pixels, itemPath)) {
+                    std::wcerr << L"S0 image fixture creation failed\n";
+                    return 142;
+                }
+                if (s0ReplaceScene && categoryIndex == 0 && itemIndex == 0) {
+                    const std::filesystem::path oracleRoot(baseValue);
+                    if (!SaveCapturedPixelsBmp(RECT{0, 0, width, height}, pixels,
+                            oracleRoot / L"resource-s0-original.bmp")) {
+                        return 142;
+                    }
+                    for (auto& pixel : pixels) { pixel ^= 0x00FFFFFFU; }
+                    if (!SaveCapturedPixelsBmp(RECT{0, 0, width, height}, pixels,
+                            oracleRoot / L"resource-s0-alternate.bmp")) {
+                        return 142;
+                    }
+                }
+            } else {
                 std::ofstream itemFile(itemPath, std::ios::binary);
                 itemFile << "resource fixture";
             }
@@ -16335,7 +18284,9 @@ int RunSmokeResourceIdle(HINSTANCE instance) {
                 L"资源项目 " + std::to_wstring(itemIndex + 1)};
             item.originalDesktopPath = itemPath.wstring();
             config.items.push_back(std::move(item));
-            category.itemIds.push_back(itemId);
+            if (!s0PreviewScene || itemIndex % 2 == 0) {
+                category.itemIds.push_back(itemId);
+            }
         }
         config.categories.push_back(std::move(category));
     }
@@ -16362,29 +18313,1955 @@ int RunSmokeResourceIdle(HINSTANCE instance) {
         ready << "PID=" << GetCurrentProcessId() << "\n"
               << "VISIBLE=" << (visibleMode ? 1 : 0) << "\n"
               << "CATEGORIES=10\n"
-              << "ITEMS=80\n";
+              << "ITEMS=" << s0ItemCount << "\n";
     }
-    const ULONGLONG deadline = GetTickCount64() + 22000;
+    wchar_t s0ReadyPath[MAX_PATH * 4]{};
+    const DWORD s0ReadyLength = GetEnvironmentVariableW(
+        L"DESKTOP_ORGANIZER_S0_READY_PATH", s0ReadyPath,
+        static_cast<DWORD>(_countof(s0ReadyPath)));
+    if (s0ReadyLength > 0) {
+        if (s0ReadyLength >= _countof(s0ReadyPath)) {
+            DestroyWindow(mainWindow);
+            return 148;
+        }
+        std::ofstream ready(std::filesystem::path(s0ReadyPath), std::ios::trunc);
+        FILETIME utc{};
+        GetSystemTimePreciseAsFileTime(&utc);
+        ready << "PID=" << GetCurrentProcessId() << "\n"
+              << "UTC_TICKS=" << ((static_cast<std::uint64_t>(utc.dwHighDateTime) << 32) |
+                  utc.dwLowDateTime) << "\n";
+        if (s0FilesScene || s0ReplaceScene) {
+            ready << "SOURCE_PATH=" << Utf8Text(config.items.front().path) << "\n"
+                  << "ADDED_PATH=" << Utf8Text((desktopRoot / L"s0-new-item.txt").wstring()) << "\n";
+        }
+        if (!ready) {
+            DestroyWindow(mainWindow);
+            return 148;
+        }
+    }
+    wchar_t s0HoverValue[2]{};
+    const bool s0Hover = visibleMode && GetEnvironmentVariableW(
+        L"DESKTOP_ORGANIZER_S0_HOVER", s0HoverValue,
+        static_cast<DWORD>(_countof(s0HoverValue))) == 1 &&
+        s0HoverValue[0] == L'1';
+    size_t s0HoverCount = 0;
+    MainWindow* s0Owner = reinterpret_cast<MainWindow*>(
+        GetWindowLongPtrW(mainWindow, GWLP_USERDATA));
+    std::ofstream previewLedger;
+    std::ofstream filesLedger;
+    std::ofstream wallpaperLedger;
+    std::ofstream fullRefreshLedger;
+    std::ofstream fullRefreshErrors;
+    std::ofstream wallpaperProfileLedger;
+    std::ofstream pointerLedger;
+    std::ofstream pointerDiagnostics;
+    std::vector<DesktopSurfaceWindowSmokeAccess::S0PointerTarget> pointerTargets;
+    S0PointerRestoreScope pointerRestore;
+    bool pointerPending = false, pointerMoveSeen = false, pointerPaintSeen = false;
+    ULONG_PTR pointerTag = 0;
+    std::chrono::steady_clock::time_point pointerSentAt{};
+    long long pointerMoveUs = 0, pointerPaintUs = 0, pointerBaselineUs = 0;
+    long long pointerFlushUs = 0, pointerCaptureUs = 0;
+    size_t pointerProbeCount = 0;
+    bool boxStarted = false;
+    size_t boxCount = 0;
+    std::uint64_t pointerSendUtc = 0;
+    std::vector<std::uint32_t> pointerBefore;
+    const std::wstring s0AddedPath = (desktopRoot / L"s0-new-item.txt").wstring();
+    wchar_t s0TraceValue[2]{};
+    const bool s0Trace = GetEnvironmentVariableW(
+        L"DESKTOP_ORGANIZER_S0_TRACE", s0TraceValue,
+        static_cast<DWORD>(_countof(s0TraceValue))) == 1 &&
+        s0TraceValue[0] == L'1';
+    if (s0PreviewScene) {
+        previewLedger.open(std::filesystem::path(baseValue) /
+            L"resource-s0-preview.csv", std::ios::trunc);
+        if (!previewLedger || s0Owner == nullptr) {
+            DestroyWindow(mainWindow);
+            return 148;
+        }
+        previewLedger << "stage,cycle,elapsed_us,operation_us,utc_ticks,private_bytes,"
+            "working_set_bytes,peak_private_bytes,cpu_100ns,handles,gdi,user,"
+            "preview_icons,preview_icon_pixel_bytes,preview_hicons,preview_pending,"
+            "preview_target,preview_joinable,preview_released\n";
+    }
+    enum class S0PreviewPhase { Closed, AwaitReady, Ready };
+    S0PreviewPhase previewPhase = S0PreviewPhase::Closed;
+    bool previewPrimed = false;
+    size_t previewCycle = 0, previewReadyCount = 0;
+    std::chrono::steady_clock::time_point previewOpenedAt{};
+    const auto s0StartedAt = std::chrono::steady_clock::now();
+    const auto elapsedUs = [&s0StartedAt]() {
+        return std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - s0StartedAt).count();
+    };
+    const ULONGLONG started = GetTickCount64();
+    ULONGLONG nextHover = started + 5000;
+    ULONGLONG nextPreview = started + 5000;
+    const ULONGLONG deadline = started + ((s0WallpaperScene || s0PointerScene || s0GestureScene || s0ShellScene) ? 35000 : 22000);
+    size_t s0OpenCount = 0;
+    size_t s0MenuCount = 0;
+    DWORD s0ShellInputTick = 0;
+    ULONGLONG nextPointer = started + 6000;
+    size_t filesConverged = 0;
+    std::uint64_t filesRevision = 0;
+    bool filesFramesReset = false;
+    size_t replaceConverged = 0;
+    size_t replaceProbeCount = 0;
+    long long replaceProbeUs = 0;
+    ULONGLONG nextReplaceProbe = started;
+    std::vector<std::vector<std::uint32_t>> replaceCaptures;
+    replaceCaptures.reserve(s0ReplaceScene ? 5 : 0);
+    const size_t filesInitialScan = DesktopScanner::ScanCountForTesting();
+    DesktopSurfaceWindow* wallpaperSurface = (s0WallpaperScene || s0FullRefreshScene || s0PointerScene || s0GestureScene || s0ShellScene) && s0Owner != nullptr
+        ? MainWindowSmokeAccess::DesktopSurface(*s0Owner) : nullptr;
+    const std::uint64_t wallpaperRevision = s0Owner == nullptr ? 0 :
+        MainWindowSmokeAccess::SnapshotRevisionForS0(*s0Owner);
+    unsigned long long wallpaperGeneration = 0;
+    size_t wallpaperStage = 0;
+    struct S0WallpaperFailureScope {
+        bool enabled = false;
+        bool Set(bool fail) {
+            if (SetEnvironmentVariableW(L"LATTICE_SMOKE_FAIL_WALLPAPER_REFRESH",
+                    fail ? L"1" : nullptr) == FALSE) {
+                return false;
+            }
+            enabled = fail;
+            return true;
+        }
+        ~S0WallpaperFailureScope() {
+            if (enabled) {
+                SetEnvironmentVariableW(L"LATTICE_SMOKE_FAIL_WALLPAPER_REFRESH", nullptr);
+            }
+        }
+    } wallpaperFailureScope;
+    if (s0WallpaperScene || s0FullRefreshScene || s0PointerScene || s0GestureScene || s0ShellScene) {
+        if (wallpaperSurface == nullptr ||
+            GetEnvironmentVariableW(L"LATTICE_SMOKE_FAIL_WALLPAPER_REFRESH", nullptr, 0) != 0) {
+            DestroyWindow(mainWindow);
+            return 156;
+        }
+        wallpaperLedger.open(std::filesystem::path(baseValue) /
+            L"resource-s0-wallpaper.csv", std::ios::trunc);
+        if (!wallpaperLedger) {
+            DestroyWindow(mainWindow);
+            return 156;
+        }
+        wallpaperLedger << "stage,event,elapsed_us,operation_us,utc_ticks,private_bytes,"
+            "working_set_bytes,peak_private_bytes,cpu_100ns,handles,gdi,user,"
+            "snapshot_revision,scan_count,snapshot_items,source_id_preserved,"
+            "source_registered,members_preserved,visible,wallpaper_ready,recovery_active,"
+            "recovery_attempts,wallpaper_generation,target,host_icons,host_icon_pixel_bytes,"
+            "host_hicons,host_pending,wallpaper_pixel_bytes\n";
+        MainWindowSmokeAccess::WriteS0WallpaperSample(*s0Owner, config, *wallpaperSurface,
+            wallpaperLedger, "baseline", 0, elapsedUs(), 0, s0Trace);
+        if (s0PointerScene) {
+            pointerDiagnostics.open(std::filesystem::path(baseValue) /
+                L"resource-s0-pointer-diagnostic.txt", std::ios::trunc);
+            if (!pointerDiagnostics) {
+                DestroyWindow(mainWindow);
+                return 158;
+            }
+            pointerDiagnostics << "PID=" << GetCurrentProcessId() << "\n";
+            pointerDiagnostics.flush();
+        }
+        if (s0FullRefreshScene) {
+            wallpaperProfileLedger.open(std::filesystem::path(baseValue) /
+                L"resource-s0-wallpaper-profile.csv", std::ios::trunc);
+            fullRefreshLedger.open(std::filesystem::path(baseValue) /
+                L"resource-s0-full-refresh.csv", std::ios::trunc);
+            fullRefreshErrors.open(std::filesystem::path(baseValue) /
+                L"resource-s0-full-refresh-error.txt", std::ios::trunc);
+            if (!fullRefreshLedger || !fullRefreshErrors || !wallpaperProfileLedger) {
+                DestroyWindow(mainWindow);
+                return 157;
+            }
+            fullRefreshLedger << "event,success,generation_before,generation_after,operation_us,error_length\n";
+            wallpaperProfileLedger << "event,enabled,complete,succeeded,thread,generation,width,height,blur,"
+                "sampled_capacity,output_capacity,resolve_us,decode_us,sample_us,blur_us,copy_us,upload_us\n";
+        }
+    }
+    if (s0FilesScene || s0ReplaceScene) {
+        filesLedger.open(std::filesystem::path(baseValue) /
+            (s0ReplaceScene ? L"resource-s0-image-replace.csv" : L"resource-s0-files.csv"),
+            std::ios::trunc);
+        if (!filesLedger || s0Owner == nullptr ||
+            MainWindowSmokeAccess::DesktopItemIdAtPath(*s0Owner,
+                config.items.front().path) != config.items.front().id ||
+            !MainWindowSmokeAccess::MembersPreservedForS0(*s0Owner, config)) {
+            DestroyWindow(mainWindow);
+            return 153;
+        }
+        filesLedger << "stage,event,elapsed_us,operation_us,utc_ticks,private_bytes,"
+            "working_set_bytes,peak_private_bytes,cpu_100ns,handles,gdi,user,"
+            "snapshot_revision,scan_count,snapshot_items,source_present,source_id_preserved,"
+            "source_registered,members_preserved,new_present,host_icons,host_icon_pixel_bytes,"
+            "host_hicons,host_pending,wallpaper_pixel_bytes\n";
+        filesRevision = MainWindowSmokeAccess::SnapshotRevisionForS0(*s0Owner);
+        MainWindowSmokeAccess::WriteS0FileSample(*s0Owner, config, s0AddedPath,
+            filesLedger, "baseline", 0, elapsedUs(), s0Trace);
+    }
+    wchar_t concurrentValue[2]{};
+    const bool concurrentWallpaper = GetEnvironmentVariableW(
+        L"LATTICE_SMOKE_CONCURRENT_WALLPAPER", concurrentValue, 2) == 1 && concurrentValue[0] == L'1';
+    if (concurrentWallpaper && !(s0PointerScene || s0GestureScene || s0MenuPointer)) {
+        DestroyWindow(mainWindow);
+        return 338;
+    }
+    const auto concurrentCancel = std::make_shared<std::atomic<bool>>(false);
+    struct ConcurrentCancelScope {
+        std::shared_ptr<std::atomic<bool>> cancelled;
+        ~ConcurrentCancelScope() { cancelled->store(true); }
+    } concurrentCancelScope{concurrentCancel};
+    bool concurrentQueued = false;
+    bool roiRecorded = false;
+    wchar_t roiDiagnosticValue[2]{};
+    const bool roiDiagnostic = GetEnvironmentVariableW(
+        L"LATTICE_SMOKE_ROI_DIAGNOSTIC", roiDiagnosticValue, 2) == 1 && roiDiagnosticValue[0] == L'1';
     while (GetTickCount64() < deadline) {
+        if (roiDiagnostic && !roiRecorded && GetTickCount64() >= started + 5000 && s0Owner != nullptr) {
+            const auto* diagnosticSurface = MainWindowSmokeAccess::DesktopSurface(*s0Owner);
+            if (diagnosticSurface == nullptr) { DestroyWindow(mainWindow); return 339; }
+            std::ofstream roi(std::filesystem::path(baseValue) / L"resource-s0-roi-diagnostic.csv", std::ios::trunc);
+            const auto visible = DesktopSurfaceWindowSmokeAccess::VisibleShellItems(*diagnosticSurface, diagnosticSurface->VisibleItemCount());
+            roi << "roi,x,y,own_host,hit_index,identity\n";
+            size_t roiIndex = 0;
+            for (const POINT center : std::array<POINT,6>{POINT{1268,1248},POINT{2440,1248},POINT{120,1248},POINT{2200,1000},POINT{120,900},POINT{2350,1000}}) {
+                for (const POINT point : std::array<POINT,5>{POINT{center.x-8,center.y-8},POINT{center.x+8,center.y-8},center,POINT{center.x-8,center.y+8},POINT{center.x+8,center.y+8}}) {
+                    const int hit = DesktopSurfaceWindowSmokeAccess::HitTestDesktopPoint(*diagnosticSurface, point);
+                    POINT screen = point;
+                    ClientToScreen(diagnosticSurface->Window(), &screen);
+                    roi << roiIndex << ',' << point.x << ',' << point.y << ','
+                        << (WindowFromPoint(screen) == diagnosticSurface->Window()) << ',' << hit << ',';
+                    if (hit >= 0 && static_cast<size_t>(hit) < visible.size()) {
+                        roi << Utf8Text(visible[static_cast<size_t>(hit)].path);
+                    }
+                    roi << '\n';
+                }
+                ++roiIndex;
+            }
+            roiRecorded = true;
+        }
+        if (concurrentWallpaper && !concurrentQueued && GetTickCount64() >= started + 5000) {
+            WallpaperBackdrop::PrepareInput input;
+            if (wallpaperSurface == nullptr || !WallpaperBackdrop::CapturePrepareInput(
+                    wallpaperSurface->Window(), 1, 1, false, input)) {
+                DestroyWindow(mainWindow);
+                return 338;
+            }
+            const std::filesystem::path cpuPath = std::filesystem::path(baseValue) /
+                L"resource-s0-concurrent-wallpaper.csv";
+            concurrentQueued = IconCache::SubmitWallpaperWork([input, concurrentCancel, cpuPath]() {
+                std::ofstream cpu(cpuPath, std::ios::trunc);
+                if (!cpu) { return; }
+                cpu << "iteration,start_utc_ticks,end_utc_ticks,thread,width,height,succeeded,cancelled\n";
+                const auto ended = std::chrono::steady_clock::now() + std::chrono::seconds(28);
+                const auto cancelled = [&]() { return concurrentCancel->load() || std::chrono::steady_clock::now() >= ended; };
+                for (size_t iteration = 0; iteration < 64 && !cancelled(); ++iteration) {
+                    FILETIME before{}, after{};
+                    GetSystemTimePreciseAsFileTime(&before);
+                    WallpaperBackdrop::PreparedPixels prepared;
+                    bool succeeded = false;
+                    try { succeeded = WallpaperBackdrop::PreparePixels(input, prepared, false, cancelled); }
+                    catch (...) { succeeded = false; }
+                    GetSystemTimePreciseAsFileTime(&after);
+                    cpu << iteration + 1 << ','
+                        << ((static_cast<std::uint64_t>(before.dwHighDateTime) << 32) | before.dwLowDateTime) << ','
+                        << ((static_cast<std::uint64_t>(after.dwHighDateTime) << 32) | after.dwLowDateTime) << ','
+                        << GetCurrentThreadId() << ',' << input.size.cx << ',' << input.size.cy << ','
+                        << succeeded << ',' << cancelled() << '\n';
+                    cpu.flush();
+                    if (!succeeded) { break; }
+                }
+            });
+            if (!concurrentQueued) { DestroyWindow(mainWindow); return 338; }
+        }
         MSG message{};
         while (PeekMessageW(
                 &message, nullptr, 0, 0, PM_REMOVE)) {
             if (message.message == WM_QUIT) {
                 return static_cast<int>(message.wParam);
             }
+            const bool pointerMove = s0PointerScene && pointerPending &&
+                message.hwnd == wallpaperSurface->Window() && message.message == WM_MOUSEMOVE &&
+                static_cast<ULONG_PTR>(GetMessageExtraInfo()) == pointerTag;
+            if (pointerMove) {
+                const auto& target = pointerTargets[s0HoverCount % 4];
+                if (std::abs(GET_X_LPARAM(message.lParam) - target.client.x) > 1 ||
+                    std::abs(GET_Y_LPARAM(message.lParam) - target.client.y) > 1) {
+                    DestroyWindow(mainWindow);
+                    return 158;
+                }
+            }
             TranslateMessage(&message);
             DispatchMessageW(&message);
+            if (pointerMove) {
+                pointerMoveSeen = true;
+                pointerMoveUs = std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - pointerSentAt).count();
+            }
+            if (s0PointerScene && pointerPending && pointerMoveSeen && !pointerPaintSeen &&
+                message.hwnd == wallpaperSurface->Window() && message.message == WM_PAINT) {
+                pointerPaintSeen = true;
+                pointerPaintUs = std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - pointerSentAt).count();
+            }
         }
-        const ULONGLONG remaining = deadline - GetTickCount64();
+        const ULONGLONG now = GetTickCount64();
+        if (s0OpenScene && s0OpenCount == 0 && now >= nextPointer) {
+            LASTINPUTINFO current{sizeof(LASTINPUTINFO)};
+            if (!GetLastInputInfo(&current)) { DestroyWindow(mainWindow); return 160; }
+            s0ShellInputTick = current.dwTime;
+            std::string token;
+            for (const wchar_t character : s0OpenToken) token.push_back(static_cast<char>(character));
+            if (!SampleS0ShellOpenCommand(*s0Owner, *wallpaperSurface, config,
+                    std::filesystem::path(baseValue), s0Recipient, token, deadline, s0OpenCount, s0Trace,
+                    s0ShellPointer ? &pointerRestore : nullptr, &s0ShellInputTick, s0DesktopIdentity, s0ExternalReceipts)) {
+                DestroyWindow(mainWindow); return 160;
+            }
+        }
+        if (s0MenuScene && s0MenuCount == 0 && now >= nextPointer) {
+            LASTINPUTINFO current{sizeof(LASTINPUTINFO)};
+            if (!GetLastInputInfo(&current)) { DestroyWindow(mainWindow); return 161; }
+            s0ShellInputTick = current.dwTime;
+            if (!SampleS0ShellMenuCommand(*s0Owner, *wallpaperSurface, config,
+                    std::filesystem::path(baseValue), deadline, s0MenuCount, s0Trace,
+                    s0ShellPointer ? &pointerRestore : nullptr, &s0ShellInputTick, s0MenuFrame, s0DesktopIdentity)) {
+                DestroyWindow(mainWindow); return 161;
+            }
+        }
+        if ((s0OpenScene && s0OpenCount > 0) || (s0MenuScene && s0MenuCount > 0)) {
+            LASTINPUTINFO current{sizeof(LASTINPUTINFO)};
+            if (!GetLastInputInfo(&current) || current.dwTime != s0ShellInputTick) {
+                DestroyWindow(mainWindow); return s0OpenScene ? 160 : 161;
+            }
+        }
+        if (s0GestureScene && !boxStarted && now >= nextPointer) {
+            boxStarted = true;
+            if (!SampleS0PointerGesture(*s0Owner, *wallpaperSurface, config, desktopRoot,
+                    std::filesystem::path(baseValue), deadline, pointerRestore, boxCount, s0DragItems, s0Trace, s0FixedDragTargets)) {
+                DestroyWindow(mainWindow);
+                return 159;
+            }
+        }
+        if (s0GestureScene && boxStarted) {
+            LASTINPUTINFO last{sizeof(LASTINPUTINFO)};
+            if (!GetLastInputInfo(&last) || last.dwTime != pointerRestore.lastInputTick) {
+                std::ofstream diagnostic(std::filesystem::path(baseValue) /
+                    L"resource-s0-pointer-diagnostic.txt", std::ios::app);
+                diagnostic << "failure=external-input-after-box-samples\n";
+                DestroyWindow(mainWindow);
+                return 159;
+            }
+        }
+        if (s0PointerScene && now >= nextPointer && s0HoverCount < 100) {
+            const bool preserved =
+                MainWindowSmokeAccess::SnapshotRevisionForS0(*s0Owner) == wallpaperRevision &&
+                DesktopScanner::ScanCountForTesting() == filesInitialScan &&
+                MainWindowSmokeAccess::DesktopItemIdAtPath(*s0Owner, config.items.front().path) == config.items.front().id &&
+                MainWindowSmokeAccess::HasRegisteredItem(*s0Owner, config.items.front().id) &&
+                MainWindowSmokeAccess::MembersPreservedForS0(*s0Owner, config) &&
+                DesktopSurfaceWindowSmokeAccess::WallpaperReady(*wallpaperSurface) &&
+                IsWindowVisible(wallpaperSurface->Window()) != FALSE;
+            const bool keysClear = ((GetAsyncKeyState(VK_LBUTTON) | GetAsyncKeyState(VK_RBUTTON) |
+                GetAsyncKeyState(VK_MBUTTON) | GetAsyncKeyState(VK_XBUTTON1) | GetAsyncKeyState(VK_XBUTTON2) |
+                GetAsyncKeyState(VK_CONTROL) | GetAsyncKeyState(VK_SHIFT) | GetAsyncKeyState(VK_MENU)) & 0x8000) == 0;
+            LASTINPUTINFO inputInfo{sizeof(LASTINPUTINFO)};
+            const bool inputReadable = GetLastInputInfo(&inputInfo) != FALSE;
+            const bool inputStable = inputReadable && (!pointerRestore.hasLast ||
+                (pointerPending && !pointerMoveSeen) || inputInfo.dwTime == pointerRestore.lastInputTick);
+            if (!preserved || !keysClear || !inputStable || GetCapture() != nullptr) {
+                pointerDiagnostics << "failure=state-input-precondition\nsample=" << s0HoverCount
+                    << "\nstate_preserved=" << preserved << "\nkeys_clear=" << keysClear
+                    << "\ninput_readable=" << inputReadable << "\ninput_stable=" << inputStable
+                    << "\ninput_tick=" << pointerRestore.lastInputTick << "\nlast_input_tick=" << inputInfo.dwTime
+                    << "\ncapture=" << reinterpret_cast<UINT_PTR>(GetCapture()) << "\n";
+                pointerDiagnostics.flush();
+                std::wcerr << L"S0 pointer state/input precondition changed\n";
+                DestroyWindow(mainWindow);
+                return 158;
+            }
+            if (pointerTargets.empty()) {
+                pointerTargets = DesktopSurfaceWindowSmokeAccess::ExposedS0PointerTargets(
+                    *wallpaperSurface, desktopRoot, &pointerDiagnostics);
+                pointerDiagnostics << "exposed_targets=" << pointerTargets.size() << "\n";
+                pointerDiagnostics.flush();
+                if (pointerTargets.size() != 4 || !GetCursorPos(&pointerRestore.saved)) {
+                    pointerDiagnostics << "failure=exposed-target-or-cursor-precondition\n";
+                    pointerDiagnostics.flush();
+                    std::wcerr << L"S0 pointer requires four fully exposed workspace cells and settled icons\n";
+                    DestroyWindow(mainWindow);
+                    return 158;
+                }
+                pointerRestore.enabled = true;
+                if (PtInRect(&pointerTargets.front().screenCell, pointerRestore.saved)) {
+                    std::rotate(pointerTargets.begin(), pointerTargets.begin() + 1, pointerTargets.end());
+                }
+                pointerLedger.open(std::filesystem::path(baseValue) / L"resource-s0-pointer-hover.csv", std::ios::trunc);
+                if (!pointerLedger) {
+                    DestroyWindow(mainWindow);
+                    return 158;
+                }
+                pointerLedger << "sample,widget,item,send_utc_ticks,move_return_us,paint_return_us,dwm_flush_us,"
+                    "capture_us,observed_pixels_us,baseline_capture_us,dwm_hresult,pixel_changed,extra_matches,"
+                    "cursor_matches,members_preserved,scan_count,snapshot_revision,capture_utc_ticks,screen_exposed,screen_probe_count,"
+                    "input_tick,last_input_tick,input_stable\n";
+                DesktopSurfaceWindowSmokeAccess::ResetS0Frames(*wallpaperSurface);
+            }
+            const auto& target = pointerTargets[s0HoverCount % 4];
+            if (WindowFromPoint(target.screen) != wallpaperSurface->Window()) {
+                std::wcerr << L"S0 pointer target was obscured\n";
+                DestroyWindow(mainWindow);
+                return 158;
+            }
+            if (pointerPending && pointerPaintSeen) {
+                const auto flushStarted = std::chrono::steady_clock::now();
+                const HRESULT flushResult = DwmFlush();
+                const auto captureStarted = std::chrono::steady_clock::now();
+                std::vector<std::uint32_t> after;
+                const bool captured = CaptureScreenPixels(target.screenCell, after);
+                const auto capturedAt = std::chrono::steady_clock::now();
+                FILETIME capturedUtc{};
+                GetSystemTimeAsFileTime(&capturedUtc);
+                const auto capturedTicks = (static_cast<std::uint64_t>(capturedUtc.dwHighDateTime) << 32) | capturedUtc.dwLowDateTime;
+                POINT cursor{};
+                const bool cursorMatches = GetCursorPos(&cursor) &&
+                    std::abs(cursor.x - target.screen.x) <= 1 && std::abs(cursor.y - target.screen.y) <= 1;
+                const bool changed = captured && after.size() == pointerBefore.size() &&
+                    !std::equal(after.begin(), after.end(), pointerBefore.begin(),
+                        [](std::uint32_t a, std::uint32_t b) { return (a & 0x00FFFFFFU) == (b & 0x00FFFFFFU); });
+                const bool exposed = DesktopSurfaceWindowSmokeAccess::S0PointerTargetExposed(*wallpaperSurface, target);
+                LASTINPUTINFO observedInput{sizeof(LASTINPUTINFO)};
+                const bool observedInputStable = GetLastInputInfo(&observedInput) &&
+                    observedInput.dwTime == pointerRestore.lastInputTick;
+                pointerFlushUs += std::chrono::duration_cast<std::chrono::microseconds>(captureStarted - flushStarted).count();
+                pointerCaptureUs += std::chrono::duration_cast<std::chrono::microseconds>(capturedAt - captureStarted).count();
+                ++pointerProbeCount;
+                const bool timedOut = capturedAt - pointerSentAt > std::chrono::seconds(2);
+                if (SUCCEEDED(flushResult) && captured && cursorMatches && exposed && observedInputStable && !changed && !timedOut) {
+                    MsgWaitForMultipleObjects(0, nullptr, FALSE, 10, QS_ALLINPUT);
+                    continue;
+                }
+                pointerLedger << s0HoverCount + 1 << ',' << target.widgetIndex << ',' << target.itemIndex << ','
+                    << pointerSendUtc << ',' << pointerMoveUs << ',' << pointerPaintUs << ','
+                    << pointerFlushUs << ',' << pointerCaptureUs << ','
+                    << std::chrono::duration_cast<std::chrono::microseconds>(capturedAt - pointerSentAt).count() << ','
+                    << pointerBaselineUs << ',' << static_cast<long>(flushResult) << ',' << changed << ','
+                    << pointerMoveSeen << ',' << cursorMatches << ',' << preserved << ','
+                    << DesktopScanner::ScanCountForTesting() << ',' << wallpaperRevision << ','
+                    << capturedTicks << ',' << exposed << ',' << pointerProbeCount << ','
+                    << pointerRestore.lastInputTick << ',' << observedInput.dwTime << ',' << observedInputStable << '\n';
+                pointerLedger.flush();
+                if (FAILED(flushResult) || !changed || !cursorMatches || !exposed || !observedInputStable || timedOut) {
+                    SaveCapturedPixelsBmp(target.screenCell, pointerBefore,
+                        std::filesystem::path(baseValue) / L"resource-s0-pointer-before.bmp");
+                    if (captured) {
+                        SaveCapturedPixelsBmp(target.screenCell, after,
+                            std::filesystem::path(baseValue) / L"resource-s0-pointer-after.bmp");
+                    }
+                    std::wcerr << L"S0 pointer screen observation failed: flush=" << flushResult
+                        << L" changed=" << changed << L" cursor=" << cursorMatches << L"\n";
+                    DestroyWindow(mainWindow);
+                    return 158;
+                }
+                ++s0HoverCount;
+                pointerPending = pointerMoveSeen = pointerPaintSeen = false;
+                nextPointer = GetTickCount64() + 40;
+            } else if (!pointerPending) {
+                const auto baselineStarted = std::chrono::steady_clock::now();
+                if (!CaptureScreenPixels(target.screenCell, pointerBefore)) {
+                    DestroyWindow(mainWindow);
+                    return 158;
+                }
+                pointerBaselineUs = std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - baselineStarted).count();
+                LASTINPUTINFO beforeInput{sizeof(LASTINPUTINFO)};
+                if (!GetLastInputInfo(&beforeInput) || beforeInput.dwTime != inputInfo.dwTime ||
+                    !DesktopSurfaceWindowSmokeAccess::S0PointerTargetExposed(*wallpaperSurface, target)) {
+                    pointerDiagnostics << "failure=input-or-exposure-changed-before-injection\nsample=" << s0HoverCount
+                        << "\ninput_tick=" << inputInfo.dwTime << "\nlast_input_tick=" << beforeInput.dwTime << "\n";
+                    pointerDiagnostics.flush();
+                    DestroyWindow(mainWindow);
+                    return 158;
+                }
+                INPUT input{};
+                input.type = INPUT_MOUSE;
+                input.mi.dx = MulDiv(target.screen.x - GetSystemMetrics(SM_XVIRTUALSCREEN), 65535,
+                    (std::max)(1, GetSystemMetrics(SM_CXVIRTUALSCREEN) - 1));
+                input.mi.dy = MulDiv(target.screen.y - GetSystemMetrics(SM_YVIRTUALSCREEN), 65535,
+                    (std::max)(1, GetSystemMetrics(SM_CYVIRTUALSCREEN) - 1));
+                input.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
+                pointerTag = 0x4C410000UL | (s0HoverCount + 1);
+                input.mi.dwExtraInfo = pointerTag;
+                input.mi.time = GetTickCount();
+                FILETIME utc{};
+                GetSystemTimeAsFileTime(&utc);
+                pointerSendUtc = (static_cast<std::uint64_t>(utc.dwHighDateTime) << 32) | utc.dwLowDateTime;
+                pointerSentAt = std::chrono::steady_clock::now();
+                if (SendInput(1, &input, sizeof(input)) != 1) {
+                    DestroyWindow(mainWindow);
+                    return 158;
+                }
+                pointerRestore.lastInputTick = input.mi.time;
+                pointerRestore.last = target.screen;
+                pointerRestore.hasLast = true;
+                pointerFlushUs = pointerCaptureUs = 0;
+                pointerProbeCount = 0;
+                pointerPending = true;
+            } else if (std::chrono::steady_clock::now() - pointerSentAt > std::chrono::seconds(2)) {
+                std::wcerr << L"S0 pointer input/paint observation timeout\n";
+                DestroyWindow(mainWindow);
+                return 158;
+            }
+        }
+        if (s0PointerScene && s0HoverCount == 100) {
+            LASTINPUTINFO completedInput{sizeof(LASTINPUTINFO)};
+            if (!GetLastInputInfo(&completedInput) || completedInput.dwTime != pointerRestore.lastInputTick) {
+                pointerDiagnostics << "failure=external-input-after-samples\ninput_tick=" << pointerRestore.lastInputTick
+                    << "\nlast_input_tick=" << completedInput.dwTime << "\n";
+                pointerDiagnostics.flush();
+                DestroyWindow(mainWindow);
+                return 158;
+            }
+        }
+        if (s0FullRefreshScene) {
+            const auto preserved = [&]() {
+                return MainWindowSmokeAccess::SnapshotRevisionForS0(*s0Owner) == wallpaperRevision &&
+                    DesktopScanner::ScanCountForTesting() == filesInitialScan &&
+                    MainWindowSmokeAccess::DesktopItemIdAtPath(*s0Owner, config.items.front().path) ==
+                        config.items.front().id &&
+                    MainWindowSmokeAccess::HasRegisteredItem(*s0Owner, config.items.front().id) &&
+                    MainWindowSmokeAccess::MembersPreservedForS0(*s0Owner, config);
+            };
+            bool valid = preserved();
+            if (wallpaperStage < 3 && now >= started + 6000 + wallpaperStage * 5000) {
+                const auto generationBefore = DesktopSurfaceWindowSmokeAccess::WallpaperGeneration(*wallpaperSurface);
+                std::wstring refreshError;
+                const auto operationStarted = std::chrono::steady_clock::now();
+                const bool succeeded = wallpaperSurface->Refresh(refreshError, true);
+                const auto operationUs = std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - operationStarted).count();
+                const auto generationAfter = DesktopSurfaceWindowSmokeAccess::WallpaperGeneration(*wallpaperSurface);
+                ++wallpaperStage;
+                fullRefreshLedger << wallpaperStage << ',' << succeeded << ',' << generationBefore << ','
+                    << generationAfter << ',' << operationUs << ',' << refreshError.size() << '\n';
+                fullRefreshErrors << "event=" << wallpaperStage << "\nsuccess=" << succeeded
+                    << "\nerror=" << Utf8Text(refreshError) << "\n";
+                fullRefreshLedger.flush();
+                fullRefreshErrors.flush();
+                DesktopSurfaceWindowSmokeAccess::WriteS0WallpaperProfile(
+                    *wallpaperSurface, wallpaperProfileLedger, wallpaperStage);
+                const std::string stage = "refresh_" + std::to_string(wallpaperStage);
+                MainWindowSmokeAccess::WriteS0WallpaperSample(*s0Owner, config, *wallpaperSurface,
+                    wallpaperLedger, stage.c_str(), wallpaperStage, elapsedUs(), operationUs, s0Trace);
+                valid = valid && preserved() &&
+                    (!succeeded || (generationAfter > generationBefore && refreshError.empty())) &&
+                    DesktopSurfaceWindowSmokeAccess::WallpaperReady(*wallpaperSurface) &&
+                    IsWindowVisible(wallpaperSurface->Window()) != FALSE;
+            }
+            if (!valid) {
+                std::wcerr << L"S0 full refresh state invariant failed at stage " << wallpaperStage << L"\n";
+                DestroyWindow(mainWindow);
+                return 157;
+            }
+        }
+        if (s0WallpaperScene) {
+            const bool invariant =
+                MainWindowSmokeAccess::SnapshotRevisionForS0(*s0Owner) == wallpaperRevision &&
+                DesktopScanner::ScanCountForTesting() == filesInitialScan &&
+                MainWindowSmokeAccess::DesktopItemIdAtPath(*s0Owner, config.items.front().path) ==
+                    config.items.front().id &&
+                MainWindowSmokeAccess::HasRegisteredItem(*s0Owner, config.items.front().id) &&
+                MainWindowSmokeAccess::MembersPreservedForS0(*s0Owner, config);
+            bool valid = invariant;
+            const char* stage = nullptr;
+            const auto operationStarted = std::chrono::steady_clock::now();
+            if (wallpaperStage == 0 && now >= started + 6000) {
+                DesktopSurfaceWindowSmokeAccess::ResetS0Frames(*wallpaperSurface);
+                wallpaperGeneration = DesktopSurfaceWindowSmokeAccess::WallpaperGeneration(*wallpaperSurface);
+                valid = valid && wallpaperGeneration != 0 &&
+                    DesktopSurfaceWindowSmokeAccess::WallpaperReady(*wallpaperSurface) &&
+                    wallpaperFailureScope.Set(true) &&
+                    !DesktopSurfaceWindowSmokeAccess::RefreshWallpaper(*wallpaperSurface) &&
+                    DesktopSurfaceWindowSmokeAccess::WallpaperReady(*wallpaperSurface) &&
+                    DesktopSurfaceWindowSmokeAccess::WallpaperGeneration(*wallpaperSurface) == wallpaperGeneration &&
+                    IsWindowVisible(wallpaperSurface->Window()) != FALSE;
+                stage = "retained";
+            } else if (wallpaperStage == 1 && now >= started + 8000) {
+                DesktopSurfaceWindowSmokeAccess::SimulateWallpaperRenderTargetLoss(*wallpaperSurface);
+                valid = valid && !DesktopSurfaceWindowSmokeAccess::WallpaperReady(*wallpaperSurface) &&
+                    DesktopSurfaceWindowSmokeAccess::WallpaperRecoveryActive(*wallpaperSurface) &&
+                    IsWindowVisible(wallpaperSurface->Window()) == FALSE;
+                stage = "failed_hidden";
+            } else if (wallpaperStage == 2 &&
+                !DesktopSurfaceWindowSmokeAccess::WallpaperRecoveryActive(*wallpaperSurface)) {
+                valid = valid && !DesktopSurfaceWindowSmokeAccess::WallpaperReady(*wallpaperSurface) &&
+                    DesktopSurfaceWindowSmokeAccess::WallpaperRecoveryAttemptsForS0(*wallpaperSurface) == 5 &&
+                    IsWindowVisible(wallpaperSurface->Window()) == FALSE;
+                stage = "exhausted";
+            } else if (wallpaperStage == 3 && now >= started + 12000) {
+                valid = valid && wallpaperFailureScope.Set(false) &&
+                    DesktopSurfaceWindowSmokeAccess::RefreshWallpaper(*wallpaperSurface) &&
+                    DesktopSurfaceWindowSmokeAccess::WallpaperReady(*wallpaperSurface) &&
+                    !DesktopSurfaceWindowSmokeAccess::WallpaperRecoveryActive(*wallpaperSurface) &&
+                    DesktopSurfaceWindowSmokeAccess::WallpaperGeneration(*wallpaperSurface) > wallpaperGeneration &&
+                    IsWindowVisible(wallpaperSurface->Window()) != FALSE;
+                wallpaperGeneration = DesktopSurfaceWindowSmokeAccess::WallpaperGeneration(*wallpaperSurface);
+                stage = "recovered";
+            } else if (wallpaperStage == 4 && now >= started + 16000) {
+                DesktopSurfaceWindowSmokeAccess::SimulateWallpaperRenderTargetLoss(*wallpaperSurface);
+                valid = valid && DesktopSurfaceWindowSmokeAccess::WallpaperReady(*wallpaperSurface) &&
+                    !DesktopSurfaceWindowSmokeAccess::WallpaperRecoveryActive(*wallpaperSurface) &&
+                    DesktopSurfaceWindowSmokeAccess::WallpaperGeneration(*wallpaperSurface) > wallpaperGeneration &&
+                    IsWindowVisible(wallpaperSurface->Window()) != FALSE;
+                stage = "healthy_target_rebuilt";
+            }
+            if (!valid) {
+                std::wcerr << L"S0 wallpaper recovery invariant failed at stage " << wallpaperStage << L"\n";
+                DestroyWindow(mainWindow);
+                return 156;
+            }
+            if (stage != nullptr) {
+                const auto operationUs = std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - operationStarted).count();
+                ++wallpaperStage;
+                MainWindowSmokeAccess::WriteS0WallpaperSample(*s0Owner, config, *wallpaperSurface,
+                    wallpaperLedger, stage, wallpaperStage, elapsedUs(), operationUs, s0Trace);
+            }
+        }
+        if (s0FilesScene || s0ReplaceScene) {
+            if (!filesFramesReset && now >= started + 5000) {
+                auto* surface = MainWindowSmokeAccess::DesktopSurface(*s0Owner);
+                if (surface == nullptr) {
+                    DestroyWindow(mainWindow);
+                    return 153;
+                }
+                DesktopSurfaceWindowSmokeAccess::ResetS0Frames(*surface);
+                filesFramesReset = true;
+            }
+            if (!MainWindowSmokeAccess::MembersPreservedForS0(*s0Owner, config) ||
+                !MainWindowSmokeAccess::HasRegisteredItem(*s0Owner, config.items.front().id)) {
+                std::wcerr << L"S0 file events lost registered identity or member order\n";
+                DestroyWindow(mainWindow);
+                return 154;
+            }
+            const auto sourceId = MainWindowSmokeAccess::DesktopItemIdAtPath(
+                *s0Owner, config.items.front().path);
+            const bool sourceRestored = sourceId == config.items.front().id;
+            const bool addedPresent = !MainWindowSmokeAccess::DesktopItemIdAtPath(
+                *s0Owner, s0AddedPath).empty();
+            const bool matches = filesConverged == 0 ? sourceId.empty() :
+                filesConverged == 1 ? sourceRestored :
+                filesConverged == 2 ? sourceRestored && addedPresent :
+                filesConverged == 3 ? sourceRestored && !addedPresent : false;
+            const auto revision = MainWindowSmokeAccess::SnapshotRevisionForS0(*s0Owner);
+            if (s0FilesScene && matches && revision > filesRevision) {
+                constexpr const char* stages[] = {"removed", "restored", "added", "new_removed"};
+                MainWindowSmokeAccess::WriteS0FileSample(*s0Owner, config, s0AddedPath,
+                    filesLedger, stages[filesConverged], filesConverged + 1, elapsedUs(), s0Trace);
+                ++filesConverged;
+                filesRevision = revision;
+            }
+            if (s0ReplaceScene) {
+                if (!sourceRestored || addedPresent || revision != filesRevision ||
+                    DesktopScanner::ScanCountForTesting() != filesInitialScan) {
+                    std::wcerr << L"S0 image content change altered identity or structural scan\n";
+                    DestroyWindow(mainWindow);
+                    return 155;
+                }
+                if (replaceCaptures.empty() && now >= started + 5000) {
+                    std::wcerr << L"S0 original natural thumbnail was not ready during warmup\n";
+                    DestroyWindow(mainWindow);
+                    return 155;
+                }
+                if (replaceConverged < 4 && now >= nextReplaceProbe &&
+                    (replaceCaptures.empty() || now >= started + 5000)) {
+                    nextReplaceProbe = now + 100;
+                    const auto probeStart = std::chrono::steady_clock::now();
+                    auto* surface = MainWindowSmokeAccess::DesktopSurface(*s0Owner);
+                    HICON icon = surface == nullptr ? nullptr :
+                        DesktopSurfaceWindowSmokeAccess::CopyNaturalImageForS0(
+                            *surface, config.items.front().path);
+                    std::vector<std::uint32_t> pixels;
+                    const bool captured = icon != nullptr && CaptureIconPixels(icon, pixels);
+                    if (icon != nullptr) { DestroyIcon(icon); }
+                    ++replaceProbeCount;
+                    replaceProbeUs += std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - probeStart).count();
+                    if (captured && replaceCaptures.empty()) {
+                        replaceCaptures.push_back(std::move(pixels));
+                        MainWindowSmokeAccess::WriteS0FileSample(*s0Owner, config,
+                            s0AddedPath, filesLedger, "original_ready", 0, elapsedUs(), s0Trace);
+                    } else if (captured &&
+                        ((pixels == replaceCaptures.front()) == (replaceConverged % 2 == 1))) {
+                        constexpr const char* stages[] = {
+                            "replaced", "restored", "replaced_again", "restored_again"};
+                        replaceCaptures.push_back(std::move(pixels));
+                        MainWindowSmokeAccess::WriteS0FileSample(*s0Owner, config,
+                            s0AddedPath, filesLedger, stages[replaceConverged],
+                            replaceConverged + 1, elapsedUs(), s0Trace);
+                        ++replaceConverged;
+                    }
+                }
+            }
+        }
+        if (s0PreviewScene && now < deadline) {
+            if (previewPhase == S0PreviewPhase::Closed && now >= nextPreview) {
+                ++previewCycle;
+                previewOpenedAt = std::chrono::steady_clock::now();
+                if (MainWindowSmokeAccess::ShowAutoOrganizePreview(*s0Owner) == nullptr) {
+                    DestroyWindow(mainWindow);
+                    return 149;
+                }
+                const auto openUs = std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - previewOpenedAt).count();
+                MainWindowSmokeAccess::WriteS0PreviewSample(*s0Owner,
+                    previewLedger, "opened", previewCycle, elapsedUs(), openUs, s0Trace);
+                previewPrimed = false;
+                previewPhase = S0PreviewPhase::AwaitReady;
+            } else if (previewPhase == S0PreviewPhase::AwaitReady) {
+                auto* preview = MainWindowSmokeAccess::PreviewForS0(*s0Owner);
+                if (preview != nullptr && AutoOrganizePreviewWindowSmokeAccess::Ready(*preview)) {
+                    if (!previewPrimed) {
+                        AutoOrganizePreviewWindowSmokeAccess::RenderNow(*preview);
+                        previewPrimed = true;
+                    }
+                    if (AutoOrganizePreviewWindowSmokeAccess::PendingIconRequests(*preview) == 0) {
+                        const auto readyUs = std::chrono::duration_cast<std::chrono::microseconds>(
+                            std::chrono::steady_clock::now() - previewOpenedAt).count();
+                        MainWindowSmokeAccess::WriteS0PreviewSample(*s0Owner,
+                            previewLedger, "ready", previewCycle, elapsedUs(), readyUs, s0Trace);
+                        ++previewReadyCount;
+                        previewPhase = S0PreviewPhase::Ready;
+                        nextPreview = GetTickCount64() + 1000;
+                    }
+                }
+            } else if (previewPhase == S0PreviewPhase::Ready && now >= nextPreview) {
+                auto* preview = MainWindowSmokeAccess::PreviewForS0(*s0Owner);
+                MainWindowSmokeAccess::WriteS0PreviewSample(*s0Owner,
+                    previewLedger, "before_close", previewCycle, elapsedUs(), 0, s0Trace);
+                const auto closeStarted = std::chrono::steady_clock::now();
+                SendMessageW(preview->Window(), WM_CLOSE, 0, 0);
+                const auto closeUs = std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - closeStarted).count();
+                if (IsWindowVisible(preview->Window()) != FALSE ||
+                    !AutoOrganizePreviewWindowSmokeAccess::InvisibleResourcesReleased(*preview)) {
+                    DestroyWindow(mainWindow);
+                    return 150;
+                }
+                MainWindowSmokeAccess::WriteS0PreviewSample(*s0Owner,
+                    previewLedger, "closed", previewCycle, elapsedUs(), closeUs, s0Trace);
+                previewPhase = S0PreviewPhase::Closed;
+                nextPreview = GetTickCount64() + 250;
+            }
+        }
+        if (s0Hover && now >= nextHover && now < deadline) {
+            MainWindow* hoverOwner = reinterpret_cast<MainWindow*>(
+                GetWindowLongPtrW(mainWindow, GWLP_USERDATA));
+            DesktopSurfaceWindow* s0Surface = hoverOwner == nullptr ? nullptr :
+                MainWindowSmokeAccess::DesktopSurface(*hoverOwner);
+            if (s0Surface == nullptr) {
+                DestroyWindow(mainWindow);
+                return 146;
+            }
+            if (s0HoverCount == 0) {
+                DesktopSurfaceWindowSmokeAccess::ResetS0Frames(*s0Surface);
+            }
+            if (!DesktopSurfaceWindowSmokeAccess::HoverS0Fixture(
+                    *s0Surface, s0HoverCount)) {
+                DestroyWindow(mainWindow);
+                return 146;
+            }
+            ++s0HoverCount;
+            nextHover = GetTickCount64() + 100;
+        }
+        const ULONGLONG afterHover = GetTickCount64();
+        const ULONGLONG remaining = afterHover < deadline ?
+            deadline - afterHover : 0;
         MsgWaitForMultipleObjects(
             0,
             nullptr,
             FALSE,
-            static_cast<DWORD>((std::min<ULONGLONG>)(remaining, 100)),
+            static_cast<DWORD>((std::min<ULONGLONG>)(remaining,
+                (s0PreviewScene || s0FilesScene || s0ReplaceScene || s0WallpaperScene || s0FullRefreshScene || s0PointerScene || s0GestureScene || s0ShellScene) ? 10 : 100)),
             QS_ALLINPUT);
     }
+    std::vector<std::pair<std::wstring, std::vector<std::uint32_t>>> thumbnailCaptures;
+    std::array<bool, 10> thumbnailCategories{};
+    bool filesFinalValid = !s0FilesScene && !s0ReplaceScene;
+    MainWindow* owner = reinterpret_cast<MainWindow*>(
+        GetWindowLongPtrW(mainWindow, GWLP_USERDATA));
+    if (owner != nullptr) {
+        if (s0WallpaperScene || s0FullRefreshScene || s0PointerScene || s0GestureScene || s0ShellScene) {
+            MainWindowSmokeAccess::WriteS0WallpaperSample(*owner, config, *wallpaperSurface,
+                wallpaperLedger, "final", wallpaperStage, elapsedUs(), 0, s0Trace);
+            wallpaperLedger.close();
+        }
+        if (s0FilesScene || s0ReplaceScene) {
+            MainWindowSmokeAccess::WriteS0FileSample(*owner, config, s0AddedPath,
+                filesLedger, "final", s0ReplaceScene ? replaceConverged : filesConverged,
+                elapsedUs(), s0Trace);
+            filesLedger.close();
+            filesFinalValid = MainWindowSmokeAccess::DesktopItemIdAtPath(
+                *owner, config.items.front().path) == config.items.front().id &&
+                MainWindowSmokeAccess::DesktopItemIdAtPath(*owner, s0AddedPath).empty() &&
+                MainWindowSmokeAccess::HasRegisteredItem(*owner, config.items.front().id) &&
+                MainWindowSmokeAccess::MembersPreservedForS0(*owner, config);
+        }
+        if (s0PreviewScene) {
+            MainWindowSmokeAccess::CloseAutoOrganizePreview(*owner);
+            MainWindowSmokeAccess::WriteS0PreviewSample(*owner,
+                previewLedger, "final_closed", previewCycle, elapsedUs(), 0, s0Trace);
+            previewLedger.close();
+        }
+        DesktopSurfaceWindow* surface =
+            MainWindowSmokeAccess::DesktopSurface(*owner);
+        if (surface != nullptr) {
+            DesktopSurfaceWindowSmokeAccess::WriteS0Ledger(
+                *surface,
+                std::filesystem::path(baseValue) / L"resource-s0-ledger.txt",
+                s0HoverCount);
+            std::ofstream ledger(std::filesystem::path(baseValue) /
+                L"resource-s0-ledger.txt", std::ios::app);
+            ledger << "fixture_item_count=" << s0ItemCount << "\n"
+                   << "preview_ready_samples=" << previewReadyCount << "\n"
+                   << "files_converged_count=" << filesConverged << "\n"
+                   << "image_replace_count=" << replaceConverged << "\n"
+                   << "wallpaper_stage_count=" << wallpaperStage << "\n"
+                   << "pointer_hover_count=" << (s0PointerScene ? s0HoverCount : 0) << "\n"
+                   << "pointer_box_count=" << (s0BoxScene ? boxCount : 0) << "\n"
+                   << "pointer_drag_count=" << (s0DragItems ? boxCount : 0) << "\n"
+                   << "pointer_drag_items=" << s0DragItems << "\n"
+                   << "pointer_target_selection=" << (s0FixedDragTargets ? "FixedCategories0And5V1" : "FirstExposedV1") << "\n"
+                   << "shell_open_count=" << s0OpenCount << "\n"
+                   << "shell_menu_count=" << s0MenuCount << "\n"
+                   << "shell_controlled_shortcut_items=" << (s0OpenScene ? 1 : 0) << "\n"
+                   << "shell_pointer_location=" << (s0DesktopPointer ? "Desktop" : s0ShellPointer ? "Widget" : "None") << "\n"
+                   << "image_capture_probe_count=" << replaceProbeCount << "\n"
+                   << "image_capture_probe_us=" << replaceProbeUs << "\n"
+                   << "fixture_item_kind=" << (s0ImageScene ? "Image" : "Text") << "\n";
+            if (s0ImageScene) {
+                for (size_t index = 0; index < config.items.size(); ++index) {
+                    const auto& item = config.items[index];
+                    HICON icon = DesktopSurfaceWindowSmokeAccess::CopyNaturalImageForS0(
+                        *surface, item.path);
+                    if (icon == nullptr) {
+                        continue;
+                    }
+                    std::vector<std::uint32_t> pixels;
+                    const bool captured = CaptureIconPixels(icon, pixels);
+                    DestroyIcon(icon);
+                    if (!captured) {
+                        DestroyWindow(mainWindow);
+                        return 151;
+                    }
+                    thumbnailCaptures.emplace_back(item.path, std::move(pixels));
+                    thumbnailCategories[index / (s0ItemCount / 10)] = true;
+                }
+            }
+        }
+    }
     DestroyWindow(mainWindow);
-    return app.Run();
+    if (s0OpenScene && s0OpenCount != 30) return 160;
+    if (s0MenuScene && s0MenuCount != 30) return 161;
+    if (s0WallpaperScene && wallpaperStage != 5) {
+        std::wcerr << L"S0 wallpaper recovery stages incomplete\n";
+        return 156;
+    }
+    if (s0FullRefreshScene && wallpaperStage != 3) {
+        std::wcerr << L"S0 full refresh calls incomplete\n";
+        return 157;
+    }
+    if (s0PointerScene && (s0HoverCount != 100 || pointerPending)) {
+        std::wcerr << L"S0 pointer observation did not reach 100 complete samples\n";
+        return 158;
+    }
+    if (s0GestureScene && boxCount != 100) {
+        std::wcerr << L"S0 pointer box observation did not reach 100 complete samples\n";
+        return 159;
+    }
+    if (s0PreviewScene && previewReadyCount == 0) {
+        return 149;
+    }
+    if (s0FilesScene && (filesConverged != 4 || !filesFinalValid)) {
+        std::wcerr << L"S0 file watcher events did not all converge: " << filesConverged << L"\n";
+        return 153;
+    }
+    if (s0ReplaceScene && (replaceConverged != 4 || !filesFinalValid || replaceCaptures.size() != 5)) {
+        std::wcerr << L"S0 image content events did not all converge: " << replaceConverged << L"\n";
+        return 155;
+    }
+    const int result = app.Run();
+    if (s0ReplaceScene) {
+        const auto oracleStarted = std::chrono::steady_clock::now();
+        std::array<std::vector<std::uint32_t>, 2> expectedPixels;
+        std::vector<std::uint32_t> typePixels;
+        const std::filesystem::path oracleRoot(baseValue);
+        HICON original = LoadSmokeShellItemImage((oracleRoot / L"resource-s0-original.bmp").wstring(), 72, false);
+        HICON alternate = LoadSmokeShellItemImage((oracleRoot / L"resource-s0-alternate.bmp").wstring(), 72, false);
+        HICON typeIcon = LoadSmokeShellItemImage(config.items.front().path, 72, true);
+        const bool captured = CaptureIconPixels(original, expectedPixels[0]) &&
+            CaptureIconPixels(alternate, expectedPixels[1]) && CaptureIconPixels(typeIcon, typePixels);
+        if (original != nullptr) { DestroyIcon(original); }
+        if (alternate != nullptr) { DestroyIcon(alternate); }
+        if (typeIcon != nullptr) { DestroyIcon(typeIcon); }
+        if (!captured || expectedPixels[0] == expectedPixels[1] ||
+            expectedPixels[0] == typePixels || expectedPixels[1] == typePixels) {
+            std::wcerr << L"S0 image replacement Shell oracle not distinguishable\n";
+            return 155;
+        }
+        for (size_t index = 0; index < replaceCaptures.size(); ++index) {
+            if (replaceCaptures[index] != expectedPixels[index % 2]) {
+                SaveCapturedPixelsBmp(RECT{0, 0, 64, 64}, replaceCaptures[index],
+                    oracleRoot / (L"image-replace-actual-" + std::to_wstring(index) + L".bmp"));
+                SaveCapturedPixelsBmp(RECT{0, 0, 64, 64}, expectedPixels[index % 2],
+                    oracleRoot / (L"image-replace-expected-" + std::to_wstring(index) + L".bmp"));
+                std::wcerr << L"S0 natural same-path thumbnail differs from Shell content: " << index << L"\n";
+                return 155;
+            }
+        }
+        std::ofstream ledger(oracleRoot / L"resource-s0-ledger.txt", std::ios::app);
+        ledger << "image_replace_oracle_count=4\n"
+               << "image_replace_oracle_us=" << std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - oracleStarted).count() << "\n";
+    }
+    if (s0ImageScene) {
+        if (thumbnailCaptures.empty() || std::any_of(thumbnailCategories.begin(),
+                thumbnailCategories.end(), [](bool compared) { return !compared; })) {
+            std::wcerr << L"S0 natural thumbnails did not cover all ten categories\n";
+            return 151;
+        }
+        const auto oracleStarted = std::chrono::steady_clock::now();
+        for (const auto& [path, actualPixels] : thumbnailCaptures) {
+            HICON thumbnail = LoadSmokeShellItemImage(path, 72, false);
+            HICON typeIcon = LoadSmokeShellItemImage(path, 72, true);
+            std::vector<std::uint32_t> expectedPixels, typePixels;
+            const bool captured = CaptureIconPixels(thumbnail, expectedPixels) &&
+                CaptureIconPixels(typeIcon, typePixels);
+            if (thumbnail != nullptr) { DestroyIcon(thumbnail); }
+            if (typeIcon != nullptr) { DestroyIcon(typeIcon); }
+            if (!captured || expectedPixels == typePixels || actualPixels != expectedPixels) {
+                std::wcerr << L"S0 natural thumbnail differs from Shell content: " << path << L"\n";
+                return 152;
+            }
+        }
+        const auto oracleUs = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - oracleStarted).count();
+        std::ofstream ledger(std::filesystem::path(baseValue) /
+            L"resource-s0-ledger.txt", std::ios::app);
+        ledger << "thumbnail_compared_count=" << thumbnailCaptures.size() << "\n"
+               << "thumbnail_unobserved_count=" << config.items.size() - thumbnailCaptures.size() << "\n"
+               << "thumbnail_category_count=10\n"
+               << "thumbnail_oracle_us=" << oracleUs << "\n";
+    }
+    return result;
+}
+
+int RunSmokeWallpaperAsync(HINSTANCE instance) {
+    HANDLE receiptHandle = nullptr;
+    DuplicateHandle(GetCurrentProcess(), GetStdHandle(STD_ERROR_HANDLE),
+        GetCurrentProcess(), &receiptHandle, 0, FALSE, DUPLICATE_SAME_ACCESS);
+    struct ReceiptHandleScope {
+        HANDLE handle;
+        ~ReceiptHandleScope() { if (handle != nullptr) { CloseHandle(handle); } }
+    } receiptHandleScope{receiptHandle};
+    const auto report = [&](const std::wstring& text) {
+        const auto utf8 = Utf8Text(text);
+        DWORD written = 0;
+        if (receiptHandle != nullptr) {
+            WriteFile(receiptHandle, utf8.data(), static_cast<DWORD>(utf8.size()), &written, nullptr);
+        }
+    };
+    AttachParentConsole();
+    SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    struct LoaderDrain {
+        ~LoaderDrain() { IconCache::ShutdownSharedLoader(); }
+    } loaderDrain;
+    wchar_t oldTrace[32768]{};
+    GetEnvironmentVariableW(L"DESKTOP_ORGANIZER_S0_TRACE", oldTrace, ARRAYSIZE(oldTrace));
+    SetEnvironmentVariableW(L"DESKTOP_ORGANIZER_S0_TRACE", L"1");
+    struct TraceRestore {
+        const wchar_t* previous;
+        ~TraceRestore() { SetEnvironmentVariableW(L"DESKTOP_ORGANIZER_S0_TRACE",
+            *previous ? previous : nullptr); }
+    } traceRestore{oldTrace};
+    const auto pump = []() {
+        MSG message{};
+        while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+        MsgWaitForMultipleObjects(0, nullptr, FALSE, 4, QS_ALLINPUT);
+    };
+    DesktopLayout layout;
+    DesktopViewSnapshot before;
+    std::wstring error;
+    if (!layout.CaptureViewSnapshot(before, error)) {
+        std::wcerr << error << L"\n";
+        return 330;
+    }
+    DesktopSurfaceWindow surface(instance);
+    if (!surface.Create({}, error)) {
+        std::wcerr << error << L"\n";
+        return 331;
+    }
+    surface.Show();
+    const auto readyDeadline = GetTickCount64() + 5000;
+    while (!DesktopSurfaceWindowSmokeAccess::AllVisibleIconsReady(surface) &&
+        GetTickCount64() < readyDeadline) { pump(); }
+    const auto generation = DesktopSurfaceWindowSmokeAccess::WallpaperGeneration(surface);
+    const auto selection = DesktopSurfaceWindowSmokeAccess::SelectedPaths(surface);
+    const auto snapshotItems = surface.Snapshot().items.size();
+    double notificationMaxMs = 0;
+    for (int notification = 0; notification < 32; ++notification) {
+        const auto began = std::chrono::steady_clock::now();
+        SendMessageW(surface.Window(), WM_SETTINGCHANGE, SPI_SETDESKWALLPAPER, 0);
+        notificationMaxMs = (std::max)(notificationMaxMs,
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - began).count());
+    }
+    const bool retained = DesktopSurfaceWindowSmokeAccess::WallpaperReady(surface) &&
+        DesktopSurfaceWindowSmokeAccess::WallpaperGeneration(surface) == generation;
+    const auto deadline = GetTickCount64() + 15000;
+    size_t responsiveProbes = 0;
+    double inputMaxMs = 0;
+    DesktopSurfaceWindowSmokeAccess::ResetNativeQueryTiming(surface);
+    while (DesktopSurfaceWindowSmokeAccess::AsyncWallpaperRunning(surface) &&
+        GetTickCount64() < deadline) {
+        const auto began = std::chrono::steady_clock::now();
+        SendMessageW(surface.Window(), WM_MOUSEMOVE, 0, MAKELPARAM(1268, 1248));
+        inputMaxMs = (std::max)(inputMaxMs,
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - began).count());
+        ++responsiveProbes;
+        pump();
+    }
+    const auto prepareThread = DesktopSurfaceWindowSmokeAccess::WallpaperPrepareThread(surface);
+    const auto nativeTiming = DesktopSurfaceWindowSmokeAccess::NativeQueryTiming(surface);
+    report(L"WALLPAPER_ASYNC_NATIVE_QUERY_COUNT=" + std::to_wstring(nativeTiming.first) +
+        L"\nWALLPAPER_ASYNC_NATIVE_QUERY_MAX_MS=" + std::to_wstring(nativeTiming.second) + L"\n");
+    const bool completed = !DesktopSurfaceWindowSmokeAccess::AsyncWallpaperRunning(surface) &&
+        DesktopSurfaceWindowSmokeAccess::WallpaperGeneration(surface) == generation + 1 &&
+        prepareThread != 0 && prepareThread != GetCurrentThreadId() &&
+        surface.Snapshot().items.size() == snapshotItems &&
+        DesktopSurfaceWindowSmokeAccess::SelectedPaths(surface) == selection;
+    report(L"WALLPAPER_ASYNC_STORM_NOTIFICATIONS=32\n"
+        L"WALLPAPER_ASYNC_NOTIFICATION_MAX_MS=" + std::to_wstring(notificationMaxMs) +
+        L"\nWALLPAPER_ASYNC_INPUT_MAX_MS=" + std::to_wstring(inputMaxMs) +
+        L"\nWALLPAPER_ASYNC_INPUT_PROBES=" + std::to_wstring(responsiveProbes) +
+        L"\nWALLPAPER_ASYNC_PREPARE_THREAD=" + std::to_wstring(prepareThread) +
+        L"\nWALLPAPER_ASYNC_UI_THREAD=" + std::to_wstring(GetCurrentThreadId()) + L"\n");
+    if (!retained || !completed || responsiveProbes < 2 ||
+        notificationMaxMs > 16.0 || inputMaxMs > 16.0) {
+        std::wcerr << L"Wallpaper async storm/input/atomic revision failed\n";
+        return 332;
+    }
+    SetEnvironmentVariableW(L"LATTICE_SMOKE_FAIL_WALLPAPER_REFRESH", L"1");
+    const auto failureGeneration = DesktopSurfaceWindowSmokeAccess::WallpaperGeneration(surface);
+    SendMessageW(surface.Window(), WM_SETTINGCHANGE, SPI_SETDESKWALLPAPER, 0);
+    const auto failureDeadline = GetTickCount64() + 15000;
+    do { pump(); } while (DesktopSurfaceWindowSmokeAccess::AsyncWallpaperRunning(surface) &&
+        GetTickCount64() < failureDeadline);
+    const bool failureRetained = DesktopSurfaceWindowSmokeAccess::WallpaperReady(surface) &&
+        DesktopSurfaceWindowSmokeAccess::WallpaperGeneration(surface) == failureGeneration &&
+        IsWindowVisible(surface.Window()) != FALSE;
+    SetEnvironmentVariableW(L"LATTICE_SMOKE_FAIL_WALLPAPER_REFRESH", nullptr);
+    DesktopSurfaceWindowSmokeAccess::RunWallpaperRecoveryTimer(surface);
+    const auto recoveryDeadline = GetTickCount64() + 15000;
+    do { pump(); } while (DesktopSurfaceWindowSmokeAccess::AsyncWallpaperRunning(surface) &&
+        GetTickCount64() < recoveryDeadline);
+    const bool recovered = DesktopSurfaceWindowSmokeAccess::WallpaperReady(surface) &&
+        DesktopSurfaceWindowSmokeAccess::WallpaperGeneration(surface) == failureGeneration + 1;
+    SendMessageW(surface.Window(), WM_SETTINGCHANGE, SPI_SETDESKWALLPAPER, 0);
+    SetEnvironmentVariableW(L"LATTICE_SMOKE_FAIL_WALLPAPER_REFRESH", L"1");
+    const auto targetGeneration = DesktopSurfaceWindowSmokeAccess::WallpaperGeneration(surface);
+    DesktopSurfaceWindowSmokeAccess::SimulateWallpaperRenderTargetLoss(surface);
+    const bool targetHidden = !DesktopSurfaceWindowSmokeAccess::WallpaperReady(surface) &&
+        IsWindowVisible(surface.Window()) == FALSE;
+    SetEnvironmentVariableW(L"LATTICE_SMOKE_FAIL_WALLPAPER_REFRESH", nullptr);
+    DesktopSurfaceWindowSmokeAccess::RunWallpaperRecoveryTimer(surface);
+    const auto staleDeadline = GetTickCount64() + 5000;
+    do { pump(); } while (DesktopSurfaceWindowSmokeAccess::AsyncWallpaperRunning(surface) &&
+        GetTickCount64() < staleDeadline);
+    const bool staleRejected = targetHidden && DesktopSurfaceWindowSmokeAccess::WallpaperReady(surface) &&
+        !DesktopSurfaceWindowSmokeAccess::AsyncWallpaperRunning(surface) &&
+        DesktopSurfaceWindowSmokeAccess::WallpaperGeneration(surface) == targetGeneration + 1;
+    if (!staleRejected) {
+        std::wcerr << L"Wallpaper target loss published an expired background result\n";
+        return 334;
+    }
+    SendMessageW(surface.Window(), WM_SETTINGCHANGE, SPI_SETDESKWALLPAPER, 0);
+    const auto closeBegan = std::chrono::steady_clock::now();
+    surface.Close();
+    const auto closeMs = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - closeBegan).count();
+    report(L"WALLPAPER_ASYNC_CLOSE_MS=" + std::to_wstring(closeMs) + L"\n");
+    for (int drain = 0; drain < 8; ++drain) { pump(); }
+    DesktopViewSnapshot after;
+    const bool restored = layout.CaptureViewSnapshot(after, error) &&
+        after.items.size() == before.items.size() && after.viewFlags == before.viewFlags &&
+        std::all_of(before.items.begin(), before.items.end(), [&](const DesktopViewItem& previous) {
+            const auto found = std::find_if(after.items.begin(), after.items.end(),
+                [&](const DesktopViewItem& current) { return current.path == previous.path; });
+            return found != after.items.end() && found->viewPoint.x == previous.viewPoint.x &&
+                found->viewPoint.y == previous.viewPoint.y && found->shellChildPidl == previous.shellChildPidl;
+        });
+    if (!failureRetained || !recovered || !restored) {
+        std::wcerr << L"Wallpaper async failure/recovery/close changed desktop state\n";
+        return 333;
+    }
+    report(L"WALLPAPER_ASYNC_STORM_CANCEL_ATOMIC=PASS\n"
+        L"WALLPAPER_ASYNC_FAILURE_RECOVERY_CLOSE=PASS\n"
+        L"WALLPAPER_ASYNC_TARGET_STALE_REJECTED=PASS\n");
+    return 0;
+}
+
+int RunSmokeDesktopNativeSelectionOracle(HINSTANCE instance) {
+    AttachParentConsole();
+    SetThreadDpiAwarenessContext(
+        DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    const DWORD required = GetEnvironmentVariableW(
+        L"DESKTOP_ORGANIZER_SMOKE_ITEMS_DIR", nullptr, 0);
+    if (required == 0) return 411;
+    std::wstring outputRoot(required, L'\0');
+    const DWORD copied = GetEnvironmentVariableW(
+        L"DESKTOP_ORGANIZER_SMOKE_ITEMS_DIR",
+        outputRoot.data(), required);
+    if (copied == 0 || copied >= required) return 411;
+    outputRoot.resize(copied);
+    std::vector<std::wstring> initialSelection;
+    if (!CaptureExplorerSelectionForSmoke(initialSelection)) return 412;
+    const HWND foregroundBefore = GetForegroundWindow();
+    DesktopSurfaceWindow surface(instance);
+    std::wstring error;
+    if (!surface.Create({}, error)) return 413;
+    const auto& items = surface.Snapshot().items;
+    const auto sameIdentity = [](const std::wstring& left,
+                                 const std::wstring& right) {
+        return CompareStringOrdinal(
+            left.c_str(), -1, right.c_str(), -1, TRUE) == CSTR_EQUAL;
+    };
+    const auto longItem = std::find_if(
+        items.begin(), items.end(),
+        [](const DesktopViewItem& item) {
+            return item.displayName.find(L"d5364d37-") !=
+                std::wstring::npos;
+        });
+    const bool initialItemsVisible = std::all_of(
+        initialSelection.begin(), initialSelection.end(),
+        [&](const std::wstring& identity) {
+            return std::any_of(items.begin(), items.end(),
+                [&](const DesktopViewItem& item) {
+                    return sameIdentity(item.path, identity);
+                });
+        });
+    if (longItem == items.end() || !initialItemsVisible) {
+        surface.Close();
+        return 414;
+    }
+    const std::wstring identity = longItem->path;
+    const bool cleared =
+        DesktopSurfaceWindowSmokeAccess::SelectExplorerIdentities(
+            surface, {});
+    DesktopSurfaceWindowSmokeAccess::RebuildSelectionRects(surface);
+    RECT compactNative{}, compactPainted{};
+    const bool compactQueried = cleared &&
+        DesktopSurfaceWindowSmokeAccess::NativeAndPaintedSelectionRect(
+            surface, identity, compactNative, compactPainted);
+    RedrawWindow(surface.Snapshot().listViewWindow, nullptr, nullptr,
+        RDW_INVALIDATE | RDW_UPDATENOW | RDW_ERASE);
+    const bool compactNativeSaved = compactQueried && SaveWindowClientBmp(
+        surface.Snapshot().listViewWindow,
+        std::filesystem::path(outputRoot) / L"desktop-longname-native-compact.bmp");
+    const bool selected =
+        DesktopSurfaceWindowSmokeAccess::SelectExplorerIdentities(
+            surface, {identity});
+    RECT expandedNative{}, expandedPainted{};
+    const bool expandedQueried = selected &&
+        DesktopSurfaceWindowSmokeAccess::NativeAndPaintedSelectionRect(
+            surface, identity, expandedNative, expandedPainted);
+    RedrawWindow(surface.Snapshot().listViewWindow, nullptr, nullptr,
+        RDW_INVALIDATE | RDW_UPDATENOW | RDW_ERASE);
+    const bool expandedNativeSaved = expandedQueried && SaveWindowClientBmp(
+        surface.Snapshot().listViewWindow,
+        std::filesystem::path(outputRoot) / L"desktop-longname-native-selected.bmp");
+    surface.Show();
+    RedrawWindow(surface.Window(), nullptr, nullptr,
+        RDW_INVALIDATE | RDW_UPDATENOW | RDW_ERASE);
+    const bool expandedSaved = expandedQueried && SaveWindowClientBmp(
+        surface.Window(),
+        std::filesystem::path(outputRoot) / L"desktop-longname-selected.bmp");
+    const bool compactLatticeSelected =
+        DesktopSurfaceWindowSmokeAccess::SelectExplorerIdentities(
+            surface, {});
+    RedrawWindow(surface.Window(), nullptr, nullptr,
+        RDW_INVALIDATE | RDW_UPDATENOW | RDW_ERASE);
+    const bool compactSaved = compactLatticeSelected && SaveWindowClientBmp(
+        surface.Window(),
+        std::filesystem::path(outputRoot) / L"desktop-longname-compact.bmp");
+    const bool hoverIssued = compactLatticeSelected &&
+        DesktopSurfaceWindowSmokeAccess::HoverIdentity(surface, identity);
+    RedrawWindow(surface.Window(), nullptr, nullptr,
+        RDW_INVALIDATE | RDW_UPDATENOW | RDW_ERASE);
+    const bool hoverSaved = hoverIssued && SaveWindowClientBmp(
+        surface.Window(),
+        std::filesystem::path(outputRoot) / L"desktop-longname-hover.bmp");
+    const bool restoreIssued =
+        DesktopSurfaceWindowSmokeAccess::SelectExplorerIdentities(
+            surface, initialSelection);
+    const bool returnPlanPrepared =
+        DesktopSurfaceWindowSmokeAccess::ExcludeVisibleIdentityForReturnPlan(
+            surface, identity);
+    POINT plannedReturn{};
+    const POINT requestedReturn{208, 149};
+    const bool returnPlanSucceeded = returnPlanPrepared &&
+        surface.PlanReturnedDisplayPosition(
+            identity, requestedReturn, plannedReturn);
+    const bool snapEnabled =
+        (surface.Snapshot().viewFlags & FWF_SNAPTOGRID) != 0;
+    const auto& nativeItems = surface.Snapshot().items;
+    const auto nativeAnchor = std::find_if(
+        nativeItems.begin(), nativeItems.end(),
+        [](const DesktopViewItem& item) {
+            return item.viewPoint.x >= 0 && item.viewPoint.y >= 0;
+        });
+    const int planCellWidth =
+        DesktopSurfaceWindowSmokeAccess::CellWidth(surface);
+    const int planCellHeight =
+        DesktopSurfaceWindowSmokeAccess::CellHeight(surface);
+    const bool returnPlanAligned = returnPlanSucceeded &&
+        (!snapEnabled ||
+         (nativeAnchor != nativeItems.end() &&
+          planCellWidth > 0 && planCellHeight > 0 &&
+          (plannedReturn.x - nativeAnchor->viewPoint.x) %
+              planCellWidth == 0 &&
+          (plannedReturn.y - nativeAnchor->viewPoint.y) %
+              planCellHeight == 0));
+    surface.Close();
+    if (foregroundBefore != nullptr &&
+        IsWindow(foregroundBefore) != FALSE) {
+        SetForegroundWindow(foregroundBefore);
+    }
+    std::vector<std::wstring> selectionAfter;
+    const bool selectionRestored = restoreIssued &&
+        CaptureExplorerSelectionForSmoke(selectionAfter) &&
+        selectionAfter.size() == initialSelection.size() &&
+        std::all_of(initialSelection.begin(), initialSelection.end(),
+            [&](const std::wstring& expected) {
+                return std::any_of(selectionAfter.begin(),
+                    selectionAfter.end(),
+                    [&](const std::wstring& actual) {
+                        return sameIdentity(expected, actual);
+                    });
+            });
+    std::ofstream report(
+        std::filesystem::path(outputRoot) /
+            L"desktop-longname-native-selection.txt");
+    report << "CLEAR=" << cleared
+           << "\nCOMPACT_QUERY=" << compactQueried
+           << "\nCOMPACT_NATIVE=" << compactNative.left << ','
+           << compactNative.top << ',' << compactNative.right << ','
+           << compactNative.bottom
+           << "\nCOMPACT_PAINTED_MATCH="
+           << EqualRect(&compactNative, &compactPainted)
+           << "\nSELECT=" << selected
+           << "\nEXPANDED_QUERY=" << expandedQueried
+           << "\nEXPANDED_NATIVE=" << expandedNative.left << ','
+           << expandedNative.top << ',' << expandedNative.right << ','
+           << expandedNative.bottom
+           << "\nEXPANDED_PAINTED_MATCH="
+           << EqualRect(&expandedNative, &expandedPainted)
+           << "\nCOMPACT_SCREENSHOT=" << compactSaved
+           << "\nHOVER_SCREENSHOT=" << hoverSaved
+           << "\nCOMPACT_NATIVE_SCREENSHOT=" << compactNativeSaved
+           << "\nEXPANDED_SCREENSHOT=" << expandedSaved
+           << "\nEXPANDED_NATIVE_SCREENSHOT=" << expandedNativeSaved
+           << "\nNATIVE_SNAP_ENABLED=" << snapEnabled
+           << "\nRETURN_PLAN_PREPARED=" << returnPlanPrepared
+           << "\nRETURN_PLAN_SUCCEEDED=" << returnPlanSucceeded
+           << "\nRETURN_PLAN=" << plannedReturn.x << ','
+           << plannedReturn.y
+           << "\nRETURN_PLAN_ALIGNED=" << returnPlanAligned
+           << "\nSELECTION_RESTORED=" << selectionRestored << '\n';
+    if (!selectionRestored) return 415;
+    return compactSaved && hoverSaved && expandedSaved &&
+        compactLatticeSelected &&
+        returnPlanAligned &&
+        compactNativeSaved && expandedNativeSaved &&
+        EqualRect(&compactNative, &compactPainted) &&
+        EqualRect(&expandedNative, &expandedPainted) &&
+        EqualRect(&expandedNative, &compactNative)
+        ? 0 : 416;
+}
+
+int RunSmokeNativeDesktopHost(HINSTANCE instance) {
+    AttachParentConsole();
+    SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    const DWORD required = GetEnvironmentVariableW(L"DESKTOP_ORGANIZER_SMOKE_ITEMS_DIR", nullptr, 0);
+    if (!required) return 491;
+    std::wstring root(required, L'\0');
+    const DWORD copied = GetEnvironmentVariableW(L"DESKTOP_ORGANIZER_SMOKE_ITEMS_DIR", root.data(), required);
+    if (!copied || copied >= required) return 491;
+    root.resize(copied);
+    std::ofstream report(std::filesystem::path(root)/L"native-desktop-host.txt");
+    DesktopSurfaceWindow surface(instance);
+    MainWindow* openAppOwner=nullptr;
+    const auto pump = [&](DWORD milliseconds) {
+        const ULONGLONG until = GetTickCount64()+milliseconds;
+        do {
+            MSG message{};
+            while (PeekMessageW(&message, nullptr,0,0,PM_REMOVE)) {
+                if (openAppOwner && openAppOwner->PreTranslateMessage(message)) continue;
+                if (surface.PreTranslateMessage(message)) continue;
+                TranslateMessage(&message); DispatchMessageW(&message);
+            }
+            MsgWaitForMultipleObjects(0,nullptr,FALSE,10,QS_ALLINPUT);
+        } while (GetTickCount64()<until);
+    };
+    DesktopLayout layout; DesktopViewSnapshot source; std::wstring error;
+    std::vector<DesktopPosition> before, after;
+    if (!layout.CaptureViewSnapshot(source,error) || !layout.CaptureAllPositions(before,error)) return 492;
+    const auto item = std::find_if(source.items.begin(),source.items.end(),[](const DesktopViewItem& v) {
+        return v.path.find(L"d5364d37-fcf0-4a07-8f76-4676398264a9.png") != std::wstring::npos;
+    });
+    if (item == source.items.end()) return 492;
+    std::vector<std::wstring> otherAssigned;
+    for(const auto& original:source.items) if(original.path!=item->path) otherAssigned.push_back(original.path);
+    POINT savedCursor{}; GetCursorPos(&savedCursor);
+    const HWND savedForeground = GetForegroundWindow();
+    Microsoft::WRL::ComPtr<IFolderView> originalFolder;
+    Microsoft::WRL::ComPtr<IShellView> originalView;
+    HWND originalWindow=nullptr;
+    if(!layout.AcquireFolderViewOnce(originalFolder.GetAddressOf(),originalView.GetAddressOf(),originalWindow,error)) return 492;
+    std::vector<const DesktopViewItem*> selectedBefore;
+    for(int i=static_cast<int>(SendMessageW(source.listViewWindow,LVM_GETNEXTITEM,static_cast<WPARAM>(-1),LVNI_SELECTED));
+        i>=0;i=static_cast<int>(SendMessageW(source.listViewWindow,LVM_GETNEXTITEM,i,LVNI_SELECTED))) {
+        auto found=std::find_if(source.items.begin(),source.items.end(),[&](const DesktopViewItem& p){return p.viewIndex==i;});
+        if(found==source.items.end()) return 492;
+        selectedBefore.push_back(&*found);
+    }
+    int originalFocus=-1; originalFolder->GetFocusedItem(&originalFocus);
+    const auto restoreSelection=[&] {
+        originalView->SelectItem(nullptr,SVSI_DESELECTOTHERS);
+        for(const auto* selected:selectedBefore) originalView->SelectItem(
+            reinterpret_cast<PCUITEMID_CHILD>(selected->shellChildPidl.data()),SVSI_SELECT);
+        auto focused=std::find_if(source.items.begin(),source.items.end(),[&](const DesktopViewItem& p){return p.viewIndex==originalFocus;});
+        if(focused!=source.items.end()) originalView->SelectItem(reinterpret_cast<PCUITEMID_CHILD>(focused->shellChildPidl.data()),SVSI_FOCUSED);
+    };
+    struct RestoreScope { std::function<void()> action; ~RestoreScope(){action();} } restore{[&]{
+        restoreSelection(); SetCursorPos(savedCursor.x,savedCursor.y);
+        if(savedForeground && IsWindow(savedForeground)) SetForegroundWindow(savedForeground);
+    }};
+    const POINT iconPoint{item->screenPoint.x+24,item->screenPoint.y+24};
+    const RECT stateRect{iconPoint.x-45,iconPoint.y-24,iconPoint.x+70,iconPoint.y+180};
+    const auto focusOther=std::find_if(source.items.begin(),source.items.end(),[&](const DesktopViewItem& p) {
+        return p.path!=item->path && std::abs(p.screenPoint.x-iconPoint.x)<144 && std::abs(p.screenPoint.y-iconPoint.y)<100;
+    });
+    const auto click=[&](POINT p) {
+        SetCursorPos(p.x,p.y); INPUT input[2]{}; input[0].type=input[1].type=INPUT_MOUSE;
+        input[0].mi.dwFlags=MOUSEEVENTF_LEFTDOWN; input[1].mi.dwFlags=MOUSEEVENTF_LEFTUP;
+        return SendInput(2,input,sizeof(INPUT))==2;
+    };
+    const auto idle=[] { return ((GetAsyncKeyState(VK_LBUTTON)|GetAsyncKeyState(VK_CONTROL)|GetAsyncKeyState(VK_SHIFT)|GetAsyncKeyState(VK_MENU))&0x8000)==0; };
+    const ULONGLONG idleUntil=GetTickCount64()+30000;
+    while(!idle() && GetTickCount64()<idleUntil) pump(20);
+    if(!idle() || WindowFromPoint(iconPoint)!=source.listViewWindow) return 492;
+    std::optional<POINT> blank;
+    for(int y=source.screenRect.top+64;!blank && y<source.screenRect.bottom-64;y+=100)
+        for(int x=source.screenRect.left+64;!blank && x<source.screenRect.right-64;x+=120) {
+            const POINT p{x,y};
+            if(WindowFromPoint(p)==source.listViewWindow && std::none_of(source.items.begin(),source.items.end(),[&](const DesktopViewItem& v) {
+                return std::abs(v.screenPoint.x-x)<144 && std::abs(v.screenPoint.y-y)<180;
+            })) blank=p;
+        }
+    if(!blank || !click(*blank)) return 492;
+    pump(100);
+    if(focusOther!=source.items.end()) originalView->SelectItem(reinterpret_cast<PCUITEMID_CHILD>(focusOther->shellChildPidl.data()),
+        SVSI_FOCUSED|SVSI_SELECT|SVSI_DESELECTOTHERS);
+    originalView->SelectItem(nullptr,SVSI_DESELECTOTHERS);
+    int sourceFocus=-1; originalFolder->GetFocusedItem(&sourceFocus);
+    report << "source_focus=" << sourceFocus << " png_index=" << item->viewIndex << " other_index="
+        << (focusOther==source.items.end()?-1:focusOther->viewIndex) << " source_selected="
+        << SendMessageW(source.listViewWindow,LVM_GETSELECTEDCOUNT,0,0) << '\n'; report.flush();
+    RedrawWindow(source.listViewWindow,nullptr,nullptr,RDW_INVALIDATE|RDW_UPDATENOW|RDW_ALLCHILDREN);
+    SetCursorPos(iconPoint.x,iconPoint.y); pump(150); DwmFlush();
+    std::vector<std::uint32_t> sourceHover,sourceSelected,nativeHover,nativeSelected;
+    const bool sourceHoverCaptured=CaptureScreenPixels(stateRect,sourceHover);
+    const bool sourceClicked=click(iconPoint); pump(100); DwmFlush();
+    const bool sourceSelectedCaptured=CaptureScreenPixels(stateRect,sourceSelected);
+    SaveCapturedPixelsBmp(stateRect,sourceHover,std::filesystem::path(root)/L"host-source-hover.bmp");
+    SaveCapturedPixelsBmp(stateRect,sourceSelected,std::filesystem::path(root)/L"host-source-selected.bmp");
+    restoreSelection();
+    std::vector<DesktopPosition> committed;
+    unsigned commits = 0;
+    surface.SetDisplayPositionCommitHandler([&](const std::vector<DesktopPosition>& positions) {
+        report << "commit_enter=" << positions.size() << " stage=" << DesktopSurfaceWindowSmokeAccess::InternalDropStageValue(surface) << '\n'; report.flush();
+        for (const auto& value: positions) {
+            auto found = std::find_if(committed.begin(),committed.end(),[&](const DesktopPosition& p){return p.path==value.path;});
+            if (found==committed.end()) committed.push_back(value); else *found=value;
+        }
+        ++commits; return true;
+    });
+    const auto awaitReady = [&] {
+        const ULONGLONG until = GetTickCount64()+5500;
+        while (!DesktopSurfaceWindowSmokeAccess::NativeReady(surface) && GetTickCount64()<until) pump(10);
+        pump(400);
+        return DesktopSurfaceWindowSmokeAccess::NativeReady(surface);
+    };
+    if (!surface.Create({},error)) { report << Utf8Text(error); return 493; }
+    surface.Show();
+    bool ready = awaitReady(); report << "ready=" << ready << '\n';
+    const bool nativeBlankClicked=ready && click(*blank); pump(100);
+    if(focusOther!=source.items.end()) DesktopSurfaceWindowSmokeAccess::NativeSelect(surface,focusOther->path,
+        SVSI_FOCUSED|SVSI_SELECT|SVSI_DESELECTOTHERS);
+    DesktopSurfaceWindowSmokeAccess::NativeSelect(surface,{},SVSI_DESELECTOTHERS);
+    RedrawWindow(DesktopSurfaceWindowSmokeAccess::NativeList(surface),nullptr,nullptr,RDW_INVALIDATE|RDW_UPDATENOW|RDW_ALLCHILDREN);
+    SetCursorPos(iconPoint.x,iconPoint.y); pump(150); DwmFlush();
+    const bool hoverSame=nativeBlankClicked && sourceHoverCaptured && CaptureScreenPixels(stateRect,nativeHover) && sourceHover==nativeHover;
+    const bool nativeClicked=click(iconPoint); pump(100); DwmFlush();
+    const bool selectedSame=ready && sourceClicked && nativeClicked && sourceSelectedCaptured &&
+        CaptureScreenPixels(stateRect,nativeSelected) && sourceSelected==nativeSelected;
+    SaveCapturedPixelsBmp(stateRect,nativeHover,std::filesystem::path(root)/L"host-native-hover.bmp");
+    SaveCapturedPixelsBmp(stateRect,nativeSelected,std::filesystem::path(root)/L"host-native-selected.bmp");
+    report << "hover_same=" << hoverSame << " selected_same=" << selectedSame << '\n'; report.flush();
+    const auto key=[](WORD code) {
+        INPUT events[2]{}; events[0].type=events[1].type=INPUT_KEYBOARD;
+        events[0].ki.wVk=events[1].ki.wVk=code; events[1].ki.dwFlags=KEYEVENTF_KEYUP;
+        return SendInput(2,events,sizeof(INPUT))==2;
+    };
+    HWND nativeList=DesktopSurfaceWindowSmokeAccess::NativeList(surface);
+    GUITHREADINFO gui{sizeof(gui)}; GetGUIThreadInfo(0,&gui);
+    const bool keyboardFocus=gui.hwndFocus==nativeList;
+    report << "keyboard_focus=" << keyboardFocus << " icon_hit_native=" << (WindowFromPoint(iconPoint)==nativeList)
+        << " blank_hit_native=" << (WindowFromPoint(*blank)==nativeList)
+        << " icon_hit_source=" << (WindowFromPoint(iconPoint)==source.listViewWindow)
+        << " native_clicked=" << nativeClicked << " input_modifiers="
+        << ((GetAsyncKeyState(VK_CONTROL)|GetAsyncKeyState(VK_SHIFT)|GetAsyncKeyState(VK_MENU)|GetAsyncKeyState(VK_LBUTTON))&0x8000)
+        << '\n'; report.flush();
+    const bool f2Injected=keyboardFocus && key(VK_F2); pump(250);
+    const bool nativeRename=IsWindow(reinterpret_cast<HWND>(SendMessageW(nativeList,LVM_GETEDITCONTROL,0,0)))!=FALSE;
+    key(VK_ESCAPE); pump(100);
+    const bool renameCancelled=!IsWindow(reinterpret_cast<HWND>(SendMessageW(nativeList,LVM_GETEDITCONTROL,0,0)));
+    bool menuObserved=false;
+    std::thread menuInput([&] {
+        if(!keyboardFocus || !renameCancelled) return;
+        SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        SetCursorPos(iconPoint.x,iconPoint.y);
+        INPUT events[2]{}; events[0].type=events[1].type=INPUT_MOUSE;
+        events[0].mi.dwFlags=MOUSEEVENTF_RIGHTDOWN; events[1].mi.dwFlags=MOUSEEVENTF_RIGHTUP;
+        SendInput(2,events,sizeof(INPUT));
+        const ULONGLONG until=GetTickCount64()+2500;
+        do {
+            Sleep(20); GUITHREADINFO info{sizeof(info)};
+            menuObserved=GetGUIThreadInfo(GetWindowThreadProcessId(nativeList,nullptr),&info) && (info.flags&GUI_INMENUMODE)!=0;
+        } while(!menuObserved && GetTickCount64()<until);
+        key(VK_ESCAPE);
+        Sleep(100);
+        PostMessageW(nativeList,WM_CANCELMODE,0,0);
+        PostMessageW(GetParent(nativeList),WM_CANCELMODE,0,0);
+    });
+    pump(3000); menuInput.join(); pump(100);
+    report << "keyboard_focus=" << keyboardFocus << " f2_injected=" << f2Injected << " native_rename=" << nativeRename
+        << " rename_cancelled=" << renameCancelled << " menu_observed=" << menuObserved << '\n'; report.flush();
+    const auto injectDrag=[&](POINT start,POINT end) {
+        std::atomic<bool> done{false}, injected{false};
+        std::thread input([&] {
+            SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+            const auto send=[&](POINT p,DWORD flags) {
+                INPUT e{}; e.type=INPUT_MOUSE;
+                e.mi.dx=MulDiv(p.x-GetSystemMetrics(SM_XVIRTUALSCREEN),65535,(std::max)(1,GetSystemMetrics(SM_CXVIRTUALSCREEN)-1));
+                e.mi.dy=MulDiv(p.y-GetSystemMetrics(SM_YVIRTUALSCREEN),65535,(std::max)(1,GetSystemMetrics(SM_CYVIRTUALSCREEN)-1));
+                e.mi.dwFlags=MOUSEEVENTF_ABSOLUTE|MOUSEEVENTF_VIRTUALDESK|MOUSEEVENTF_MOVE|flags;
+                return SendInput(1,&e,sizeof(e))==1;
+            };
+            bool ok=send(start,0); Sleep(80); ok=send(start,MOUSEEVENTF_LEFTDOWN)&&ok; Sleep(100);
+            for(int step=1;step<=12;++step) {
+                ok=send({start.x+MulDiv(end.x-start.x,step,12),start.y+MulDiv(end.y-start.y,step,12)},0)&&ok; Sleep(25);
+            }
+            ok=send(end,MOUSEEVENTF_LEFTUP)&&ok; injected.store(ok); done.store(true);
+        });
+        while(!done.load()) pump(10);
+        input.join(); pump(500);
+        return injected.load();
+    };
+    bool multiSelected=false, marqueeSelected=false, blankCleared=false;
+    if(focusOther!=source.items.end()) {
+        const POINT otherPoint{focusOther->screenPoint.x+24,focusOther->screenPoint.y+24};
+        click(iconPoint); pump(100);
+        INPUT control{}; control.type=INPUT_KEYBOARD; control.ki.wVk=VK_CONTROL;
+        const bool controlDown=SendInput(1,&control,sizeof(control))==1;
+        const bool otherClicked=controlDown && click(otherPoint); pump(100);
+        control.ki.dwFlags=KEYEVENTF_KEYUP; SendInput(1,&control,sizeof(control)); pump(100);
+        multiSelected=otherClicked && SendMessageW(nativeList,LVM_GETSELECTEDCOUNT,0,0)==2;
+        click(*blank); pump(100);
+        pump(GetDoubleClickTime()+40);
+        const POINT end{source.screenRect.left+2,source.screenRect.top+640};
+        marqueeSelected=WindowFromPoint(*blank)==nativeList && injectDrag(*blank,end) &&
+            SendMessageW(nativeList,LVM_GETSELECTEDCOUNT,0,0)>=2;
+        click(*blank); pump(100);
+        blankCleared=SendMessageW(nativeList,LVM_GETSELECTEDCOUNT,0,0)==0;
+    }
+    report << "ctrl_multi=" << multiSelected << " native_marquee=" << marqueeSelected
+        << " blank_clear=" << blankCleared << '\n'; report.flush();
+    bool multiDragPreserved=false, nativeRefreshPreserved=false, widgetLayerPreserved=false;
+    if(focusOther!=source.items.end()) {
+        auto pairAssigned=otherAssigned;
+        pairAssigned.erase(std::remove(pairAssigned.begin(),pairAssigned.end(),focusOther->path),pairAssigned.end());
+        surface.UpdateAssignedIdentities(pairAssigned);
+        surface.UpdateDisplayPositions({{item->path,POINT{136,296}},{focusOther->path,POINT{251,296}}});
+        HostedWidgetDescriptor layerWidget;
+        layerWidget.categoryId=L"native-multi-layer"; layerWidget.title=L"多选与刷新保留测试";
+        layerWidget.config.x=1000; layerWidget.config.y=500; layerWidget.config.width=280;
+        layerWidget.config.height=layerWidget.config.normalHeight=380; layerWidget.config.dpi=144;
+        const bool applied=surface.ApplyHostedWidgets({layerWidget},error); pump(500);
+        const bool widgetBefore=applied && DesktopSurfaceWindowSmokeAccess::NativeWidgetHit(surface);
+        pump(GetDoubleClickTime()+40);
+        const bool selected=injectDrag({100,275},{350,420});
+        auto expected=std::vector<std::wstring>{item->path,focusOther->path}; std::sort(expected.begin(),expected.end());
+        const auto selectedPair=[&] {
+            auto actual=DesktopSurfaceWindowSmokeAccess::NativeSelected(surface); std::sort(actual.begin(),actual.end());
+            return actual==expected;
+        };
+        bool pairMoved=selected && selectedPair();
+        report << "batch_marquee=" << pairMoved << " widget_before=" << widgetBefore << '\n'; report.flush();
+        for(int round=0;round<2;++round) {
+            POINT a{},b{},nextA{},nextB{};
+            const bool beforePair=DesktopSurfaceWindowSmokeAccess::NativePoint(surface,item->path,a) &&
+                DesktopSurfaceWindowSmokeAccess::NativePoint(surface,focusOther->path,b);
+            const unsigned previous=commits;
+            const POINT start{a.x+24,a.y+24},end{a.x+139,a.y+24};
+            const bool injected=beforePair && WindowFromPoint(start)==nativeList && WindowFromPoint(end)==nativeList && injectDrag(start,end);
+            const bool moved=injected && commits==previous+1 &&
+                DesktopSurfaceWindowSmokeAccess::NativePoint(surface,item->path,nextA) &&
+                DesktopSurfaceWindowSmokeAccess::NativePoint(surface,focusOther->path,nextB) &&
+                nextA.x==a.x+115 && nextA.y==a.y && nextB.x==b.x+115 && nextB.y==b.y;
+            const bool selection=selectedPair();
+            report << "batch_round=" << round << " moved=" << moved << " selection=" << selection
+                << " selected_count=" << SendMessageW(nativeList,LVM_GETSELECTEDCOUNT,0,0)
+                << " widget_hit=" << DesktopSurfaceWindowSmokeAccess::NativeWidgetHit(surface) << '\n'; report.flush();
+            pairMoved=pairMoved && moved && selection;
+        }
+        multiDragPreserved=pairMoved;
+        const bool widgetAfter=DesktopSurfaceWindowSmokeAccess::NativeWidgetHit(surface);
+        POINT a{},b{},nextA{},nextB{};
+        const bool positions=DesktopSurfaceWindowSmokeAccess::NativePoint(surface,item->path,a) &&
+            DesktopSurfaceWindowSmokeAccess::NativePoint(surface,focusOther->path,b);
+        struct RefreshEvents {
+            int deletes=0,deleteAll=0,setCount=0;
+            static LRESULT CALLBACK Observe(HWND h,UINT m,WPARAM w,LPARAM l,UINT_PTR,DWORD_PTR ref) {
+                auto& e=*reinterpret_cast<RefreshEvents*>(ref);
+                if(m==LVM_DELETEITEM) ++e.deletes;
+                if(m==LVM_DELETEALLITEMS) ++e.deleteAll;
+                if(m==LVM_SETITEMCOUNT) ++e.setCount;
+                return DefSubclassProc(h,m,w,l);
+            }
+        } refreshEvents;
+        SetWindowSubclass(nativeList,RefreshEvents::Observe,79,reinterpret_cast<DWORD_PTR>(&refreshEvents));
+        const bool refresh=DesktopSurfaceWindowSmokeAccess::NativeRefresh(surface); pump(700);
+        RemoveWindowSubclass(nativeList,RefreshEvents::Observe,79);
+        report << "refresh_events_delete=" << refreshEvents.deletes << " delete_all=" << refreshEvents.deleteAll
+            << " set_count=" << refreshEvents.setCount << " old_list=" << reinterpret_cast<UINT_PTR>(nativeList)
+            << " old_live=" << IsWindow(nativeList) << DesktopSurfaceWindowSmokeAccess::NativeRefreshState(surface) << '\n';
+        nativeList=DesktopSurfaceWindowSmokeAccess::NativeList(surface);
+        nativeRefreshPreserved=refresh && positions &&
+            SendMessageW(nativeList,LVM_GETITEMCOUNT,0,0)==2 &&
+            DesktopSurfaceWindowSmokeAccess::NativePoint(surface,item->path,nextA) &&
+            DesktopSurfaceWindowSmokeAccess::NativePoint(surface,focusOther->path,nextB) &&
+            a.x==nextA.x && a.y==nextA.y && b.x==nextB.x && b.y==nextB.y;
+        widgetLayerPreserved=widgetBefore && widgetAfter && DesktopSurfaceWindowSmokeAccess::NativeWidgetHit(surface);
+        report << "native_refresh=" << refresh << " refresh_preserved=" << nativeRefreshPreserved
+            << " native_count=" << SendMessageW(nativeList,LVM_GETITEMCOUNT,0,0)
+            << " widget_after_drag=" << widgetAfter << " widget_after_refresh="
+            << DesktopSurfaceWindowSmokeAccess::NativeWidgetHit(surface) << '\n'; report.flush();
+        bool backgroundRefreshClicked=false;
+        std::thread backgroundInput([&] {
+            SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+            SetCursorPos(800,150);
+            INPUT events[2]{}; events[0].type=events[1].type=INPUT_MOUSE;
+            events[0].mi.dwFlags=MOUSEEVENTF_RIGHTDOWN; events[1].mi.dwFlags=MOUSEEVENTF_RIGHTUP;
+            SendInput(2,events,sizeof(INPUT));
+            const ULONGLONG until=GetTickCount64()+2500;
+            do {
+                HWND popup=FindWindowW(L"#32768",nullptr); DWORD pid=0;
+                if(popup) GetWindowThreadProcessId(popup,&pid);
+                if(popup && pid==GetCurrentProcessId()) {
+                    const HMENU menu=reinterpret_cast<HMENU>(SendMessageW(popup,MN_GETHMENU,0,0));
+                    for(int index=0;index<GetMenuItemCount(menu);++index) {
+                        wchar_t text[256]{}; GetMenuStringW(menu,static_cast<UINT>(index),text,ARRAYSIZE(text),MF_BYPOSITION);
+                        if(std::wstring(text).find(L"刷新")==std::wstring::npos && std::wstring(text).find(L"Refresh")==std::wstring::npos) continue;
+                        RECT rect{};
+                        if(GetMenuItemRect(nullptr,menu,static_cast<UINT>(index),&rect))
+                            backgroundRefreshClicked=click({(rect.left+rect.right)/2,(rect.top+rect.bottom)/2});
+                        break;
+                    }
+                }
+                if(backgroundRefreshClicked) break;
+                Sleep(20);
+            } while(GetTickCount64()<until);
+            if(!backgroundRefreshClicked) key(VK_ESCAPE);
+        });
+        pump(3000); backgroundInput.join(); pump(700);
+        const bool backgroundMembers=SendMessageW(nativeList,LVM_GETITEMCOUNT,0,0)==2 &&
+            DesktopSurfaceWindowSmokeAccess::NativePoint(surface,item->path,nextA) &&
+            DesktopSurfaceWindowSmokeAccess::NativePoint(surface,focusOther->path,nextB) &&
+            a.x==nextA.x && a.y==nextA.y && b.x==nextB.x && b.y==nextB.y;
+        report << "background_refresh_clicked=" << backgroundRefreshClicked << " background_members=" << backgroundMembers
+            << " background_widget_hit=" << DesktopSurfaceWindowSmokeAccess::NativeWidgetHit(surface) << '\n'; report.flush();
+        nativeRefreshPreserved=nativeRefreshPreserved && backgroundRefreshClicked && backgroundMembers;
+        widgetLayerPreserved=widgetLayerPreserved && DesktopSurfaceWindowSmokeAccess::NativeWidgetHit(surface);
+        surface.ClearHostedWidgets(); surface.UpdateAssignedIdentities({}); awaitReady();
+    }
+    const std::wstring controlledIdentity=L"C:\\Users\\wzm33\\Desktop\\Lattice-S0-ControlledOpen-d6d7f1cf.lnk";
+    wchar_t executable[32768]{}; GetModuleFileNameW(nullptr,executable,ARRAYSIZE(executable));
+    const auto project=std::filesystem::path(executable).parent_path().parent_path().parent_path();
+    const auto receipts=project/L".workspace"/L"resource-s0"/L"desktop-pointer-review-d6d7f1cfc7374941821bce6cfcba2166"/L"receipts";
+    const auto receiptCount=[&] {
+        size_t count=0;
+        for(const auto& f:std::filesystem::directory_iterator(receipts)) {
+            const auto name=f.path().filename().wstring();
+            if(name.starts_with(L"recipient-d6d7f1cfc7374941821bce6cfcba2166-") && name.ends_with(L".started.json")) ++count;
+        }
+        return count;
+    };
+    POINT controlledPoint{};
+    const size_t receiptsBefore=receiptCount();
+    bool opened=DesktopSurfaceWindowSmokeAccess::NativePoint(surface,controlledIdentity,controlledPoint);
+    bool openWithoutRefresh=false;
+    if(opened) {
+        const auto beforeOpen=DesktopSurfaceWindowSmokeAccess::NativeOpenCounters(surface);
+        const HWND beforeOpenList=DesktopSurfaceWindowSmokeAccess::NativeList(surface);
+        controlledPoint.x+=24; controlledPoint.y+=24;
+        pump(GetDoubleClickTime()+40);
+        opened=WindowFromPoint(controlledPoint)==nativeList && click(controlledPoint);
+        pump(60); opened=click(controlledPoint) && opened;
+        const ULONGLONG until=GetTickCount64()+4000;
+        while(receiptCount()==receiptsBefore && GetTickCount64()<until) pump(20);
+        pump(400);
+        opened=opened && receiptCount()==receiptsBefore+1 && DesktopSurfaceWindowSmokeAccess::NativeReady(surface);
+        const auto afterOpen=DesktopSurfaceWindowSmokeAccess::NativeOpenCounters(surface);
+        report << "open_counter_delta(nav,views,members,recovery,show,hide,position)=";
+        for(size_t i=0;i<afterOpen.size();++i) report << (i?",":"") << afterOpen[i]-beforeOpen[i];
+        openWithoutRefresh=beforeOpen==afterOpen && beforeOpenList==DesktopSurfaceWindowSmokeAccess::NativeList(surface);
+        report << " open_without_refresh=" << openWithoutRefresh << '\n'; report.flush();
+    }
+    report << "native_open_once=" << opened << '\n'; report.flush();
+    surface.UpdateAssignedIdentities(otherAssigned); awaitReady();
+    const auto drag = [&](POINT delta) {
+        POINT original{};
+        if (!DesktopSurfaceWindowSmokeAccess::NativePoint(surface,item->path,original)) return false;
+        const HWND list = DesktopSurfaceWindowSmokeAccess::NativeList(surface);
+        const POINT start{original.x+24,original.y+24}, end{start.x+delta.x,start.y+delta.y};
+        const auto busy = [] { return ((GetAsyncKeyState(VK_LBUTTON)|GetAsyncKeyState(VK_CONTROL)|
+            GetAsyncKeyState(VK_SHIFT)|GetAsyncKeyState(VK_MENU))&0x8000)!=0; };
+        const ULONGLONG idle = GetTickCount64()+30000;
+        while (busy() && GetTickCount64()<idle) pump(20);
+        const bool exposed = WindowFromPoint(start)==list && WindowFromPoint(end)==list;
+        report << "drag_exposed=" << exposed << " busy=" << busy() << '\n'; report.flush();
+        if (!exposed || busy()) return false;
+        SetFocus(list);
+        const unsigned previous = commits;
+        const bool injected=injectDrag(start,end);
+        POINT current{};
+        bool positioned=false;
+        const ULONGLONG positionStart=GetTickCount64(), positionDeadline=positionStart+3000;
+        do {
+            positioned=DesktopSurfaceWindowSmokeAccess::NativePoint(surface,item->path,current);
+            if(positioned && current.x==original.x+delta.x && current.y==original.y+delta.y) break;
+            pump(10);
+        } while(GetTickCount64()<positionDeadline);
+        report << "position_wait_ms=" << GetTickCount64()-positionStart << '\n';
+        report << "injected=" << injected << " commits=" << commits << " before=" << original.x << ',' << original.y
+            << " after=" << current.x << ',' << current.y << " delta=" << delta.x << ',' << delta.y << '\n'; report.flush();
+        return injected && commits==previous+1 && positioned && current.x==original.x+delta.x && current.y==original.y+delta.y;
+    };
+    const bool first=ready && drag({115,147});
+    const bool second=first && drag({115,0});
+    auto allAssigned=otherAssigned; allAssigned.push_back(item->path);
+    surface.UpdateAssignedIdentities(allAssigned); pump(400);
+    POINT point{};
+    const bool classified=second && !DesktopSurfaceWindowSmokeAccess::NativePoint(surface,item->path,point);
+    HostedWidgetDescriptor widget;
+    widget.categoryId=L"native-return-category"; widget.title=L"原生往返测试";
+    widget.config.x=1000; widget.config.y=500; widget.config.width=280;
+    widget.config.height=widget.config.normalHeight=380; widget.config.dpi=144;
+    widget.config.iconSize=48;
+    DesktopItem widgetItem;
+    widgetItem.id=L"native-return-item"; widgetItem.path=item->path;
+    widgetItem.displayName=item->displayName;
+    widget.items.push_back(widgetItem);
+    unsigned returnCommands=0; POINT returnPoint{};
+    surface.SetHostedWidgetCommandHandler([&](const HostedWidgetCommand& command) {
+        if(command.type==HostedWidgetCommandType::BringToFront) return true;
+        if(command.type!=HostedWidgetCommandType::MoveSelectionOut || command.categoryId!=widget.categoryId ||
+            command.itemIds!=std::vector<std::wstring>{widgetItem.id} || command.itemScreenPoints.size()!=1) return false;
+        ++returnCommands; returnPoint=command.itemScreenPoints.front(); return true;
+    });
+    const bool widgetApplied=classified && surface.ApplyHostedWidgets({widget},error);
+    std::optional<DesktopSurfaceWindowSmokeAccess::S0PointerTarget> widgetTarget;
+    const ULONGLONG widgetDeadline=GetTickCount64()+3000;
+    while(widgetApplied && !widgetTarget && GetTickCount64()<widgetDeadline) {
+        pump(20); widgetTarget=DesktopSurfaceWindowSmokeAccess::S0HostedItemTarget(surface,widget.categoryId,widgetItem.id);
+    }
+    const POINT widgetEnd{720,640};
+    const bool widgetDrag=widgetTarget && WindowFromPoint(widgetTarget->screen)==surface.Window() &&
+        WindowFromPoint(widgetEnd)==DesktopSurfaceWindowSmokeAccess::NativeList(surface) &&
+        injectDrag(widgetTarget->screen,widgetEnd) && returnCommands==1;
+    POINT viewPoint=returnPoint,resolved{};
+    const bool planned=widgetDrag && ScreenToClient(source.listViewWindow,&viewPoint) &&
+        surface.PlanReturnedDisplayPosition(item->path,viewPoint,resolved);
+    if(planned) {
+        const DesktopPosition returnedPosition{item->path,resolved};
+        auto saved=std::find_if(committed.begin(),committed.end(),[&](const DesktopPosition& p){return p.path==item->path;});
+        if(saved==committed.end()) committed.push_back(returnedPosition); else *saved=returnedPosition;
+        surface.UpdateDisplayPositions(committed); surface.UpdateAssignedIdentities(otherAssigned);
+        surface.ClearHostedWidgets(); pump(400);
+    }
+    const bool returned=planned && DesktopSurfaceWindowSmokeAccess::NativePoint(surface,item->path,point);
+    report << "widget_applied=" << widgetApplied << " widget_target=" << widgetTarget.has_value() << " widget_drag=" << widgetDrag
+        << " return_commands=" << returnCommands << " planned=" << planned << '\n'; report.flush();
+    const bool returnDrag=returned && drag({115,0});
+    const bool refreshed=returnDrag && surface.Refresh(error) && awaitReady() && drag({115,0});
+    POINT persisted{};
+    const bool hasPersisted=DesktopSurfaceWindowSmokeAccess::NativePoint(surface,item->path,persisted);
+    surface.Close();
+    const bool recreated=surface.Create(otherAssigned,error);
+    if(recreated) { surface.UpdateDisplayPositions(committed); surface.Show(); }
+    const bool restart=recreated && awaitReady() && DesktopSurfaceWindowSmokeAccess::NativePoint(surface,item->path,point) &&
+        hasPersisted && point.x==persisted.x && point.y==persisted.y;
+    const bool restartDrag=restart && drag({115,0});
+    const auto originalFixture=std::filesystem::path(root)/L"native-rename-original.txt";
+    const auto renamedFixture=std::filesystem::path(root)/L"native-rename-verified.txt";
+    std::ofstream(originalFixture) << "native rename fixture";
+    ConfigStore renameStore; AppConfig renameConfig;
+    renameConfig.desktopDisplayLayout.push_back({originalFixture.wstring(),711,590});
+    const bool renameSeedSaved=renameStore.SaveAppConfig(renameConfig);
+    unsigned renameCommits=0;
+    DesktopSurfaceWindowSmokeAccess::NativeRenameFixture(surface,originalFixture.wstring(),{1800,800},
+        [&](const std::wstring& previous,const std::wstring& next,const std::wstring& name) {
+            if(previous!=originalFixture.wstring() || next!=renamedFixture.wstring()) return false;
+            ++renameCommits; return renameStore.SaveShellRenameAsync(previous,next,name);
+        });
+    const bool renameFixtureReady=renameSeedSaved && awaitReady();
+    POINT fixturePoint{};
+    bool renamed=renameFixtureReady && DesktopSurfaceWindowSmokeAccess::NativePoint(surface,originalFixture.wstring(),fixturePoint);
+    if(renamed) {
+        renamed=click({fixturePoint.x+24,fixturePoint.y+24}); pump(80);
+        GUITHREADINFO renameGui{sizeof(renameGui)};
+        const HWND renameList=DesktopSurfaceWindowSmokeAccess::NativeList(surface);
+        const bool renameFocused=GetGUIThreadInfo(0,&renameGui) && renameGui.hwndFocus==renameList;
+        report << "rename_input_focus=" << renameFocused << " exposed=" << (WindowFromPoint({fixturePoint.x+24,fixturePoint.y+24})==renameList) << '\n'; report.flush();
+        key(VK_F2); pump(150);
+        HWND edit=reinterpret_cast<HWND>(SendMessageW(DesktopSurfaceWindowSmokeAccess::NativeList(surface),LVM_GETEDITCONTROL,0,0));
+        renamed=renamed && IsWindow(edit);
+        if(edit) { SetWindowTextW(edit,L"native-rename-verified.txt"); key(VK_RETURN); }
+        const ULONGLONG until=GetTickCount64()+4000;
+        while(renameCommits==0 && GetTickCount64()<until) pump(20);
+        renamed=renamed && renameCommits==1 && std::filesystem::exists(renamedFixture) && !std::filesystem::exists(originalFixture) &&
+            ConfigStore::DrainPendingWrites(5000);
+        const auto saved=renameStore.LoadAppConfig();
+        renamed=renamed && saved.desktopDisplayLayout.size()==1 && saved.desktopDisplayLayout.front().path==renamedFixture.wstring() &&
+            saved.desktopDisplayLayout.front().x==711 && saved.desktopDisplayLayout.front().y==590;
+    }
+    report << "native_rename_persisted=" << renamed << " rename_commits=" << renameCommits << '\n'; report.flush();
+    surface.UpdateAssignedIdentities(otherAssigned); pump(400);
+    DesktopSurfaceWindowSmokeAccess::FailNativePaint(surface); pump(50);
+    const bool failedClosed=!IsWindowVisible(surface.Window()) &&
+        !IsWindowVisible(DesktopSurfaceWindowSmokeAccess::NativeList(surface)) && IsWindowVisible(source.listViewWindow);
+    const bool refreshRecovered=awaitReady() &&
+        IsWindowVisible(DesktopSurfaceWindowSmokeAccess::NativeList(surface)) && IsWindowVisible(surface.Window());
+    report << "refresh_error=" << Utf8Text(error) << " native_ready=" << DesktopSurfaceWindowSmokeAccess::NativeReady(surface)
+        << " root_visible=" << IsWindowVisible(surface.Window()) << " native_visible="
+        << IsWindowVisible(DesktopSurfaceWindowSmokeAccess::NativeList(surface)) << '\n'; report.flush();
+    // Verify the desktop folder default action without closing pre-existing
+    // Explorer windows. Only this test's new matching folder window is closed.
+    const auto folderWindows=[] {
+        std::vector<std::pair<HWND,std::wstring>> windows;
+        Microsoft::WRL::ComPtr<IShellWindows> collection;
+        if(FAILED(CoCreateInstance(CLSID_ShellWindows,nullptr,CLSCTX_ALL,IID_PPV_ARGS(collection.GetAddressOf())))) return windows;
+        long count=0; collection->get_Count(&count);
+        for(long i=0;i<count;++i) {
+            VARIANT index{}; index.vt=VT_I4; index.lVal=i;
+            Microsoft::WRL::ComPtr<IDispatch> dispatch;
+            Microsoft::WRL::ComPtr<IWebBrowser2> browser;
+            Microsoft::WRL::ComPtr<IServiceProvider> provider;
+            Microsoft::WRL::ComPtr<IShellBrowser> shellBrowser;
+            Microsoft::WRL::ComPtr<IShellView> shellView;
+            Microsoft::WRL::ComPtr<IFolderView> folderView;
+            Microsoft::WRL::ComPtr<IPersistFolder2> folder;
+            SHANDLE_PTR handle=0; PIDLIST_ABSOLUTE pidl=nullptr; PWSTR identity=nullptr;
+            if(SUCCEEDED(collection->Item(index,&dispatch)) && dispatch && SUCCEEDED(dispatch.As(&browser)) &&
+                SUCCEEDED(browser->get_HWND(&handle)) && SUCCEEDED(dispatch.As(&provider)) &&
+                SUCCEEDED(provider->QueryService(SID_STopLevelBrowser,IID_PPV_ARGS(shellBrowser.GetAddressOf()))) &&
+                SUCCEEDED(shellBrowser->QueryActiveShellView(&shellView)) && SUCCEEDED(shellView.As(&folderView)) &&
+                SUCCEEDED(folderView->GetFolder(IID_PPV_ARGS(folder.GetAddressOf()))) && SUCCEEDED(folder->GetCurFolder(&pidl)) &&
+                SUCCEEDED(SHGetNameFromIDList(pidl,SIGDN_DESKTOPABSOLUTEPARSING,&identity)))
+                windows.emplace_back(reinterpret_cast<HWND>(handle),identity);
+            CoTaskMemFree(identity); CoTaskMemFree(pidl);
+        }
+        return windows;
+    };
+    const auto computer=std::find_if(source.items.begin(),source.items.end(),[](const DesktopViewItem& value) {
+        return value.path.find(L"20D04FE0-3AEA-1069-A2D8-08002B30309D")!=std::wstring::npos;
+    });
+    surface.Close();
+    ConfigStore appStore;
+    AppConfig appConfig{};
+    appConfig.window.x=1100; appConfig.window.y=500;
+    appConfig.settings.desktopGridAlignmentInitialized=true;
+    const bool appConfigSaved=appStore.SaveAppConfig(appConfig);
+    auto openApp=std::make_unique<App>(instance);
+    const bool appInitialized=appConfigSaved && openApp->Initialize(SW_SHOWNOACTIVATE);
+    const HWND appMain=FindCurrentProcessMainWindow();
+    openAppOwner=appMain ? reinterpret_cast<MainWindow*>(GetWindowLongPtrW(appMain,GWLP_USERDATA)) : nullptr;
+    DesktopSurfaceWindow* appSurface=openAppOwner ? MainWindowSmokeAccess::DesktopSurface(*openAppOwner) : nullptr;
+    bool appReady=appInitialized && appSurface;
+    if(appReady) {
+        const ULONGLONG until=GetTickCount64()+5000;
+        while(!DesktopSurfaceWindowSmokeAccess::NativeReady(*appSurface) && GetTickCount64()<until) pump(20);
+        pump(1000);
+        appReady=DesktopSurfaceWindowSmokeAccess::NativeReady(*appSurface);
+    }
+    const size_t scanBefore=DesktopScanner::ScanCountForTesting();
+    DesktopSurfaceWindow& openSurface=appSurface ? *appSurface : surface;
+    bool backgroundPreserved=false;
+    if(appReady && computer!=source.items.end()) {
+        POINT paintPoint{};
+        const bool positioned=DesktopSurfaceWindowSmokeAccess::NativePoint(openSurface,computer->path,paintPoint);
+        const RECT rect{paintPoint.x,paintPoint.y,paintPoint.x+72,paintPoint.y+72};
+        SetCursorPos(paintPoint.x+180,paintPoint.y+200); pump(100);
+        std::vector<std::uint32_t> beforePaint,afterPaint;
+        const HWND parent=DesktopSurfaceWindowSmokeAccess::NativeParent(openSurface);
+        const bool captured=positioned && WindowFromPoint({paintPoint.x+24,paintPoint.y+24})==DesktopSurfaceWindowSmokeAccess::NativeList(openSurface) && CaptureScreenPixels(rect,beforePaint);
+        InvalidateRect(parent,nullptr,TRUE); UpdateWindow(parent); DwmFlush();
+        backgroundPreserved=captured && CaptureScreenPixels(rect,afterPaint) && beforePaint==afterPaint;
+        SaveCapturedPixelsBmp(rect,beforePaint,std::filesystem::path(root)/L"open-before-parent-paint.bmp");
+        SaveCapturedPixelsBmp(rect,afterPaint,std::filesystem::path(root)/L"open-after-parent-paint.bmp");
+        report << "parent_repaint_captured=" << captured << " pixels_preserved=" << backgroundPreserved << '\n'; report.flush();
+        RedrawWindow(DesktopSurfaceWindowSmokeAccess::NativeList(openSurface),nullptr,nullptr,RDW_INVALIDATE|RDW_UPDATENOW|RDW_ERASE); pump(100);
+    }
+    bool computerOpenNoRefresh=false;
+    if(computer!=source.items.end()) {
+        auto assigned=otherAssigned;
+        assigned.erase(std::remove(assigned.begin(),assigned.end(),computer->path),assigned.end());
+        openSurface.UpdateAssignedIdentities(assigned);
+        const ULONGLONG projectionDeadline=GetTickCount64()+5500;
+        pump(10);
+        while(!DesktopSurfaceWindowSmokeAccess::NativeReady(openSurface) && GetTickCount64()<projectionDeadline) pump(10);
+        appReady=DesktopSurfaceWindowSmokeAccess::NativeReady(openSurface);
+        if(appReady) {
+            const auto windowsBefore=folderWindows();
+            const auto countersBefore=DesktopSurfaceWindowSmokeAccess::NativeOpenCounters(openSurface);
+            const unsigned parentPaintsBefore=DesktopSurfaceWindowSmokeAccess::NativeParentPaints(openSurface);
+            const HWND listBefore=DesktopSurfaceWindowSmokeAccess::NativeList(openSurface);
+            POINT p{};
+            bool injected=DesktopSurfaceWindowSmokeAccess::NativePoint(openSurface,computer->path,p);
+            p.x+=24; p.y+=24; pump(GetDoubleClickTime()+40);
+            injected=injected && WindowFromPoint(p)==listBefore && click(p); pump(60);
+            injected=click(p) && injected;
+            GUITHREADINFO openGui{sizeof(openGui)}; GetGUIThreadInfo(0,&openGui);
+            report << "computer_input_focus=" << (openGui.hwndFocus==listBefore) << " modifiers=" << ((GetAsyncKeyState(VK_MENU)|GetAsyncKeyState(VK_CONTROL)|GetAsyncKeyState(VK_SHIFT))&0x8000) << '\n'; report.flush();
+            std::vector<std::pair<HWND,std::wstring>> windowsAfter;
+            const ULONGLONG deadline=GetTickCount64()+4000;
+            bool external=false;
+            do {
+                pump(100); windowsAfter=folderWindows();
+                external=std::any_of(windowsAfter.begin(),windowsAfter.end(),[&](const auto& w){return w.second==computer->path;});
+            } while(!external && GetTickCount64()<deadline);
+            pump(1600);
+            const auto countersAfter=DesktopSurfaceWindowSmokeAccess::NativeOpenCounters(openSurface);
+            computerOpenNoRefresh=injected && external && countersBefore==countersAfter &&
+                listBefore==DesktopSurfaceWindowSmokeAccess::NativeList(openSurface) && DesktopSurfaceWindowSmokeAccess::NativeReady(openSurface);
+            report << "app_computer_open_injected=" << injected << " external=" << external << " counter_delta=";
+            for(size_t i=0;i<countersAfter.size();++i) report << (i?",":"") << countersAfter[i]-countersBefore[i];
+            unsigned closed=0;
+            for(const auto& w:windowsAfter) if(w.second==computer->path && std::none_of(windowsBefore.begin(),windowsBefore.end(),
+                [&](const auto& old){return old.first==w.first;})) { PostMessageW(w.first,WM_CLOSE,0,0); ++closed; }
+            pump(300);
+            const auto remaining=folderWindows();
+            const bool restored=std::none_of(remaining.begin(),remaining.end(),[&](const auto& w) {
+                return w.second==computer->path && std::none_of(windowsBefore.begin(),windowsBefore.end(),[&](const auto& old){return old.first==w.first;});
+            });
+            computerOpenNoRefresh=computerOpenNoRefresh && restored;
+            report << " open_without_refresh=" << computerOpenNoRefresh << " new_windows_closed=" << closed << " closed_verified=" << restored << '\n'; report.flush();
+            report << "app_setting_notifications=";
+            for(const auto value:DesktopSurfaceWindowSmokeAccess::SettingNotifications(openSurface)) report << value << ",";
+            report << " scan_delta=" << DesktopScanner::ScanCountForTesting()-scanBefore << "\n";
+            report << "open_parent_paint_delta=" << DesktopSurfaceWindowSmokeAccess::NativeParentPaints(openSurface)-parentPaintsBefore << '\n';
+        }
+    }
+    report << "app_close_begin=1\n"; report.flush();
+    if(appMain && IsWindow(appMain)) {
+        PostMessageW(appMain,WM_CLOSE,0,0);
+        const ULONGLONG closeDeadline=GetTickCount64()+6000;
+        while(IsWindow(appMain) && GetTickCount64()<closeDeadline) pump(20);
+        report << "app_normal_close=" << !IsWindow(appMain) << '\n'; report.flush();
+        computerOpenNoRefresh=computerOpenNoRefresh && !IsWindow(appMain);
+    }
+    openAppOwner=nullptr;
+    openApp.reset();
+    report << "app_close_complete=1\n"; report.flush();
+    surface.Close(); SetCursorPos(savedCursor.x,savedCursor.y);
+    if(savedForeground && IsWindow(savedForeground)) SetForegroundWindow(savedForeground);
+    pump(100);
+    report << "original_positions_read_begin=1\n"; report.flush();
+    const bool positionsSame=layout.CaptureAllPositions(after,error) && before.size()==after.size() &&
+        std::all_of(before.begin(),before.end(),[&](const DesktopPosition& original) {
+            return std::any_of(after.begin(),after.end(),[&](const DesktopPosition& current) {
+                return original.path==current.path && original.point.x==current.point.x && original.point.y==current.point.y;
+            });
+        });
+    DesktopViewSnapshot final;
+    const bool sourceSame=layout.CaptureViewSnapshot(final,error) && final.viewFlags==source.viewFlags &&
+        IsWindowVisible(source.listViewWindow) && final.items.size()==source.items.size();
+    report << "source_flags=" << source.viewFlags << " final_flags=" << final.viewFlags << " source_count=" << source.items.size()
+        << " final_count=" << final.items.size() << " source_visible=" << IsWindowVisible(source.listViewWindow)
+        << " final_list_same=" << (source.listViewWindow==final.listViewWindow) << " snapshot_error=" << Utf8Text(error) << '\n';
+    report << "first=" << first << " second=" << second << " classified=" << classified << " returned=" << returned << " refreshed=" << refreshed
+        << " return_drag=" << returnDrag << " restart=" << restart << " restart_drag=" << restartDrag
+        << "failed_closed=" << failedClosed << " refresh_recovered=" << refreshRecovered << " positions_same=" << positionsSame << " source_same=" << sourceSame << '\n';
+    return ready&&hoverSame&&selectedSame&&keyboardFocus&&nativeRename&&renameCancelled&&menuObserved&&multiSelected&&marqueeSelected&&blankCleared&&multiDragPreserved&&nativeRefreshPreserved&&widgetLayerPreserved&&opened&&openWithoutRefresh&&computerOpenNoRefresh&&backgroundPreserved&&renamed&&first&&second&&classified&&returned&&returnDrag&&refreshed&&restart&&restartDrag&&failedClosed&&refreshRecovered&&positionsSame&&sourceSame ? 0:494;
+}
+
+int RunSmokeDesktopGridAndDragPlan() {
+    AttachParentConsole();
+    const std::vector<DesktopPosition> native{
+        {L"native-left", POINT{21, 2}},
+        {L"native-right", POINT{136, 2}},
+        {L"returned-from-widget", POINT{366, 2}}};
+    const std::vector<DesktopPosition> dropped{
+        {L"returned-from-widget", POINT{208, 149}}};
+    const RECT viewBounds{0, 0, 2560, 1440};
+    const auto raw = DesktopSurfaceWindowSmokeAccess::
+        ResolveVisiblePositionCollisions(
+            native, dropped, viewBounds, 115, 147);
+    const auto aligned = DesktopSurfaceWindowSmokeAccess::
+        ResolveVisiblePositionCollisions(
+            native, dropped, viewBounds, 115, 147, {}, true);
+    if (raw.size() != 3 || aligned.size() != 3 ||
+        raw[2].point.x != 208 || raw[2].point.y != 149 ||
+        aligned[2].point.x != 251 || aligned[2].point.y != 149 ||
+        aligned[0].point.x != native[0].point.x ||
+        aligned[1].point.x != native[1].point.x) {
+        return 401;
+    }
+    std::vector<DesktopPosition> plan;
+    const bool rawPlanAccepted = DesktopSurfaceWindowSmokeAccess::
+        PlanVisibleGridDrop(
+            raw, {raw[2]}, raw[2].point, POINT{323, 149},
+            viewBounds, 115, 147, 72, plan);
+    plan.clear();
+    const bool alignedPlanAccepted = DesktopSurfaceWindowSmokeAccess::
+        PlanVisibleGridDrop(
+            aligned, {aligned[2]}, aligned[2].point,
+            POINT{366, 149}, viewBounds, 115, 147, 72, plan);
+    if (rawPlanAccepted || !alignedPlanAccepted ||
+        plan.size() != 1 ||
+        plan.front().path != L"returned-from-widget" ||
+        plan.front().point.x != 366 ||
+        plan.front().point.y != 149) {
+        return 402;
+    }
+    std::wcout << L"Off-grid widget return rejected the next drag; "
+                  L"native-grid alignment restored its drop plan\n";
+    return 0;
 }
 
 int RunSmokeCollapseSelectionLogic(HINSTANCE instance) {
@@ -16418,6 +20295,20 @@ int RunSmokeCollapseSelectionLogic(HINSTANCE instance) {
         nativeDesktopPositions[0].point.x != 168 ||
         nativeDesktopPositions[1].point.x != 16) {
         std::wcerr << L"New desktop item overlapped an independent Lattice display position\n";
+        return 173;
+    }
+    const std::vector<DesktopPosition> offGridDisplayPosition{
+        {L"shell:::ThisPC", POINT{184, 100}}};
+    const auto snappedDisplayPositions =
+        DesktopSurfaceWindowSmokeAccess::ResolveVisiblePositionCollisions(
+            nativeDesktopPositions, offGridDisplayPosition,
+            RECT{0, 0, 320, 336}, 76, 84, {}, true);
+    if (snappedDisplayPositions.size() != nativeDesktopPositions.size() ||
+        snappedDisplayPositions[0].point.x != 168 ||
+        snappedDisplayPositions[0].point.y != 84 ||
+        nativeDesktopPositions[0].point.x != 168 ||
+        nativeDesktopPositions[0].point.y != 0) {
+        std::wcerr << L"Lattice display override did not use the native grid phase\n";
         return 173;
     }
     DesktopSurfaceWindow collisionSurface(instance);
@@ -19017,6 +22908,70 @@ int RunSmokeUnifiedHostProduction(HINSTANCE instance) {
         return 302;
     }
 
+    WidgetView* stableHoverView = DesktopSurfaceWindowSmokeAccess::HostedWidgetAt(surface, 0);
+    if (stableHoverView == nullptr) {
+        cleanup();
+        return 302;
+    }
+    const RECT stableHoverCell = stableHoverView->ItemHostCell(0);
+    const POINT stableHoverPoint{
+        (stableHoverCell.left + stableHoverCell.right) / 2,
+        (stableHoverCell.top + stableHoverCell.bottom) / 2};
+    if (DesktopSurfaceWindowSmokeAccess::HostedWidgetIndexAt(
+            surface, stableHoverPoint) < 0) {
+        cleanup();
+        return 302;
+    }
+    ShowWindow(hostWindow, SW_SHOWNOACTIVATE);
+    DesktopSurfaceWindowSmokeAccess::DispatchHostedMouse(surface, WM_MOUSEMOVE, 0, stableHoverPoint);
+    DesktopSurfaceWindowSmokeAccess::RenderDirtyProductionHost(surface);
+    int stableHoverRenders = 0;
+    const ULONGLONG stableHoverStart = GetTickCount64();
+    for (int step = 0; step < 100; ++step) {
+        const POINT jitter{stableHoverPoint.x + (step % 3) - 1,
+                           stableHoverPoint.y + ((step / 3) % 3) - 1};
+        DesktopSurfaceWindowSmokeAccess::DispatchHostedMouse(surface, WM_MOUSEMOVE, 0, jitter);
+        if (DesktopSurfaceWindowSmokeAccess::RenderDirtyProductionHost(surface)) {
+            ++stableHoverRenders;
+        }
+    }
+    const ULONGLONG stableHoverElapsed = GetTickCount64() - stableHoverStart;
+    std::wcout << L"STABLE_HOVER_RENDERS=" << stableHoverRenders
+               << L" STABLE_HOVER_MS=" << stableHoverElapsed << L"\n";
+    const RECT nextHoverCell = stableHoverView->ItemHostCell(1);
+    const RECT hoverBounds = stableHoverView->HostPixelBounds();
+    const std::array<POINT, 3> transitionPoints{{
+        POINT{(nextHoverCell.left + nextHoverCell.right) / 2,
+              (nextHoverCell.top + nextHoverCell.bottom) / 2},
+        POINT{hoverBounds.left + 100, hoverBounds.top + 12},
+        POINT{5, 5}}};
+    int transitionRenders = 0;
+    for (const POINT transitionPoint : transitionPoints) {
+        DesktopSurfaceWindowSmokeAccess::DispatchHostedMouse(
+            surface, WM_MOUSEMOVE, 0, transitionPoint);
+        transitionRenders += DesktopSurfaceWindowSmokeAccess::RenderDirtyProductionHost(
+            surface) ? 1 : 0;
+    }
+    ShowWindow(hostWindow, SW_HIDE);
+    if (transitionRenders != 3) {
+        cleanup();
+        std::wcerr << L"Hosted hover visual transitions were not repainted\n";
+        return 323;
+    }
+    std::wstring hoverItemsDir(32768, L'\0');
+    const DWORD hoverItemsDirLength = GetEnvironmentVariableW(
+        L"DESKTOP_ORGANIZER_SMOKE_ITEMS_DIR", hoverItemsDir.data(),
+        static_cast<DWORD>(hoverItemsDir.size()));
+    if (hoverItemsDirLength > 0 && hoverItemsDirLength < hoverItemsDir.size()) {
+        hoverItemsDir.resize(hoverItemsDirLength);
+        std::ofstream hoverLedger(
+            std::filesystem::path(hoverItemsDir) / L"stable-hover.txt",
+            std::ios::trunc);
+        hoverLedger << "renders=" << stableHoverRenders
+                    << " elapsed_ms=" << stableHoverElapsed
+                    << " transition_renders=" << transitionRenders << '\n';
+    }
+
     const std::array<std::pair<int, HostedWidgetCommandType>, 6>
         headerButtons{{
             {12, HostedWidgetCommandType::ToggleCollapsed},
@@ -19954,10 +23909,26 @@ std::optional<int> RunSmokeOrPreviewCommand(
     if (HasArgument(commandLine, L"--smoke-resource-idle")) {
         return RunSmokeResourceIdle(instance);
     }
+    if (HasArgument(commandLine, L"--smoke-wallpaper-async")) {
+        return RunSmokeWallpaperAsync(instance);
+    }
     if (HasArgument(
             commandLine,
             L"--smoke-collapse-selection-logic")) {
         return RunSmokeCollapseSelectionLogic(instance);
+    }
+    if (HasArgument(commandLine, L"--smoke-native-desktop-host")) {
+        return RunSmokeNativeDesktopHost(instance);
+    }
+    if (HasArgument(
+            commandLine,
+            L"--smoke-desktop-grid-and-drag-plan")) {
+        return RunSmokeDesktopGridAndDragPlan();
+    }
+    if (HasArgument(
+            commandLine,
+            L"--smoke-desktop-native-selection-oracle")) {
+        return RunSmokeDesktopNativeSelectionOracle(instance);
     }
     if (HasArgument(
             commandLine,

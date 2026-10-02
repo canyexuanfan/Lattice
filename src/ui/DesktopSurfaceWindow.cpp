@@ -12,6 +12,7 @@
 #include <cmath>
 #include <limits>
 #include <map>
+#include <mutex>
 #include <set>
 
 #include "shell/ShellDragDrop.h"
@@ -20,7 +21,20 @@
 #include "ui/MessageDialog.h"
 #include "ui/WidgetAlignment.h"
 
+struct DesktopWallpaperAsyncState {
+    std::atomic<bool> active{true};
+    std::atomic<std::uint64_t> revision{0};
+    std::mutex mutex;
+    WallpaperBackdrop::PreparedPixels completed;
+    std::uint64_t completedRevision = 0;
+    bool succeeded = false;
+    UINT_PTR token = 0;
+};
+
 namespace {
+
+std::atomic<UINT_PTR> nextWallpaperLifetimeToken{0};
+constexpr UINT kWallpaperReadyMessage = WM_APP + 45;
 
 constexpr wchar_t kDesktopSurfaceClassName[] =
     L"Lattice.DesktopSurfaceWindow";
@@ -28,6 +42,9 @@ constexpr UINT kIconReadyMessage = WM_APP + 41;
 constexpr UINT kFinishRenameMessage = WM_APP + 42;
 constexpr UINT kCancelRenameMessage = WM_APP + 43;
 constexpr UINT kBeginRenameMessage = WM_APP + 44;
+#ifndef NDEBUG
+constexpr UINT kS0ReadOnlyRefreshDiagnosticMessage = WM_APP + 47;
+#endif
 constexpr UINT_PTR kRenameTimerId = 0x52454E41;
 constexpr UINT_PTR kWallpaperRecoveryTimerId = 0x57414C4C;
 constexpr UINT kWallpaperRecoveryDelayMilliseconds = 80;
@@ -139,6 +156,9 @@ public:
         ResetExternalRoute(true);
         internalDrag_ = owner_ != nullptr && owner_->internalDragActive_;
 #ifndef NDEBUG
+        if (owner_) SetPropW(owner_->Window(), L"Lattice.NativeDropStage", reinterpret_cast<HANDLE>(1));
+#endif
+#ifndef NDEBUG
         if (internalDrag_) {
             owner_->internalDropStage_ =
                 DesktopSurfaceWindow::InternalDropStage::DragEntered;
@@ -161,6 +181,9 @@ public:
         }
         POINT screenPoint{point.x, point.y};
         GetPhysicalCursorPos(&screenPoint);
+#ifndef NDEBUG
+        if (owner_) SetPropW(owner_->Window(), L"Lattice.NativeDropStage", reinterpret_cast<HANDLE>(2));
+#endif
         if (dragImageHelper_ != nullptr && owner_ != nullptr) {
             dragImageHelper_->DragEnter(
                 owner_->Window(),
@@ -222,6 +245,9 @@ public:
             return E_POINTER;
         }
         POINT screenPoint{point.x, point.y};
+#ifndef NDEBUG
+        if (owner_) SetPropW(owner_->Window(), L"Lattice.NativeDropStage", reinterpret_cast<HANDLE>(3));
+#endif
         POINT imagePoint = screenPoint;
         GetPhysicalCursorPos(&imagePoint);
         if (!internalDrag_) {
@@ -282,6 +308,9 @@ public:
         }
         HRESULT routedResult = RouteInternalDrag(
             dataObject, keyState, point, effect);
+#ifndef NDEBUG
+        if (owner_) SetPropW(owner_->Window(), L"Lattice.NativeDropStage", reinterpret_cast<HANDLE>(4));
+#endif
         internalDrag_ = false;
         if (dragImageHelper_ != nullptr) {
             dragImageHelper_->Drop(
@@ -345,7 +374,9 @@ public:
                 positioned = owner_->CommitInternalDesktopDrop(screenPoint);
             }
         }
-        *effect = positioned ? DROPEFFECT_MOVE : DROPEFFECT_NONE;
+        // A display/membership transaction does not move the Shell source item.
+        // ResultsFolder removes a source result after MOVE, so retain it here.
+        *effect = positioned && !owner_->nativeDragSession_ ? DROPEFFECT_MOVE : DROPEFFECT_NONE;
         ResetInternalItemTarget(false);
         internalDataObject_.Reset();
         internalAllowedEffects_ = DROPEFFECT_NONE;
@@ -621,6 +652,18 @@ private:
 
 DesktopSurfaceWindow::DesktopSurfaceWindow(HINSTANCE instance)
     : instance_(instance) {
+#ifndef NDEBUG
+    wchar_t enabled[2]{};
+    s0TraceEnabled_ = GetEnvironmentVariableW(
+        L"DESKTOP_ORGANIZER_S0_TRACE", enabled, ARRAYSIZE(enabled)) == 1 &&
+        enabled[0] == L'1';
+    if (s0TraceEnabled_) {
+        LARGE_INTEGER frequency{};
+        QueryPerformanceFrequency(&frequency);
+        s0QpcFrequency_ = static_cast<std::uint64_t>(frequency.QuadPart);
+        s0FrameMicroseconds_.reserve(4096);
+    }
+#endif
 }
 
 #ifndef NDEBUG
@@ -795,15 +838,6 @@ bool DesktopSurfaceWindow::Create(
             PostMessageW(window, kIconReadyMessage, 0, 0);
         }
     });
-    for (const DesktopViewItem& item : visibleItems_) {
-        iconCache_.PreloadShellIcon(
-            item.path,
-            item.systemImageIndex,
-            item.overlayIndex,
-            iconSize_,
-            &item.shellChildPidl,
-            snapshot_.viewIconSize);
-    }
     wallpaperReadyForTarget_ = false;
     if (!wallpaper_.Refresh(
             hwnd_, d2d_.Target(), width, height, false)) {
@@ -813,17 +847,47 @@ bool DesktopSurfaceWindow::Create(
         return false;
     }
     wallpaperReadyForTarget_ = true;
-    if (!InstallKeyboardHook()) {
-        errorMessage =
-            L"无法建立桌面F2键盘路由。";
-        Close();
-        return false;
-    }
     MaintainDesktopLayer();
+    nativeDesktop_.Attach(new (std::nothrow) NativeDesktopView());
+    if (!nativeDesktop_ || !nativeDesktop_->Create(snapshot_, hwnd_, desktopDropTarget_.Get(),
+        [this](bool ready) {
+            if (!ready) {
+                if (hwnd_) ShowWindow(hwnd_, SW_HIDE);
+                StartWallpaperRecovery(true);
+            } else if (nativeShowRequested_) {
+                Show();
+            }
+        },
+        [this](const std::vector<std::wstring>& identities, POINT screen, bool entering) {
+            nativeDragSession_ = entering;
+            if (!entering) { EndInternalDragSession(); return; }
+            selectedIdentities_.clear();
+            for (const auto& identity : identities) AddSelected(identity);
+            POINT client = screen;
+            if (ScreenToClient(hwnd_, &client)) BeginInternalDragSession(client);
+        }, errorMessage)) {
+        Close(); return false;
+    }
+    nativeDesktop_->SetRenameHandler([this](const std::wstring& previous,const std::wstring& identity,const std::wstring& name) {
+        DesktopShellRenameResult renamed;
+        renamed.disposition=ShellRenameDisposition::Renamed;
+        if(FAILED(CreateDesktopShellItemReference(identity,renamed.item)) || !renameCommitHandler_ ||
+            !renameCommitHandler_(previous,identity,name)) return false;
+        renamed.displayName=name;
+        ReplaceRenamedIdentity(previous,renamed);
+        UpdateNativeDesktop(); return true;
+    });
+    UpdateNativeDesktop();
+    UpdateNativeWidgetRegion();
     return true;
 }
 
+bool DesktopSurfaceWindow::PreTranslateMessage(MSG& message) {
+    return nativeDesktop_ && nativeDesktop_->TranslateMessage(message);
+}
+
 void DesktopSurfaceWindow::Show() {
+    nativeShowRequested_ = true;
     if (hwnd_ == nullptr) {
         return;
     }
@@ -833,6 +897,11 @@ void DesktopSurfaceWindow::Show() {
         return;
     }
     wallpaperRecoveryHidden_ = false;
+    if (nativeDesktop_) {
+        nativeDesktop_->Show(true);
+        if (!nativeDesktop_->Ready()) return;
+        UpdateNativeWidgetRegion();
+    }
     ShowWindow(hwnd_, SW_SHOWNOACTIVATE);
     MaintainDesktopLayer();
     RedrawWindow(
@@ -841,6 +910,8 @@ void DesktopSurfaceWindow::Show() {
 }
 
 void DesktopSurfaceWindow::Hide() {
+    nativeShowRequested_ = false;
+    if (nativeDesktop_) nativeDesktop_->Show(false);
     if (hwnd_ != nullptr) {
         ResetHostedPointerGesture();
         wallpaperRecoveryHidden_ = false;
@@ -856,7 +927,7 @@ void DesktopSurfaceWindow::UpdateAssignedIdentities(
     const std::vector<std::wstring>& assignedIdentities) {
     assignedIdentities_ = assignedIdentities;
     RebuildVisibleItems();
-    for (const DesktopViewItem& item : visibleItems_) {
+    if (!nativeDesktop_) for (const DesktopViewItem& item : visibleItems_) {
         iconCache_.PreloadShellIcon(
             item.path,
             item.systemImageIndex,
@@ -915,6 +986,77 @@ void DesktopSurfaceWindow::SetDisplayPositionCommitHandler(
 void DesktopSurfaceWindow::SetRenameCommitHandler(
     RenameCommitHandler handler) {
     renameCommitHandler_ = std::move(handler);
+}
+
+bool DesktopSurfaceWindow::PlanReturnedDisplayPosition(
+    const std::wstring& identity,
+    POINT requestedViewPoint,
+    POINT& resolvedViewPoint) const {
+    resolvedViewPoint = requestedViewPoint;
+    if ((snapshot_.viewFlags & FWF_SNAPTOGRID) == 0) {
+        return true;
+    }
+    if (snapshot_.listViewWindow == nullptr ||
+        IsWindow(snapshot_.listViewWindow) == FALSE ||
+        cellWidth_ <= 0 || cellHeight_ <= 0) {
+        return false;
+    }
+    const auto returning = std::find_if(
+        snapshot_.items.begin(), snapshot_.items.end(),
+        [&](const DesktopViewItem& item) {
+            return IdentitiesEqual(item.path, identity);
+        });
+    if (returning == snapshot_.items.end()) return false;
+    std::vector<DesktopPosition> nativePositions;
+    std::vector<DesktopPosition> displayOverrides;
+    nativePositions.reserve(visibleItems_.size() + 1);
+    displayOverrides.reserve(positionOverrides_.size() + 1);
+    const auto include = [&](const DesktopViewItem& item) {
+        POINT nativePoint = item.viewPoint;
+        const auto override = std::find_if(
+            positionOverrides_.begin(), positionOverrides_.end(),
+            [&](const PositionOverride& value) {
+                return IdentitiesEqual(value.identity, item.path);
+            });
+        if (override != positionOverrides_.end()) {
+            nativePoint = override->nativeScreenPoint;
+            if (ScreenToClient(snapshot_.listViewWindow,
+                    &nativePoint) == FALSE) {
+                return false;
+            }
+            displayOverrides.push_back(
+                DesktopPosition{item.path, override->viewPoint});
+        }
+        nativePositions.push_back(
+            DesktopPosition{item.path, nativePoint});
+        return true;
+    };
+    for (const DesktopViewItem& item : visibleItems_) {
+        if (!include(item)) return false;
+    }
+    if (!include(*returning)) return false;
+    displayOverrides.erase(std::remove_if(
+        displayOverrides.begin(), displayOverrides.end(),
+        [&](const DesktopPosition& position) {
+            return IdentitiesEqual(position.path, identity);
+        }), displayOverrides.end());
+    displayOverrides.push_back(
+        DesktopPosition{identity, requestedViewPoint});
+    const RECT viewBounds{
+        0, 0,
+        snapshot_.screenRect.right - snapshot_.screenRect.left,
+        snapshot_.screenRect.bottom - snapshot_.screenRect.top};
+    const auto resolved = ResolveVisiblePositionCollisions(
+        nativePositions, displayOverrides, viewBounds,
+        cellWidth_, cellHeight_, {}, true);
+    const auto placement = std::find_if(
+        resolved.begin(), resolved.end(),
+        [&](const DesktopPosition& position) {
+            return IdentitiesEqual(position.path, identity);
+        });
+    if (placement == resolved.end()) return false;
+    resolvedViewPoint = placement->point;
+    return true;
 }
 
 void DesktopSurfaceWindow::PresentUnassignedItemAt(
@@ -979,6 +1121,13 @@ void DesktopSurfaceWindow::ConfirmUnassignedItemAt(
 }
 
 void DesktopSurfaceWindow::Close() {
+    nativeShowRequested_ = false;
+    nativeDragSession_ = false;
+    if (nativeDesktop_) nativeDesktop_->Close();
+    nativeDesktop_.Reset();
+    nativeWidgetRegion_.clear();
+    nativeWidgetRegionSet_ = false;
+    CancelAsyncWallpaperRefresh(true);
     ResetHostedPointerGesture();
     StopWallpaperRecovery();
     RemoveKeyboardHook();
@@ -1015,6 +1164,10 @@ void DesktopSurfaceWindow::Close() {
 }
 
 bool DesktopSurfaceWindow::RefreshWallpaperForCurrentTarget() {
+#ifndef NDEBUG
+    ++debugWallpaperRefreshes_;
+#endif
+    CancelAsyncWallpaperRefresh(false);
     if (hwnd_ == nullptr || d2d_.Target() == nullptr) {
         return false;
     }
@@ -1029,13 +1182,134 @@ bool DesktopSurfaceWindow::RefreshWallpaperForCurrentTarget() {
     }
     wallpaperReadyForTarget_ = true;
     StopWallpaperRecovery();
+    if (nativeDesktop_) nativeDesktop_->RefreshWallpaper();
     if (wallpaperRecoveryHidden_) {
         wallpaperRecoveryHidden_ = false;
-        ShowWindow(hwnd_, SW_SHOWNOACTIVATE);
-        MaintainDesktopLayer();
+        if (nativeShowRequested_) Show();
     }
     InvalidateRect(hwnd_, nullptr, FALSE);
     return true;
+}
+
+void DesktopSurfaceWindow::CancelAsyncWallpaperRefresh(bool close) {
+    wallpaperRefreshRequested_ = false;
+    wallpaperAsyncRecovery_ = false;
+    if (wallpaperAsyncState_ != nullptr) {
+        ++wallpaperAsyncState_->revision;
+        if (close) {
+            const auto state = wallpaperAsyncState_;
+            std::lock_guard<std::mutex> lock(state->mutex);
+            state->active = false;
+            state->completed = {};
+            wallpaperAsyncState_.reset();
+            wallpaperAsyncRunning_ = false;
+            wallpaperAsyncTarget_ = nullptr;
+        }
+    }
+}
+
+void DesktopSurfaceWindow::QueueWallpaperRefresh() {
+    if (hwnd_ == nullptr) { return; }
+    if (wallpaperAsyncState_ == nullptr) {
+        wallpaperAsyncState_ = std::make_shared<DesktopWallpaperAsyncState>();
+        wallpaperAsyncState_->token = ++nextWallpaperLifetimeToken;
+    }
+    ++wallpaperAsyncState_->revision;
+    wallpaperRefreshRequested_ = true;
+    wallpaperAsyncRecovery_ = true;
+    if (!wallpaperAsyncRunning_) { StartAsyncWallpaperRefresh(); }
+}
+
+void DesktopSurfaceWindow::StartAsyncWallpaperRefresh() {
+    if (hwnd_ == nullptr || wallpaperAsyncState_ == nullptr ||
+        wallpaperAsyncRunning_) { return; }
+    WallpaperBackdrop::PrepareInput input;
+    if (d2d_.Target() == nullptr || !WallpaperBackdrop::CapturePrepareInput(
+            hwnd_, snapshot_.screenRect.right - snapshot_.screenRect.left,
+            snapshot_.screenRect.bottom - snapshot_.screenRect.top, false, input)) {
+        StartWallpaperRecovery(!wallpaperReadyForTarget_);
+        return;
+    }
+    const auto state = wallpaperAsyncState_;
+    const auto revision = state->revision.load();
+    const HWND owner = hwnd_;
+    wallpaperAsyncTarget_ = d2d_.Target();
+    wallpaperAsyncRunning_ = true;
+    wallpaperRefreshRequested_ = false;
+    const bool submitted = IconCache::SubmitWallpaperWork([state, revision, owner, input]() {
+        WallpaperBackdrop::PreparedPixels prepared;
+        bool succeeded = false;
+        try {
+            const auto cancelled = [state, revision]() {
+                return !state->active.load() || state->revision.load() != revision;
+            };
+            if (!cancelled()) {
+                succeeded = WallpaperBackdrop::PreparePixels(input, prepared, false, cancelled);
+            }
+        } catch (...) {
+            succeeded = false;
+        }
+        std::lock_guard<std::mutex> lock(state->mutex);
+        if (!state->active.load()) { return; }
+        state->completed = std::move(prepared);
+        state->completedRevision = revision;
+        state->succeeded = succeeded;
+        PostMessageW(owner, kWallpaperReadyMessage, state->token, 0);
+    });
+    if (!submitted) {
+        wallpaperAsyncRunning_ = false;
+        wallpaperRefreshRequested_ = true;
+        StartWallpaperRecovery(!wallpaperReadyForTarget_);
+    }
+}
+
+void DesktopSurfaceWindow::HandleAsyncWallpaperReady(WPARAM token) {
+    if (wallpaperAsyncState_ == nullptr || token != wallpaperAsyncState_->token) { return; }
+    const auto state = wallpaperAsyncState_;
+    WallpaperBackdrop::PreparedPixels prepared;
+    std::uint64_t revision = 0;
+    bool succeeded = false;
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        prepared = std::move(state->completed);
+        revision = state->completedRevision;
+        succeeded = state->succeeded;
+    }
+    wallpaperAsyncRunning_ = false;
+    if (revision != state->revision.load()) {
+        if (wallpaperRefreshRequested_) { StartAsyncWallpaperRefresh(); }
+        return;
+    }
+    WallpaperBackdrop::PrepareInput current;
+    const bool currentGeometry = WallpaperBackdrop::CapturePrepareInput(hwnd_,
+        snapshot_.screenRect.right - snapshot_.screenRect.left,
+        snapshot_.screenRect.bottom - snapshot_.screenRect.top, false, current) &&
+        current.origin.x == prepared.input.origin.x && current.origin.y == prepared.input.origin.y &&
+        current.size.cx == prepared.input.size.cx && current.size.cy == prepared.input.size.cy &&
+        current.dpi == prepared.input.dpi;
+    if (succeeded && (wallpaperAsyncTarget_ != d2d_.Target() || !currentGeometry)) {
+        QueueWallpaperRefresh();
+        return;
+    }
+    if (succeeded && wallpaper_.CommitPreparedPixels(d2d_.Target(), prepared)) {
+        wallpaperReadyForTarget_ = true;
+        StopWallpaperRecovery();
+        if (nativeDesktop_) nativeDesktop_->RefreshWallpaper();
+        wallpaperAsyncRecovery_ = false;
+        if (wallpaperRecoveryHidden_) {
+            wallpaperRecoveryHidden_ = false;
+            if (nativeShowRequested_) Show();
+        }
+        InvalidateRect(hwnd_, nullptr, FALSE);
+        MaintainDesktopLayer();
+#ifndef NDEBUG
+        SetPropW(hwnd_, L"Lattice.S0.WallpaperGeneration",
+            reinterpret_cast<HANDLE>(static_cast<UINT_PTR>(wallpaper_.Generation())));
+#endif
+        return;
+    }
+    wallpaperRefreshRequested_ = true;
+    StartWallpaperRecovery(!wallpaperReadyForTarget_);
 }
 
 void DesktopSurfaceWindow::StartWallpaperRecovery(bool hideSurface) {
@@ -1043,6 +1317,7 @@ void DesktopSurfaceWindow::StartWallpaperRecovery(bool hideSurface) {
         return;
     }
     if (hideSurface) {
+        if (nativeDesktop_) nativeDesktop_->Show(false);
         if (IsWindowVisible(hwnd_) != FALSE) {
             ShowWindow(hwnd_, SW_HIDE);
         }
@@ -1077,6 +1352,17 @@ void DesktopSurfaceWindow::HandleWallpaperRecoveryTimer() {
         return;
     }
     KillTimer(hwnd_, kWallpaperRecoveryTimerId);
+    if (wallpaperAsyncRecovery_) {
+        if (wallpaperAsyncRunning_) { return; }
+        ++wallpaperRecoveryAttempts_;
+        if (wallpaperRecoveryAttempts_ >= kWallpaperRecoveryAttemptLimit) {
+            wallpaperRecoveryActive_ = false;
+            wallpaperRefreshRequested_ = false;
+            return;
+        }
+        StartAsyncWallpaperRefresh();
+        return;
+    }
     if (RefreshWallpaperForCurrentTarget()) {
         RedrawWindow(
             hwnd_, nullptr, nullptr,
@@ -1113,6 +1399,9 @@ void DesktopSurfaceWindow::RecoverWallpaperAfterRenderFailure() {
 bool DesktopSurfaceWindow::Refresh(
     std::wstring& errorMessage,
     bool refreshWallpaper) {
+#ifndef NDEBUG
+    ++debugRefreshRequests_;
+#endif
     if (hwnd_ == nullptr) {
         errorMessage = L"Lattice 桌面显示接管尚未创建。";
         return false;
@@ -1197,7 +1486,7 @@ bool DesktopSurfaceWindow::Refresh(
         SetItemScreenPoint(value.identity, value.screenPoint);
     }
     RebuildVisibleItems(newlyObserved);
-    for (const DesktopViewItem& item : visibleItems_) {
+    if (!nativeDesktop_) for (const DesktopViewItem& item : visibleItems_) {
         iconCache_.PreloadShellIcon(
             item.path,
             item.systemImageIndex,
@@ -1225,6 +1514,10 @@ bool DesktopSurfaceWindow::Refresh(
         parentOrigin.y, width, height,
         SWP_NOZORDER | SWP_NOACTIVATE);
     d2d_.Resize(static_cast<UINT>(width), static_cast<UINT>(height));
+    if (nativeDesktop_ && !nativeDesktop_->Resize(snapshot_)) {
+        errorMessage = L"原生桌面视图几何已失效，覆盖层已撤下。";
+        return false;
+    }
     if (refreshWallpaper && !RefreshWallpaperForCurrentTarget()) {
         StartWallpaperRecovery(!wallpaperReadyForTarget_);
         errorMessage =
@@ -1517,20 +1810,24 @@ LRESULT DesktopSurfaceWindow::HandleMessage(
                 return 0;
             }
             const int hostedIndex = HostedWidgetIndexAt(current);
+            bool visualChanged = false;
             for (size_t index = 0; index < hostedWidgets_.size(); ++index) {
                 if (hostedWidgets_[index] != nullptr) {
-                    hostedWidgets_[index]->view.SetVisualPointerState(
+                    visualChanged = hostedWidgets_[index]->view.SetVisualPointerState(
                         static_cast<int>(index) == hostedIndex
                             ? current
-                            : POINT{LONG_MIN, LONG_MIN});
+                            : POINT{LONG_MIN, LONG_MIN}) || visualChanged;
                 }
             }
             if (hostedIndex >= 0) {
+                visualChanged = visualChanged || hoverIndex_ != -1;
                 hoverIndex_ = -1;
                 TRACKMOUSEEVENT track{
                     sizeof(track), TME_LEAVE, hwnd_, HOVER_DEFAULT};
                 TrackMouseEvent(&track);
-                InvalidateRect(hwnd_, nullptr, FALSE);
+                if (visualChanged) {
+                    InvalidateRect(hwnd_, nullptr, FALSE);
+                }
                 return 0;
             }
             if (pointerGesture_ != PointerGesture::None &&
@@ -1576,7 +1873,7 @@ LRESULT DesktopSurfaceWindow::HandleMessage(
                 return 0;
             }
             const int hover = HitTest(current);
-            if (hover != hoverIndex_) {
+            if (hover != hoverIndex_ || visualChanged) {
                 hoverIndex_ = hover;
                 InvalidateRect(hwnd_, nullptr, FALSE);
             }
@@ -1850,10 +2147,10 @@ LRESULT DesktopSurfaceWindow::HandleMessage(
                 CancelPointerCapture();
                 InvalidateRect(hwnd_, nullptr, FALSE);
 #ifndef NDEBUG
+                ++desktopOpenRequestCountForSmoke_;
+                desktopOpenPathForSmoke_ =
+                    visibleItems_[static_cast<size_t>(index)].path;
                 if (suppressDesktopOpenForSmoke_) {
-                    ++desktopOpenRequestCountForSmoke_;
-                    desktopOpenPathForSmoke_ =
-                        visibleItems_[static_cast<size_t>(index)].path;
                     return 0;
                 }
 #endif
@@ -1944,6 +2241,10 @@ LRESULT DesktopSurfaceWindow::HandleMessage(
                         selectedItems.front(), canRename);
                 }
                 InvalidateRect(hwnd_, nullptr, FALSE);
+#ifndef NDEBUG
+                ++desktopMenuRequestCountForSmoke_;
+                desktopMenuPathForSmoke_ = identity;
+#endif
                 const ShellContextMenuResult menuResult =
                     launcher_.ShowDesktopContextMenu(
                     hwnd_,
@@ -1991,13 +2292,36 @@ LRESULT DesktopSurfaceWindow::HandleMessage(
             }
             break;
         }
-        case WM_DISPLAYCHANGE:
-        case WM_SETTINGCHANGE: {
+        case kWallpaperReadyMessage:
+            HandleAsyncWallpaperReady(wParam);
+            return 0;
+#ifndef NDEBUG
+        case kS0ReadOnlyRefreshDiagnosticMessage: {
+            wchar_t allowed[2]{};
+            if (GetEnvironmentVariableW(L"DESKTOP_ORGANIZER_S0_WALLPAPER_DIAGNOSTIC",
+                    allowed, ARRAYSIZE(allowed)) == 1 && allowed[0] == L'1') {
+                std::wstring ignored;
+                Refresh(ignored);
+            }
+            return 0;
+        }
+#endif
+        case WM_SETTINGCHANGE:
+#ifndef NDEBUG
+            if(debugSettingNotifications_.size()<32) debugSettingNotifications_.push_back(static_cast<UINT>(wParam));
+#endif
+            if (wParam == SPI_SETDESKWALLPAPER) {
+                QueueWallpaperRefresh();
+                return 0;
+            }
+            [[fallthrough]];
+        case WM_DISPLAYCHANGE: {
             std::wstring ignored;
             Refresh(ignored);
             return 0;
         }
         case WM_DESTROY:
+            CancelAsyncWallpaperRefresh(true);
             StopWallpaperRecovery();
             RemoveKeyboardHook();
             CancelPendingRename();
@@ -2029,8 +2353,30 @@ LRESULT DesktopSurfaceWindow::HandleMessage(
 }
 
 void DesktopSurfaceWindow::Render() {
+    if (nativeDesktop_) UpdateNativeWidgetRegion();
+#ifndef NDEBUG
+    LARGE_INTEGER s0FrameStarted{};
+    if (s0TraceEnabled_) {
+        QueryPerformanceCounter(&s0FrameStarted);
+    }
+#endif
     PAINTSTRUCT paint{};
     BeginPaint(hwnd_, &paint);
+#ifndef NDEBUG
+    if (s0TraceEnabled_) {
+        RECT client{};
+        GetClientRect(hwnd_, &client);
+        ++s0RenderCount_;
+        s0DrawPixels_ += static_cast<std::uint64_t>(
+            std::max(0L, client.right - client.left)) *
+            static_cast<std::uint64_t>(
+                std::max(0L, client.bottom - client.top));
+        s0DirtyPixels_ += static_cast<std::uint64_t>(
+            std::max(0L, paint.rcPaint.right - paint.rcPaint.left)) *
+            static_cast<std::uint64_t>(
+                std::max(0L, paint.rcPaint.bottom - paint.rcPaint.top));
+    }
+#endif
     ID2D1HwndRenderTarget* target = d2d_.Target();
     if (target == nullptr || !wallpaperReadyForTarget_ ||
         !wallpaper_.HasBitmap()) {
@@ -2057,6 +2403,7 @@ void DesktopSurfaceWindow::Render() {
         return;
     }
 
+    if (!nativeDesktop_) {
     Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> textBrush;
     Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> shadowBrush;
     Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> selectionBrush;
@@ -2209,6 +2556,7 @@ void DesktopSurfaceWindow::Render() {
             D2D1_DRAW_TEXT_OPTIONS_CLIP);
         target->PopAxisAlignedClip();
     }
+    }
     for (const auto& hosted : hostedWidgets_) {
         if (hosted != nullptr && hosted->descriptor.visible) {
             hosted->view.Draw(d2d_, iconCache_);
@@ -2221,6 +2569,17 @@ void DesktopSurfaceWindow::Render() {
 #endif
     const HRESULT result = d2d_.EndDraw();
     EndPaint(hwnd_, &paint);
+#ifndef NDEBUG
+    if (s0TraceEnabled_ && s0QpcFrequency_ != 0 &&
+        s0FrameMicroseconds_.size() < 4096) {
+        LARGE_INTEGER completed{};
+        QueryPerformanceCounter(&completed);
+        s0FrameMicroseconds_.push_back(
+            static_cast<std::uint64_t>(
+                completed.QuadPart - s0FrameStarted.QuadPart) *
+            1000000 / s0QpcFrequency_);
+    }
+#endif
     if (FAILED(result)) {
         RecoverWallpaperAfterRenderFailure();
     }
@@ -2322,6 +2681,7 @@ bool DesktopSurfaceWindow::ApplyHostedWidgets(
     }
     ResetHostedPointerGesture();
     hostedWidgets_.swap(candidate);
+    if (nativeDesktop_) UpdateNativeWidgetRegion();
     activeHostedWidgetIndex_ = -1;
     if (!activeCategory.empty()) {
         for (size_t index = 0; index < hostedWidgets_.size(); ++index) {
@@ -2343,6 +2703,7 @@ bool DesktopSurfaceWindow::ApplyHostedWidgets(
 void DesktopSurfaceWindow::ClearHostedWidgets() {
     ResetHostedPointerGesture();
     hostedWidgets_.clear();
+    if (nativeDesktop_) UpdateNativeWidgetRegion();
     activeHostedWidgetIndex_ = -1;
     if (hwnd_ != nullptr && IsWindow(hwnd_) != FALSE) {
         InvalidateRect(hwnd_, nullptr, FALSE);
@@ -3314,14 +3675,29 @@ bool DesktopSurfaceWindow::SendListViewQuery(
         messageBuffer = listViewQueryBuffer_;
     }
     DWORD_PTR rawResult = 0;
-    if (SendMessageTimeoutW(
+#ifndef NDEBUG
+    LARGE_INTEGER s0QueryStarted{};
+    if (s0TraceEnabled_) { QueryPerformanceCounter(&s0QueryStarted); }
+#endif
+    const LRESULT queryDelivered = SendMessageTimeoutW(
             snapshot_.listViewWindow,
             message,
             wParam,
             reinterpret_cast<LPARAM>(messageBuffer),
             SMTO_ABORTIFHUNG | SMTO_BLOCK | SMTO_ERRORONEXIT,
             kListViewQueryTimeoutMilliseconds,
-            &rawResult) == 0) {
+            &rawResult);
+#ifndef NDEBUG
+    if (s0TraceEnabled_ && s0QpcFrequency_ != 0) {
+        LARGE_INTEGER s0QueryEnded{};
+        QueryPerformanceCounter(&s0QueryEnded);
+        ++s0NativeQueryCount_;
+        s0NativeQueryMaxMs_ = (std::max)(s0NativeQueryMaxMs_,
+            1000.0 * static_cast<double>(s0QueryEnded.QuadPart - s0QueryStarted.QuadPart) /
+            static_cast<double>(s0QpcFrequency_));
+    }
+#endif
+    if (queryDelivered == 0) {
         return false;
     }
     if (currentProcessId != GetCurrentProcessId()) {
@@ -4414,8 +4790,9 @@ void DesktopSurfaceWindow::ReplaceRenamedIdentity(
         AddSelected(renamedItem.item.path);
     }
     RebuildVisibleItems();
-    SynchronizeExplorerSelection();
-    iconCache_.Alias(
+    if (!nativeDesktop_) {
+        SynchronizeExplorerSelection();
+        iconCache_.Alias(
         previousIdentity,
         renamedItem.item.path,
         systemImageIndex,
@@ -4430,6 +4807,7 @@ void DesktopSurfaceWindow::ReplaceRenamedIdentity(
         iconSize_,
         &renamedItem.item.desktopChildPidl,
         snapshot_.viewIconSize);
+    }
     if (hwnd_ != nullptr) {
         InvalidateRect(hwnd_, nullptr, FALSE);
     }
@@ -4477,7 +4855,8 @@ DesktopSurfaceWindow::ResolveVisiblePositionCollisions(
     const RECT& viewBounds,
     int cellWidth,
     int cellHeight,
-    const std::vector<std::wstring>& newlyObserved) {
+    const std::vector<std::wstring>& newlyObserved,
+    bool snapDisplayOverridesToGrid) {
     std::vector<DesktopPosition> resolved = nativePositions;
     if (nativePositions.empty() || cellWidth <= 0 || cellHeight <= 0 ||
         viewBounds.right <= viewBounds.left ||
@@ -4515,6 +4894,18 @@ DesktopSurfaceWindow::ResolveVisiblePositionCollisions(
         nativeAnchor->point.x - viewBounds.left, cellWidth);
     const int firstY = viewBounds.top + remainder(
         nativeAnchor->point.y - viewBounds.top, cellHeight);
+    const auto snapToAxis = [](int coordinate, int first,
+                               int spacing, int limit) {
+        const int count = (limit - first) / spacing;
+        if (count <= 0) {
+            return coordinate;
+        }
+        const int index = std::clamp(
+            static_cast<int>(std::lround(
+                static_cast<double>(coordinate - first) / spacing)),
+            0, count - 1);
+        return first + index * spacing;
+    };
     std::vector<POINT> occupied;
     occupied.reserve(nativePositions.size());
     std::vector<bool> placed(nativePositions.size(), false);
@@ -4534,6 +4925,12 @@ DesktopSurfaceWindow::ResolveVisiblePositionCollisions(
         const auto preferred = overrideFor(nativePositions[index].path);
         if (preferred != displayOverrides.end()) {
             point = preferred->point;
+            if (snapDisplayOverridesToGrid && inside(point)) {
+                point.x = snapToAxis(
+                    point.x, firstX, cellWidth, viewBounds.right);
+                point.y = snapToAxis(
+                    point.y, firstY, cellHeight, viewBounds.bottom);
+            }
         }
         if (preferFirstFree || (inside(point) && collides(point))) {
             bool freeFound = false;
@@ -4620,17 +5017,27 @@ void DesktopSurfaceWindow::RebuildVisibleItems(
         snapshot_.screenRect.bottom - snapshot_.screenRect.top};
     auto resolved = ResolveVisiblePositionCollisions(
         nativePositions, displayOverrides, viewBounds,
-        cellWidth_, cellHeight_, newlyObserved);
+        cellWidth_, cellHeight_, newlyObserved,
+        (snapshot_.viewFlags & FWF_SNAPTOGRID) != 0);
     std::vector<DesktopPosition> newDisplayPositions;
     for (size_t index = 0; index < nativePositions.size(); ++index) {
-        if (std::any_of(
+        const bool isNew = std::any_of(
                 newlyObserved.begin(), newlyObserved.end(),
                 [&](const std::wstring& identity) {
                     return IdentitiesEqual(
                         identity, nativePositions[index].path);
-                }) &&
-            (resolved[index].point.x != nativePositions[index].point.x ||
-             resolved[index].point.y != nativePositions[index].point.y)) {
+                });
+        const auto override = std::find_if(
+            displayOverrides.begin(), displayOverrides.end(),
+            [&](const DesktopPosition& position) {
+                return IdentitiesEqual(
+                    position.path, nativePositions[index].path);
+            });
+        const POINT reference = override == displayOverrides.end()
+            ? nativePositions[index].point : override->point;
+        if ((isNew || override != displayOverrides.end()) &&
+            (resolved[index].point.x != reference.x ||
+             resolved[index].point.y != reference.y)) {
             newDisplayPositions.push_back(resolved[index]);
         }
     }
@@ -4687,6 +5094,7 @@ void DesktopSurfaceWindow::RebuildVisibleItems(
     PruneSelectionToVisibleItems();
     RebuildInteractionRects();
     UpdateRenameEditGeometry();
+    UpdateNativeDesktop();
 }
 
 void DesktopSurfaceWindow::SetItemScreenPoint(
@@ -5295,4 +5703,37 @@ void DesktopSurfaceWindow::MaintainDesktopLayer() {
         0,
         0,
         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+}
+
+void DesktopSurfaceWindow::UpdateNativeDesktop() {
+    if (!nativeDesktop_) return;
+    std::vector<DesktopPosition> projected;
+    projected.reserve(visibleItems_.size());
+    for (const auto& item : visibleItems_) projected.push_back({item.path, item.screenPoint});
+    nativeDesktop_->Update(projected);
+}
+
+void DesktopSurfaceWindow::UpdateNativeWidgetRegion() {
+    if (!nativeDesktop_ || !hwnd_) return;
+    std::vector<RECT> bounds;
+    for (const auto& hosted : hostedWidgets_)
+        if (hosted && hosted->descriptor.visible) bounds.push_back(hosted->view.HostPixelBounds());
+    const bool same = bounds.size() == nativeWidgetRegion_.size() &&
+        std::equal(bounds.begin(), bounds.end(), nativeWidgetRegion_.begin(),
+            [](const RECT& a, const RECT& b) { return EqualRect(&a, &b) != FALSE; });
+    if (same && nativeWidgetRegionSet_) return;
+    HRGN region = CreateRectRgn(0,0,0,0);
+    if (!region) { Hide(); return; }
+    bool valid = true;
+    for (const auto& rect : bounds) {
+        HRGN part = CreateRectRgnIndirect(&rect);
+        if (!part || CombineRgn(region, region, part, RGN_OR) == ERROR) valid = false;
+        if (part) DeleteObject(part);
+        if (!valid) break;
+    }
+    if (!valid || !SetWindowRgn(hwnd_, region, TRUE)) {
+        DeleteObject(region); Hide(); return;
+    }
+    nativeWidgetRegion_ = std::move(bounds);
+    nativeWidgetRegionSet_ = true;
 }

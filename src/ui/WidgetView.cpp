@@ -500,22 +500,28 @@ void WidgetView::SyncGridSelection() {
     grid_.SetSelectedIndices(indices);
 }
 
-void WidgetView::SetVisualPointerState(
+bool WidgetView::SetVisualPointerState(
     POINT hostPoint,
     int pressedHeaderButton) {
     const WidgetViewHit hit = HitTestHostPoint(hostPoint);
-    headerHovered_ =
+    const bool headerHovered =
         hit.kind == WidgetViewHitKind::Header ||
         hit.kind == WidgetViewHitKind::HeaderButton;
-    hoverHeaderButton_ = hit.kind == WidgetViewHitKind::HeaderButton
+    const int hoverHeaderButton = hit.kind == WidgetViewHitKind::HeaderButton
         ? hit.headerButton
         : -1;
+    const bool changed = headerHovered_ != headerHovered ||
+        hoverHeaderButton_ != hoverHeaderButton ||
+        pressedHeaderButton_ != pressedHeaderButton;
+    headerHovered_ = headerHovered;
+    hoverHeaderButton_ = hoverHeaderButton;
     pressedHeaderButton_ = pressedHeaderButton;
-    grid_.SetHoverIndex(
+    const bool gridChanged = grid_.SetHoverIndex(
         hit.kind == WidgetViewHitKind::ItemIcon ||
                 hit.kind == WidgetViewHitKind::ItemCellGap
             ? hit.itemIndex
             : -1);
+    return changed || gridChanged;
 }
 
 void WidgetView::SetMarquee(RECT localDipRect, bool active) {

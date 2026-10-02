@@ -44,6 +44,11 @@ public:
     bool CaptureViewSnapshot(
         DesktopViewSnapshot& snapshot,
         std::wstring& errorMessage) const;
+#ifndef NDEBUG
+    bool CaptureNativeControlPositionsForTesting(
+        const DesktopViewSnapshot& snapshot,
+        std::vector<DesktopPosition>& positions) const;
+#endif
     bool CaptureViewFlags(DWORD& flags, std::wstring& errorMessage) const;
     bool EnsureSnapToGrid(std::wstring& errorMessage) const;
     bool CaptureAllPositions(std::vector<DesktopPosition>& positions, std::wstring& errorMessage) const;

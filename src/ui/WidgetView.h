@@ -96,7 +96,7 @@ public:
     bool ScrollBy(int deltaPixels);
     int ScrollOffset() const noexcept { return scrollOffset_; }
     SIZE SlotSize() const noexcept { return grid_.SlotSize(); }
-    void SetVisualPointerState(
+    bool SetVisualPointerState(
         POINT hostPoint,
         int pressedHeaderButton = -1);
     void SetMarquee(RECT localDipRect, bool active);
