@@ -2,6 +2,7 @@
 
 #include <Windows.h>
 
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -56,7 +57,8 @@ public:
         const WindowConfig& config,
         int theme,
         RECT hostPixelBounds,
-        std::vector<DesktopItem> items);
+        std::vector<DesktopItem> items,
+        std::optional<RECT> contentBounds = std::nullopt);
     void SetHostPixelBounds(RECT bounds);
     void SetCollapsed(bool collapsed);
     void SetLocked(bool locked);
@@ -120,6 +122,7 @@ private:
     WindowConfig config_{};
     int theme_ = 0;
     RECT hostPixelBounds_{};
+    std::optional<RECT> contentBounds_;
     std::vector<DesktopItem> items_;
     IconGrid grid_;
     std::vector<std::wstring> selectedItemIds_;

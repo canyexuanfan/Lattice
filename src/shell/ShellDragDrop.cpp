@@ -160,6 +160,7 @@ private:
 
 class ShellDropSource final : public IDropSource {
 public:
+    explicit ShellDropSource(std::function<void()> cancelHandler = {}) : cancelHandler_(std::move(cancelHandler)) {}
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** object) override {
         if (object == nullptr) {
             return E_POINTER;
@@ -187,6 +188,7 @@ public:
 
     HRESULT STDMETHODCALLTYPE QueryContinueDrag(BOOL escapePressed, DWORD keyState) override {
         if (escapePressed) {
+            if(cancelHandler_) {auto handler=std::move(cancelHandler_);handler();}
             return DRAGDROP_S_CANCEL;
         }
         if ((keyState & MK_LBUTTON) == 0) {
@@ -200,6 +202,7 @@ public:
     }
 
 private:
+    std::function<void()> cancelHandler_;
     std::atomic<ULONG> references_{1};
 };
 
@@ -240,12 +243,13 @@ HRESULT InitializeShellDragImage(
 
 bool StartShellDragWithDataObject(
     IDataObject* dataObject,
-    const SHDRAGIMAGE* dragImage) {
+    const SHDRAGIMAGE* dragImage,
+    std::function<void()> cancelHandler = {}) {
     if (dataObject == nullptr) {
         return false;
     }
     InitializeShellDragImage(dataObject, dragImage);
-    auto* dropSource = new (std::nothrow) ShellDropSource();
+    auto* dropSource = new (std::nothrow) ShellDropSource(std::move(cancelHandler));
     if (dropSource == nullptr) {
         return false;
     }
@@ -493,6 +497,11 @@ HRESULT DropShellItemsOnDesktopItem(
 bool StartShellDrag(
     HWND ownerWindow,
     const std::vector<std::wstring>& paths) {
+    return StartShellDrag(ownerWindow,paths,nullptr,{});
+}
+
+bool StartShellDrag(HWND ownerWindow,const std::vector<std::wstring>& paths,
+    const SHDRAGIMAGE* dragImage,std::function<void()> cancelHandler) {
     Microsoft::WRL::ComPtr<IDataObject> dataObject;
     if (FAILED(CreateShellDragDataObject(
             ownerWindow,
@@ -501,7 +510,7 @@ bool StartShellDrag(
         dataObject == nullptr) {
         return false;
     }
-    return StartShellDragWithDataObject(dataObject.Get(), nullptr);
+    return StartShellDragWithDataObject(dataObject.Get(), dragImage,std::move(cancelHandler));
 }
 
 bool StartShellDrag(

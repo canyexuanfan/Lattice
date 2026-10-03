@@ -6,6 +6,8 @@
 #include <string>
 #include <vector>
 
+#include "organize/OrganizeRule.h"
+
 struct WindowConfig {
     int x = 80;
     int y = 80;
@@ -40,6 +42,10 @@ struct AppSettings {
     int iconCacheSize = 256;
     int theme = 0;
     bool desktopGridAlignmentInitialized = false;
+    int quickHideKey = VK_F9;
+    int quickHideModifiers = MOD_CONTROL | MOD_ALT;
+    int temporaryAccessKey = VK_F10;
+    int temporaryAccessModifiers = MOD_CONTROL | MOD_ALT;
 };
 
 struct ItemConfig {
@@ -94,6 +100,7 @@ struct AutoOrganizeUndoRecord {
 struct AppConfig {
     AppSettings settings;
     WindowConfig window;
+    WindowConfig tabContainer;
     std::wstring currentCategoryId;
     std::wstring uncategorizedName = L"未分类";
     std::wstring uncategorizedStorageFolder = L"uncategorized";
@@ -103,6 +110,8 @@ struct AppConfig {
     std::vector<std::wstring> uncategorizedItemIds;
     std::vector<CategoryConfig> categories;
     std::vector<AutoOrganizeUndoRecord> autoOrganizeUndoHistory;
+    std::vector<lattice::organize::OrganizeRule> organizeRules;
+    bool organizeRulesReadError = false;
 };
 
 struct ConfiguredItemMembership {
@@ -148,6 +157,8 @@ struct AutoOrganizeApplyRequest {
     std::wstring transactionId;
     std::vector<AutoOrganizeMoveRequest> moves;
     std::vector<CategoryConfig> newCategories;
+    bool usesRules = false;
+    std::vector<lattice::organize::OrganizeRule> expectedRules;
 };
 
 struct AutoOrganizeTransactionResult {
@@ -178,7 +189,11 @@ public:
     WindowConfig Load() const;
     bool Save(const WindowConfig& config) const;
     AppConfig LoadAppConfig() const;
-    bool SaveAppConfig(const AppConfig& config) const;
+    bool SaveAppConfig(const AppConfig& config, bool preserveOrganizeRules = false) const;
+    bool SaveOrganizeRulesAsync(
+        const std::vector<lattice::organize::OrganizeRule>& expected,
+        const std::vector<lattice::organize::OrganizeRule>& rules,
+        HWND notificationWindow, UINT notificationMessage, std::uint64_t token) const;
     bool SaveInteractionStateAsync(
         const std::wstring& categoryId,
         const WindowConfig& layout,

@@ -297,6 +297,10 @@ const ExistingCategorySnapshot* FindExistingCategory(
 
 }  // namespace
 
+std::wstring OrganizeCategoryId(const std::wstring& monitorId, const std::wstring& name) {
+    return StableCategoryId(monitorId, name);
+}
+
 void EnrichSnapshotLocalMetadata(
     Snapshot& snapshot,
     const std::atomic<bool>* cancelRequested) {
@@ -439,6 +443,19 @@ Plan BuildPlan(const Snapshot& snapshot) {
         }
     }
 
+    RebuildPlanGroups(plan);
+    return plan;
+}
+
+void RebuildPlanGroups(Plan& plan, std::size_t minimumNewGroupItems) {
+    plan.groups.clear();
+    std::map<std::wstring, std::size_t> highConfidenceNewCounts;
+    for (const Decision& decision : plan.decisions) {
+        if (!decision.targetCategoryId.empty() && !decision.targetIsExistingCategory &&
+            decision.confidence == Confidence::High) {
+            ++highConfidenceNewCounts[decision.targetCategoryId];
+        }
+    }
     std::map<std::wstring, GroupPlan> groupsById;
     for (const Decision& decision : plan.decisions) {
         if (decision.targetCategoryId.empty()) {
@@ -450,7 +467,7 @@ Plan BuildPlan(const Snapshot& snapshot) {
         group.monitorId = decision.monitorId;
         group.existingCategory = decision.targetIsExistingCategory;
         group.createNewCategory = !decision.targetIsExistingCategory &&
-            highConfidenceNewCounts[decision.targetCategoryId] >= 2;
+            highConfidenceNewCounts[decision.targetCategoryId] >= minimumNewGroupItems;
         if (IsOwnershipAdjustment(decision)) {
             group.itemIds.push_back(decision.itemId);
         }
@@ -486,7 +503,6 @@ Plan BuildPlan(const Snapshot& snapshot) {
     // no unselected items. A user may still drag an accepted suggestion back
     // to the desktop during preview.
     plan.groups.push_back(std::move(keepDesktop));
-    return plan;
 }
 
 }  // namespace lattice::organize

@@ -3,6 +3,7 @@
 #include <Windows.h>
 
 #include <functional>
+#include <array>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -27,6 +28,7 @@
 #include "ui/AutoOrganizePreviewWindow.h"
 #include "ui/DesktopSurfaceWindow.h"
 #include "ui/SettingsDialog.h"
+#include "ui/OrganizeRulesDialog.h"
 #include "ui/WidgetWindow.h"
 
 class MainWindow {
@@ -58,6 +60,7 @@ public:
     void FinishPendingDesktopPlacements();
 
 private:
+    friend struct DisplayModesSmokeAccess;
     friend struct MainWindowSmokeAccess;
 
     struct TileView {
@@ -120,12 +123,29 @@ private:
     void ToggleAllLocked();
     void ToggleStartup();
     AppSettings SettingsForDialog() const;
-    void RefreshSearchQuery();
-    void LayoutSearchEdit();
     void ShowTrayMenu();
     void OpenAllCategoryWidgets();
     void ShowSettings();
-    void ShowAutoOrganizePreview();
+    struct AccessHotkeyBinding {int id=0;int key=0;int modifiers=0;};
+    std::array<AccessHotkeyBinding,2> accessHotkeys_{};
+    bool ConfigureAccessHotkeys(const AppSettings& settings,std::wstring& error);
+    void ReleaseAccessHotkeys() noexcept;
+    void ToggleTemporaryAccess();
+    void PromoteTemporaryAccess();
+    bool EndTemporaryAccess(bool restoreHidden=true, bool force=false);
+    void FinishAccessInteraction();
+    bool temporaryAccess_=false,temporaryPromoted_=false,temporaryWasVisible_=false,temporaryTransition_=false;
+    bool temporaryEndPending_=false,temporaryHiddenCleanup_=false,pendingAccessHide_=false,pendingAccessExit_=false;
+    bool pendingAccessRebuild_=false;
+    int pendingAccessMode_=-1;
+    unsigned accessInteractionDepth_=0;
+    struct AccessInteractionScope {
+        MainWindow& owner;
+        explicit AccessInteractionScope(MainWindow& value):owner(value) {++owner.accessInteractionDepth_;}
+        ~AccessInteractionScope() {owner.FinishAccessInteraction();}
+    };
+    void ShowAutoOrganizePreview(bool useRules = false);
+    void ShowOrganizeRules();
     void UndoLastAutoOrganize();
     AutoOrganizePreviewInput BuildAutoOrganizePreviewInput() const;
     AutoOrganizeApplyRequest BuildAutoOrganizeApplyRequest(
@@ -168,6 +188,9 @@ private:
         const DesktopPlacementConfig* displayPlacement = nullptr);
     RECT GridBounds() const;
     RECT TabBounds(size_t index) const;
+    RECT TabViewport() const;
+    void EnsureCurrentTabVisible();
+    std::wstring TabCategoryAtScreenPoint(POINT point) const;
     RECT CollapseButtonBounds() const;
     RECT LockButtonBounds() const;
     RECT TileHeaderBounds(size_t index) const;
@@ -180,6 +203,14 @@ private:
     bool HitTestTileHeader(POINT point, size_t& tileIndex) const;
     void DockTileWindowToWorkArea(bool rememberRestore);
     void SetViewMode(int viewMode);
+    WindowConfig ActiveWindowConfig() const;
+    void StoreActiveWindowConfig();
+    void SyncTabContainer(bool visible, bool closing = false);
+    void RenderTabChrome();
+    void RefreshTabTooltips();
+    HWND tabTooltip_ = nullptr;
+    std::vector<std::wstring> tabTipTexts_;
+    bool tabGeometryUpdating_ = false;
     void SetTabSide(int side);
     void SaveLayoutProfile();
     void RestoreLayoutProfile();
@@ -227,15 +258,12 @@ private:
     const Category* FindCategory(const std::wstring& categoryId) const;
     std::wstring CurrentCategoryName() const;
     std::wstring GenerateCategoryId() const;
-    bool MatchesSearch(const DesktopItem& item) const;
     int HoverButton() const;
 
     HINSTANCE instance_;
     NormalExitHandler normalExitHandler_;
     bool keepRunningOnNormalExitFailure_ = true;
     HWND hwnd_ = nullptr;
-    HWND searchEdit_ = nullptr;
-    HWND searchScopeCombo_ = nullptr;
     ConfigStore configStore_;
     StartupManager startupManager_;
     TrayIcon trayIcon_;
@@ -264,8 +292,6 @@ private:
     std::mutex desktopChangesMutex_;
     DesktopChangeBatch pendingDesktopChanges_;
     bool desktopInitialScanComplete_ = false;
-    std::wstring searchQuery_;
-    int searchScope_ = 0;
     POINT lastMousePoint_{};
     int hoverTabIndex_ = -1;
     int hoverButtonIndex_ = -1;
@@ -279,10 +305,12 @@ private:
     bool hostedCollectionBusyNotified_ = false;
     bool hostedCollectionDirty_ = false;
     std::unique_ptr<AutoOrganizePreviewWindow> autoOrganizePreview_;
+    bool organizeRulesPreview_ = false;
     std::unique_ptr<DesktopSurfaceWindow> desktopSurface_;
     std::vector<TileView> tileViews_;
     std::unordered_map<std::wstring, bool> tileCollapsed_;
     int tileScrollOffset_ = 0;
+    std::wstring tabScrollCategory_;
     int tileContentHeight_ = 0;
     int hoverTileIndex_ = -1;
     int draggingTileIndex_ = -1;

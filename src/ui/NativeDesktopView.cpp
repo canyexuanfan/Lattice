@@ -408,7 +408,7 @@ LRESULT CALLBACK NativeDesktopView::WindowProc(HWND hwnd, UINT message, WPARAM w
 LRESULT CALLBACK NativeDesktopView::ViewProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp,
     UINT_PTR, DWORD_PTR reference) {
     auto& self = *reinterpret_cast<NativeDesktopView*>(reference);
-    if (message == WM_ERASEBKGND) return self.Paint(reinterpret_cast<HDC>(wp));
+    if (message == WM_ERASEBKGND || message == WM_PRINTCLIENT) return self.Paint(reinterpret_cast<HDC>(wp));
     if (message == WM_NOTIFY && lp) {
         const auto* notice = reinterpret_cast<NMHDR*>(lp);
         if (notice->hwndFrom == self.list_) {

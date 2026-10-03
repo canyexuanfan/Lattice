@@ -243,6 +243,9 @@ LayoutSnapshot BuildLayoutSnapshot(
     snapshot.globalVisible = config.settings.lastVisible;
     snapshot.viewMode = std::clamp(config.window.viewMode, 0, 1);
     snapshot.main = config.window;
+    snapshot.hasTabContainer = true;
+    snapshot.tabContainer = config.tabContainer;
+    snapshot.currentCategoryId = config.currentCategoryId;
     snapshot.uncategorizedItemOrder = config.uncategorizedItemIds;
     snapshot.desktopDisplayLayout = config.desktopDisplayLayout;
     snapshot.monitors = monitors;
@@ -262,7 +265,8 @@ bool ValidateLayoutSnapshot(
         errorMessage = L"布局方案版本不受支持。";
         return false;
     }
-    if (!ValidWindow(snapshot.main)) {
+    if (!ValidWindow(snapshot.main) ||
+        (snapshot.hasTabContainer && !ValidWindow(snapshot.tabContainer))) {
         errorMessage = L"主窗口布局字段无效。";
         return false;
     }
@@ -380,6 +384,15 @@ bool BuildLayoutRestorePlan(
 
     if (plan.legacyMainOnly) {
         return true;
+    }
+    if (snapshot.hasTabContainer) {
+        plan.candidate.tabContainer = MapWindow(
+            snapshot.tabContainer, snapshot.monitors, currentMonitors,
+            plan.exactMonitorTopology);
+        const auto found = std::find_if(current.categories.begin(), current.categories.end(),
+            [&](const CategoryConfig& category) { return category.id == snapshot.currentCategoryId; });
+        if (snapshot.currentCategoryId == L"uncategorized" || found != current.categories.end())
+            plan.candidate.currentCategoryId = snapshot.currentCategoryId;
     }
     plan.candidate.window.viewMode = snapshot.viewMode;
     plan.candidate.settings.lastVisible = snapshot.globalVisible;

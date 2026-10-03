@@ -121,6 +121,11 @@ bool ApplyAutoOrganizeTransaction(
     AppConfig& candidate,
     AutoOrganizeTransactionResult& result) {
     result = {};
+    if (request.usesRules && (current.organizeRulesReadError || current.organizeRules != request.expectedRules)) {
+        result.conflict = true;
+        result.message = L"规则在预览后改变，请重新生成预览；本次未应用。";
+        return false;
+    }
     if (request.transactionId.empty() || request.moves.empty()) {
         result.message = L"整理计划为空，配置未改变。";
         return false;

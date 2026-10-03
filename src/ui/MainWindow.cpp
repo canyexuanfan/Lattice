@@ -1,6 +1,9 @@
 #include "ui/MainWindow.h"
 
 #include <dwmapi.h>
+#include <CommCtrl.h>
+#include <uxtheme.h>
+#include "ui/DialogStyle.h"
 #include <commdlg.h>
 #include <shellapi.h>
 #include <ShlObj.h>
@@ -13,6 +16,7 @@
 #ifndef NDEBUG
 #include <chrono>
 #include <fstream>
+#include <iostream>
 #endif
 #include <filesystem>
 #include <iterator>
@@ -126,18 +130,19 @@ constexpr int kDensityCompactCommand = 2040;
 constexpr int kDensityStandardCommand = 2041;
 constexpr int kDensitySpaciousCommand = 2042;
 constexpr int kAutoOrganizeCommand = 2067;
+constexpr int kOrganizeRulesCommand = 2074;
+constexpr int kRulesPreviewCommand = 2075;
 constexpr int kUndoAutoOrganizeCommand = 2068;
 constexpr int kTrayToggleVisibleCommand = 2020;
 constexpr int kTrayToggleLockCommand = 2021;
 constexpr int kTrayRefreshCommand = 2022;
 constexpr int kTrayStartupCommand = 2023;
 constexpr int kTraySettingsCommand = 2024;
-constexpr int kSearchEditId = 4001;
-constexpr int kSearchScopeId = 4002;
 constexpr UINT kDesktopChangedMessage = WM_APP + 11;
 constexpr UINT kIconReadyMessage = WM_APP + 14;
 constexpr UINT kAutoOrganizeTransactionCompleteMessage = WM_APP + 64;
 constexpr UINT kLayoutRestoreCompleteMessage = WM_APP + 65;
+constexpr UINT kFinishAccessInteractionMessage = WM_APP + 66;
 const UINT kUpdateExitMessage = RegisterWindowMessageW(L"Lattice.RequestExitForUpdate.V1");
 const UINT kTaskbarCreatedMessage = RegisterWindowMessageW(L"TaskbarCreated");
 constexpr UINT kDesktopRefreshTimerId = 7001;
@@ -473,9 +478,9 @@ MainWindow::MainWindow(
       normalExitHandler_(std::move(normalExitHandler)),
       keepRunningOnNormalExitFailure_(keepRunningOnNormalExitFailure) {
     LoadOrganizerConfig();
-    windowConfig_ = organizerConfig_.window;
+    windowConfig_ = ActiveWindowConfig();
     if (windowConfig_.collapsed) {
-        windowConfig_.height = kTitleHeight + kTabsHeight + 12;
+        windowConfig_.height = windowConfig_.viewMode==0?MulDiv(32,static_cast<int>(GetDpiForWindow(hwnd_)),96):kTitleHeight + kTabsHeight + 12;
     }
 }
 
@@ -491,6 +496,8 @@ bool MainWindow::DrainPendingDesktopPlacementsForExit(std::wstring& errorMessage
 }
 
 void MainWindow::RequestNormalExit() {
+    if(temporaryAccess_&&accessInteractionDepth_) {pendingAccessExit_=true;temporaryEndPending_=true;return;}
+    EndTemporaryAccess();
     if (normalExitInProgress_ || normalExitCompleted_ || hwnd_ == nullptr || IsWindow(hwnd_) == FALSE) {
         return;
     }
@@ -556,6 +563,16 @@ MainWindow::~MainWindow() {
 }
 
 bool MainWindow::PreTranslateMessage(MSG& message) {
+    if(temporaryAccess_&&message.message==WM_KEYDOWN&&message.wParam==VK_ESCAPE&&
+        (message.hwnd==hwnd_||IsChild(hwnd_,message.hwnd)||
+         (desktopSurface_&&(message.hwnd==desktopSurface_->Window()||IsChild(desktopSurface_->Window(),message.hwnd))))) {
+        EndTemporaryAccess();return true;
+    }
+    if(windowConfig_.viewMode==0 && message.hwnd==hwnd_ && message.message==WM_KEYDOWN && desktopSurface_ &&
+        (message.wParam==VK_F2 || message.wParam==VK_RETURN || message.wParam==VK_APPS ||
+         message.wParam==VK_LEFT || message.wParam==VK_RIGHT || message.wParam==VK_UP || message.wParam==VK_DOWN)) {
+        SendMessageW(desktopSurface_->Window(),message.message,message.wParam,message.lParam);return true;
+    }
     return desktopSurface_ && desktopSurface_->PreTranslateMessage(message);
 }
 
@@ -567,6 +584,41 @@ bool MainWindow::EnableDesktopDisplayTakeover(
         return false;
     }
     auto surface = std::make_unique<DesktopSurfaceWindow>(instance_);
+    surface->SetVisibilityHandler([this](bool visible, bool closing) {
+        if(temporaryTransition_) {if(closing)SyncTabContainer(false,true);return;}
+        if(!visible&&temporaryAccess_)EndTemporaryAccess(true,true);
+        if(visible&&temporaryAccess_&&!temporaryPromoted_)PromoteTemporaryAccess();
+        SyncTabContainer(visible, closing);
+    });
+    surface->SetAccessInteractionHandler([this](bool active) {
+        if(active)++accessInteractionDepth_;else FinishAccessInteraction();
+    });
+    surface->SetAccessEscapeHandler([this] {EndTemporaryAccess();});
+    surface->SetTabDropTargetHandler([this](POINT point) { return TabCategoryAtScreenPoint(point); });
+    surface->SetTabInputHandler([this](UINT message,WPARAM key,POINT screen) {
+        if(windowConfig_.viewMode!=0 || (windowConfig_.collapsed && windowConfig_.tabSide!=0) || !IsWindowVisible(hwnd_))return false;
+        POINT local=screen;ScreenToClient(hwnd_,&local);
+        const RECT viewport=TabViewport();
+        if(message==WM_MOUSEWHEEL ? !PtInRect(&viewport,local) : HitTestTab(local)<0) {
+            if(message==WM_MOUSEMOVE && hoverTabIndex_>=0)SendMessageW(hwnd_,WM_MOUSELEAVE,0,0);
+            return false;
+        }
+        if(message==WM_CONTEXTMENU || message==WM_MOUSEWHEEL)SendMessageW(hwnd_,message,key,MAKELPARAM(screen.x,screen.y));
+        else SendMessageW(hwnd_,message,key,MAKELPARAM(local.x,local.y));
+        return true;
+    });
+    surface->SetHostedLayoutPreviewHandler([this](RECT bounds) {
+        if (windowConfig_.viewMode != 0) return;
+        tabGeometryUpdating_ = true;
+        const HWND parent = GetAncestor(hwnd_, GA_PARENT);
+        POINT point{bounds.left, bounds.top};
+        if (parent) ScreenToClient(parent, &point);
+        SetWindowPos(hwnd_, nullptr, point.x, point.y,
+            bounds.right-bounds.left, bounds.bottom-bounds.top,
+            SWP_NOZORDER|SWP_NOACTIVATE);
+        tabGeometryUpdating_ = false;
+        SyncTabContainer(true);
+    });
     if (!surface->Create(
             AssignedDesktopIdentities(), errorMessage)) {
         return false;
@@ -667,13 +719,41 @@ std::vector<HostedWidgetDescriptor> MainWindow::BuildHostedWidgets() const {
     if (desktopSnapshot_ == nullptr) {
         return result;
     }
+    if (windowConfig_.viewMode == 0) {
+        if (!organizerConfig_.settings.lastVisible&&!temporaryAccess_) return result;
+        HostedWidgetDescriptor descriptor;
+        descriptor.categoryId = organizerConfig_.currentCategoryId;
+        descriptor.title = windowConfig_.tabSide == 0 ? std::wstring{} : CurrentCategoryName();
+        descriptor.config = windowConfig_;
+        RECT screen{};
+        if (!GetWindowRect(hwnd_, &screen)) return result;
+        descriptor.config.x = screen.left; descriptor.config.y = screen.top;
+        descriptor.config.width = screen.right - screen.left;
+        descriptor.config.height = screen.bottom - screen.top;
+        descriptor.config.dpi = std::max(96, static_cast<int>(GetDpiForWindow(hwnd_)));
+        descriptor.theme = organizerConfig_.settings.theme;
+        descriptor.visible = true;
+        descriptor.singleClickOpen = organizerConfig_.settings.singleClickOpen;
+        if (!windowConfig_.collapsed) descriptor.items = currentItems_;
+        RECT content = GridBounds();
+        POINT origin{};
+        ClientToScreen(hwnd_, &origin);
+        const int dpi = descriptor.config.dpi;
+        content.left = MulDiv(content.left + origin.x - screen.left, 96, dpi);
+        content.right = MulDiv(content.right + origin.x - screen.left, 96, dpi);
+        content.top = MulDiv(content.top + origin.y - screen.top, 96, dpi);
+        content.bottom = MulDiv(content.bottom + origin.y - screen.top, 96, dpi);
+        descriptor.contentBounds = content;
+        result.push_back(std::move(descriptor));
+        return result;
+    }
     result.reserve(hostedWidgetCategoryIds_.size());
     std::vector<std::pair<HMONITOR, UINT>> monitorDpis;
     for (const std::wstring& categoryId : hostedWidgetCategoryIds_) {
         HostedWidgetDescriptor descriptor;
         descriptor.categoryId = categoryId;
         descriptor.theme = organizerConfig_.settings.theme;
-        descriptor.visible = organizerConfig_.settings.lastVisible;
+        descriptor.visible = organizerConfig_.settings.lastVisible||temporaryAccess_;
         descriptor.singleClickOpen =
             organizerConfig_.settings.singleClickOpen;
         if (categoryId == kUncategorizedCategoryId) {
@@ -742,6 +822,7 @@ bool MainWindow::SyncHostedWidgets(std::wstring* errorMessage) {
 
 bool MainWindow::ExecuteHostedWidgetCommand(
     const HostedWidgetCommand& command) {
+    AccessInteractionScope accessScope(*this);
     if (command.categoryId.empty()) {
         return false;
     }
@@ -757,8 +838,27 @@ bool MainWindow::ExecuteHostedWidgetCommand(
         return false;
     }
     organizerConfig_.currentCategoryId = command.categoryId;
+    if (windowConfig_.viewMode == 0) {
+        if (command.type == HostedWidgetCommandType::ToggleCollapsed) {
+            ToggleCollapsed(); return true;
+        }
+        if (command.type == HostedWidgetCommandType::ToggleLocked) {
+            ToggleLocked(); return true;
+        }
+        if (command.type == HostedWidgetCommandType::CommitLayout) {
+            const WindowConfig previous = windowConfig_;
+            windowConfig_ = command.layout;
+            windowConfig_.viewMode = 0;
+            StoreActiveWindowConfig();
+            if (!SaveOrganizerConfig()) {
+                windowConfig_ = previous; StoreActiveWindowConfig(); return false;
+            }
+            return true;
+        }
+    }
     switch (command.type) {
         case HostedWidgetCommandType::BringToFront: {
+            if(windowConfig_.viewMode==0) return command.categoryId==organizerConfig_.currentCategoryId;
             const auto existing = std::find(
                 hostedWidgetCategoryIds_.begin(),
                 hostedWidgetCategoryIds_.end(),
@@ -813,17 +913,30 @@ bool MainWindow::ExecuteHostedWidgetCommand(
                 command.categoryId,
                 command.itemIds,
                 static_cast<size_t>(std::max(0, command.insertionIndex)));
-        case HostedWidgetCommandType::MoveSelectionToCategory:
-            for (const std::wstring& itemId : command.itemIds) {
-                MoveItemToCategory(itemId, command.targetCategoryId);
+        case HostedWidgetCommandType::MoveSelectionToCategory: {
+            Category* target=FindCategory(command.targetCategoryId);
+            if(command.itemIds.empty() || (command.targetCategoryId!=kUncategorizedCategoryId && !target))return false;
+            const bool registered=std::all_of(command.itemIds.begin(),command.itemIds.end(),[&](const auto& id){
+                const DesktopItem* item=FindItem(id);
+                return item && !shortcutStore_.IsManagedPath(item->path) && std::any_of(organizerConfig_.items.begin(),organizerConfig_.items.end(),[&](const auto& v){return v.id==id;});
+            });
+            if(registered) {
+                const OrganizerConfig previous=organizerConfig_;
+                auto remove=[&](auto& ids){std::erase_if(ids,[&](const auto& id){return std::find(command.itemIds.begin(),command.itemIds.end(),id)!=command.itemIds.end();});};
+                remove(organizerConfig_.uncategorizedItemIds);for(auto& c:organizerConfig_.categories)remove(c.itemIds);
+                auto& ids=target?target->itemIds:organizerConfig_.uncategorizedItemIds;
+                const size_t at=command.insertionIndex<0?ids.size():std::min(ids.size(),static_cast<size_t>(command.insertionIndex));
+                ids.insert(ids.begin()+static_cast<std::ptrdiff_t>(at),command.itemIds.begin(),command.itemIds.end());
+                organizerConfig_.currentCategoryId=command.targetCategoryId;
+                if(!SaveOrganizerConfig()) {organizerConfig_=previous;RefreshCurrentItems();return false;}
+                RefreshCurrentItems();
+            } else {
+                for(const auto& id:command.itemIds)MoveItemToCategory(id,command.targetCategoryId);
+                if(command.insertionIndex>=0)ReorderHostedSelection(command.targetCategoryId,command.itemIds,static_cast<size_t>(command.insertionIndex));
             }
-            if (command.insertionIndex >= 0) {
-                ReorderHostedSelection(
-                    command.targetCategoryId,
-                    command.itemIds,
-                    static_cast<size_t>(command.insertionIndex));
-            }
+            if(desktopSurface_)desktopSurface_->SelectHostedItemIds(command.targetCategoryId,command.itemIds);
             return true;
+        }
         case HostedWidgetCommandType::MoveSelectionOut:
             for (size_t index = 0; index < command.itemIds.size(); ++index) {
                 const POINT* dropPoint = index < command.itemScreenPoints.size()
@@ -850,7 +963,7 @@ bool MainWindow::ExecuteHostedWidgetCommand(
             } else {
                 layout->height = std::max(layout->normalHeight, 120);
             }
-            windowConfig_ = organizerConfig_.window;
+            windowConfig_ = ActiveWindowConfig();
             return SaveOrganizerConfig();
         }
         case HostedWidgetCommandType::ToggleLocked: {
@@ -862,7 +975,7 @@ bool MainWindow::ExecuteHostedWidgetCommand(
                     : &FindCategory(command.categoryId)->layout);
             if (layout == nullptr) return false;
             layout->locked = !layout->locked;
-            windowConfig_ = organizerConfig_.window;
+            windowConfig_ = ActiveWindowConfig();
             return SaveOrganizerConfig();
         }
         case HostedWidgetCommandType::CommitLayout: {
@@ -958,6 +1071,7 @@ bool MainWindow::ExecuteHostedWidgetCommand(
 
 WindowConfig* MainWindow::HostedWidgetLayout(
     const std::wstring& categoryId) {
+    if (windowConfig_.viewMode == 0) return &windowConfig_;
     if (categoryId == kUncategorizedCategoryId) {
         return &organizerConfig_.window;
     }
@@ -967,6 +1081,7 @@ WindowConfig* MainWindow::HostedWidgetLayout(
 
 const WindowConfig* MainWindow::HostedWidgetLayout(
     const std::wstring& categoryId) const {
+    if (windowConfig_.viewMode == 0) return &windowConfig_;
     if (categoryId == kUncategorizedCategoryId) {
         return &organizerConfig_.window;
     }
@@ -1035,6 +1150,8 @@ void MainWindow::ShowHostedWidgetBackgroundMenu(
         kAutoArrange,
         kRefresh,
         kAutoOrganize,
+        kOrganizeRules,
+        kRulesPreview,
         kUndoAutoOrganize,
         kToggleCollapse,
         kFixedExpanded,
@@ -1087,6 +1204,8 @@ void MainWindow::ShowHostedWidgetBackgroundMenu(
     AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(sort), L"排序方式(O)");
     AppendMenuW(menu, MF_STRING, kRefresh, L"刷新(E)");
     AppendMenuW(menu, MF_STRING, kAutoOrganize, L"自动整理桌面…");
+    AppendMenuW(menu, MF_STRING, kOrganizeRules, L"整理规则…");
+    AppendMenuW(menu, MF_STRING, kRulesPreview, L"按规则整理…");
     AppendMenuW(
         menu,
         configStore_.LoadAppConfig().autoOrganizeUndoHistory.empty()
@@ -1249,6 +1368,16 @@ void MainWindow::ShowHostedWidgetBackgroundMenu(
         layoutChanged = true;
     }
     if (layoutChanged) {
+        if (windowConfig_.viewMode == 0) {
+            windowConfig_.height = windowConfig_.collapsed
+                ? MulDiv(32,static_cast<int>(GetDpiForWindow(hwnd_)),96)
+                : std::max(windowConfig_.normalHeight,windowConfig_.height);
+            tabGeometryUpdating_=true;
+            POINT origin{windowConfig_.x,windowConfig_.y};
+            if(const HWND parent=GetAncestor(hwnd_,GA_PARENT))ScreenToClient(parent,&origin);
+            SetWindowPos(hwnd_,nullptr,origin.x,origin.y,windowConfig_.width,windowConfig_.height,SWP_NOZORDER|SWP_NOACTIVATE);
+            tabGeometryUpdating_=false;
+        }
         if (categoryId == kUncategorizedCategoryId) {
             windowConfig_ = *layout;
         }
@@ -1258,6 +1387,10 @@ void MainWindow::ShowHostedWidgetBackgroundMenu(
 
     if (selected == kRefresh || selected == kRefreshAll) {
         LoadDesktopItems();
+    } else if (selected == kOrganizeRules) {
+        ShowOrganizeRules();
+    } else if (selected == kRulesPreview) {
+        ShowAutoOrganizePreview(true);
     } else if (selected == kAutoOrganize) {
         ShowAutoOrganizePreview();
     } else if (selected == kUndoAutoOrganize) {
@@ -1933,7 +2066,7 @@ bool MainWindow::SaveDesktopPlacement(
         savedPosition->x = point.x;
         savedPosition->y = point.y;
     }
-    if (configStore_.SaveAppConfig(updatedConfig)) {
+    if (configStore_.SaveAppConfig(updatedConfig, true)) {
         return true;
     }
 
@@ -2002,8 +2135,6 @@ bool MainWindow::Create() {
 }
 
 void MainWindow::Show(int showCommand, bool enableDesktopTakeover) {
-    windowConfig_.viewMode = 1;
-    organizerConfig_.window.viewMode = 1;
     ShowWindow(hwnd_, SW_HIDE);
     if (showCommand == SW_HIDE) {
         hostedWidgetCategoryIds_.clear();
@@ -2028,7 +2159,12 @@ void MainWindow::Show(int showCommand, bool enableDesktopTakeover) {
     if (desktopSurface_ != nullptr) {
         desktopSurface_->Show();
     }
-    OpenAllCategoryWidgets();
+    if (windowConfig_.viewMode == 1) OpenAllCategoryWidgets();
+    else {
+        hostedWidgetCategoryIds_.clear();
+        SyncHostedWidgets();
+        SyncTabContainer(true);
+    }
 }
 
 void MainWindow::CheckForUpdates(HWND sourceWindow) {
@@ -2083,6 +2219,8 @@ LRESULT MainWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
     }
     if (kTaskbarCreatedMessage != 0 &&
         message == kTaskbarCreatedMessage) {
+        if(accessInteractionDepth_) {pendingAccessRebuild_=true;EndTemporaryAccess(true,true);return 0;}
+        EndTemporaryAccess(true,true);
 #ifndef NDEBUG
         RecordExplorerRoutingDiagnostic(L"TaskbarCreated entered lastVisible=" +
             std::to_wstring(organizerConfig_.settings.lastVisible) + L" host=" +
@@ -2130,42 +2268,6 @@ LRESULT MainWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
             SetLayeredWindowAttributes(hwnd_, 0, static_cast<BYTE>(windowConfig_.opacity), LWA_ALPHA);
             DragAcceptFiles(hwnd_, TRUE);
             d2d_.Initialize(hwnd_);
-            searchEdit_ = CreateWindowExW(
-                WS_EX_CLIENTEDGE,
-                L"EDIT",
-                L"",
-                WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
-                150,
-                7,
-                260,
-                24,
-                hwnd_,
-                reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSearchEditId)),
-                instance_,
-                nullptr);
-            if (searchEdit_ != nullptr) {
-                SendMessageW(searchEdit_, EM_SETCUEBANNER, TRUE, reinterpret_cast<LPARAM>(L"搜索名称、文件名或路径…"));
-                SendMessageW(searchEdit_, WM_SETFONT, reinterpret_cast<WPARAM>(GetStockObject(DEFAULT_GUI_FONT)), TRUE);
-            }
-            searchScopeCombo_ = CreateWindowW(
-                L"COMBOBOX",
-                L"",
-                WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
-                420,
-                7,
-                112,
-                140,
-                hwnd_,
-                reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSearchScopeId)),
-                instance_,
-                nullptr);
-            if (searchScopeCombo_ != nullptr) {
-                SendMessageW(searchScopeCombo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"当前分类"));
-                SendMessageW(searchScopeCombo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"全部分类"));
-                SendMessageW(searchScopeCombo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"未分类"));
-                SendMessageW(searchScopeCombo_, CB_SETCURSEL, searchScope_, 0);
-                SendMessageW(searchScopeCombo_, WM_SETFONT, reinterpret_cast<WPARAM>(GetStockObject(DEFAULT_GUI_FONT)), TRUE);
-            }
             iconCache_.SetInvalidateCallback([hwnd = hwnd_]() {
                 if (hwnd != nullptr && IsWindow(hwnd) != FALSE) {
                     PostMessageW(hwnd, kIconReadyMessage, 0, 0);
@@ -2173,11 +2275,14 @@ LRESULT MainWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
             });
             LoadDesktopItems();
             trayIcon_.Initialize(hwnd_, instance_);
+            {
+                std::wstring error;
+                if(!ConfigureAccessHotkeys(organizerConfig_.settings,error))ShowNonBlockingNotice(L"快捷键未启用",error);
+            }
             desktopWatcher_.Start([this](DesktopChangeBatch changes) {
                 QueueDesktopChanges(std::move(changes));
             });
             desktopPlacementCoordinator_.AttachNotificationWindow(hwnd_);
-            LayoutSearchEdit();
             UpdateService::Start(hwnd_, false);
             return 0;
 
@@ -2185,11 +2290,38 @@ LRESULT MainWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
             HandleUpdateServiceResult(reinterpret_cast<UpdateServiceResult*>(lParam));
             return 0;
 
+        case kFinishAccessInteractionMessage:
+            if(accessInteractionDepth_==0) {
+                if(temporaryEndPending_)EndTemporaryAccess();
+                if(temporaryHiddenCleanup_&&desktopSurface_) {
+                    temporaryHiddenCleanup_=false;desktopSurface_->Close();desktopSurface_.reset();hostedWidgetCategoryIds_.clear();
+                }
+                if(pendingAccessRebuild_) {pendingAccessRebuild_=false;PostMessageW(hwnd_,kTaskbarCreatedMessage,0,0);}
+                if(pendingAccessExit_) {pendingAccessExit_=false;RequestNormalExit();}
+                else if(pendingAccessHide_) {pendingAccessHide_=false;ToggleAllVisible();}
+                else if(pendingAccessMode_>=0) {const int mode=pendingAccessMode_;pendingAccessMode_=-1;SetViewMode(mode);}
+            }
+            return 0;
+        case WM_HOTKEY:
+            for(size_t role=0;role<accessHotkeys_.size();++role)if(accessHotkeys_[role].id!=0 && accessHotkeys_[role].id==static_cast<int>(wParam)) {
+                if(role==0)ToggleAllVisible();else ToggleTemporaryAccess();
+                return 0;
+            }
+            return 0;
+        case WM_MOVE:
+            if (windowConfig_.viewMode == 0 && !tabGeometryUpdating_ && desktopSurface_) {
+                SyncHostedWidgets();
+                SyncTabContainer(IsWindowVisible(hwnd_) != FALSE);
+            }
+            break;
         case WM_SIZE:
+            if (windowConfig_.viewMode == 0 && !tabGeometryUpdating_ && desktopSurface_) {
+                SyncHostedWidgets();
+                SyncTabContainer(IsWindowVisible(hwnd_) != FALSE);
+            }
             d2d_.Resize(LOWORD(lParam), HIWORD(lParam));
             iconGrid_.SetBounds(GridBounds());
             RefreshTileViews();
-            LayoutSearchEdit();
             InvalidateRect(hwnd_, nullptr, FALSE);
             return 0;
 
@@ -2208,7 +2340,6 @@ LRESULT MainWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
             windowConfig_.dpi = HIWORD(wParam);
             iconGrid_.SetBounds(GridBounds());
             RefreshTileViews();
-            LayoutSearchEdit();
             InvalidateRect(hwnd_, nullptr, FALSE);
             return 0;
         }
@@ -2238,7 +2369,16 @@ LRESULT MainWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
             return 0;
         }
 
+        case WM_NCCALCSIZE:
+            if(windowConfig_.viewMode==0) return 0;
+            break;
         case WM_NCHITTEST: {
+            if (windowConfig_.viewMode == 0) {
+                POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+                ScreenToClient(hwnd_, &point);
+                const int header = MulDiv(32, static_cast<int>(GetDpiForWindow(hwnd_)), 96);
+                return point.y < header && HitTestTab(point) < 0 ? HTTRANSPARENT : HTCLIENT;
+            }
             POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
             ScreenToClient(hwnd_, &point);
             RECT client{};
@@ -2296,11 +2436,12 @@ LRESULT MainWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
 
         case WM_LBUTTONDOWN: {
             POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
-            if (HitTestCollapseButton(point)) {
+
+            if (windowConfig_.viewMode!=0 && HitTestCollapseButton(point)) {
                 ToggleCollapsed();
                 return 0;
             }
-            if (HitTestLockButton(point)) {
+            if (windowConfig_.viewMode!=0 && HitTestLockButton(point)) {
                 ToggleLocked();
                 return 0;
             }
@@ -2310,6 +2451,10 @@ LRESULT MainWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
                 RefreshCurrentItems();
                 SaveOrganizerConfig();
                 InvalidateRect(hwnd_, nullptr, FALSE);
+                if (windowConfig_.tabSide == 0 && desktopSurface_) {
+                    POINT screen = point; ClientToScreen(hwnd_, &screen);
+                    desktopSurface_->BeginHostedContainerMove(screen);
+                }
                 return 0;
             }
             if (tabIndex > 0 && static_cast<size_t>(tabIndex - 1) < organizerConfig_.categories.size()) {
@@ -2317,6 +2462,10 @@ LRESULT MainWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
                 RefreshCurrentItems();
                 SaveOrganizerConfig();
                 InvalidateRect(hwnd_, nullptr, FALSE);
+                if (windowConfig_.tabSide == 0 && desktopSurface_) {
+                    POINT screen = point; ClientToScreen(hwnd_, &screen);
+                    desktopSurface_->BeginHostedContainerMove(screen);
+                }
                 return 0;
             }
             if (tabIndex == static_cast<int>(organizerConfig_.categories.size() + 1)) {
@@ -2350,9 +2499,7 @@ LRESULT MainWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
                         if (item != nullptr) {
                             launcher_.OpenPath(item->path);
                         }
-                    } else if (searchQuery_.empty() &&
-                               searchScope_ == 0 &&
-                               item != nullptr &&
+                    } else if (item != nullptr &&
                                !DragGhostWindow::Instance().IsCommitted()) {
                         draggingTileIndex_ = static_cast<int>(tileIndex);
                         draggingTileIconIndex_ = tileIconIndex;
@@ -2389,8 +2536,6 @@ LRESULT MainWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
                 }
             }
             if (!windowConfig_.collapsed &&
-                searchQuery_.empty() &&
-                searchScope_ == 0 &&
                 !DragGhostWindow::Instance().IsCommitted()) {
                 const int iconIndex = iconGrid_.HitTest(point);
                 const DesktopItem* dragItem = iconIndex >= 0
@@ -2421,6 +2566,12 @@ LRESULT MainWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
         }
 
         case WM_LBUTTONUP: {
+            if (windowConfig_.viewMode == 0 && desktopSurface_ && GetCapture() == desktopSurface_->Window()) {
+                POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+                ClientToScreen(hwnd_, &point);ScreenToClient(desktopSurface_->Window(), &point);
+                SendMessageW(desktopSurface_->Window(),message,wParam,MAKELPARAM(point.x,point.y));
+                return 0;
+            }
             if (draggingTileIndex_ >= 0 && draggingTileIconIndex_ >= 0) {
                 const std::wstring movingId = draggingItemId_;
                 const std::wstring sourceCategoryId = draggingSourceCategoryId_;
@@ -2623,6 +2774,18 @@ LRESULT MainWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
         }
 
         case WM_MOUSEWHEEL: {
+            if(windowConfig_.viewMode==0 && !windowConfig_.collapsed) {
+                POINT point{GET_X_LPARAM(lParam),GET_Y_LPARAM(lParam)};ScreenToClient(hwnd_,&point);
+                const RECT viewport=TabViewport();
+                if(PtInRect(&viewport,point)) {
+                    const int dpi=static_cast<int>(GetDpiForWindow(hwnd_));
+                    const bool vertical=windowConfig_.tabSide>=2;
+                    const int available=MulDiv(vertical?viewport.bottom-viewport.top:viewport.right-viewport.left,96,dpi);
+                    const int total=vertical?static_cast<int>(organizerConfig_.categories.size()+2)*35:static_cast<int>(organizerConfig_.categories.size()+1)*77+31;
+                    tileScrollOffset_=std::clamp(tileScrollOffset_-(GET_WHEEL_DELTA_WPARAM(wParam)/WHEEL_DELTA)*77,0,std::max(0,total-available));
+                    RefreshTabTooltips();InvalidateRect(hwnd_,nullptr,FALSE);return 0;
+                }
+            }
             if (!windowConfig_.collapsed) {
                 POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
                 ScreenToClient(hwnd_, &point);
@@ -2858,7 +3021,7 @@ LRESULT MainWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
             refreshPending_ = false;
             organizerRefreshPending_ = false;
             LoadOrganizerConfig();
-            windowConfig_ = organizerConfig_.window;
+            windowConfig_ = ActiveWindowConfig();
             LoadDesktopItems();
             if (autoOrganizePreview_ != nullptr) {
                 autoOrganizePreview_->MarkDesktopChanged();
@@ -2990,31 +3153,8 @@ LRESULT MainWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
             return 0;
         }
 
-        case WM_CTLCOLOREDIT:
-            if (reinterpret_cast<HWND>(lParam) == searchEdit_) {
-                const bool lightTheme = UseLightTheme(organizerConfig_.settings.theme);
-                static HBRUSH darkBrush = CreateSolidBrush(RGB(12, 34, 44));
-                static HBRUSH lightBrush = CreateSolidBrush(RGB(247, 251, 253));
-                HDC dc = reinterpret_cast<HDC>(wParam);
-                SetTextColor(dc, lightTheme ? RGB(21, 48, 59) : RGB(235, 246, 250));
-                SetBkColor(dc, lightTheme ? RGB(247, 251, 253) : RGB(12, 34, 44));
-                return reinterpret_cast<LRESULT>(lightTheme ? lightBrush : darkBrush);
-            }
-            break;
-
         case WM_COMMAND: {
             const int command = LOWORD(wParam);
-            if (command == kSearchEditId && HIWORD(wParam) == EN_CHANGE) {
-                RefreshSearchQuery();
-                return 0;
-            }
-            if (command == kSearchScopeId && HIWORD(wParam) == CBN_SELCHANGE) {
-                searchScope_ = static_cast<int>(SendMessageW(searchScopeCombo_, CB_GETCURSEL, 0, 0));
-                iconGrid_.SetScrollOffset(0);
-                RefreshCurrentItems();
-                InvalidateRect(hwnd_, nullptr, FALSE);
-                return 0;
-            }
             if (command == kNewCategoryCommand) {
                 CreateCategory();
                 return 0;
@@ -3180,6 +3320,8 @@ LRESULT MainWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
                 ShowSettings();
                 return 0;
             }
+            if (command == kOrganizeRulesCommand) { ShowOrganizeRules(); return 0; }
+            if (command == kRulesPreviewCommand) { ShowAutoOrganizePreview(true); return 0; }
             if (command == kAutoOrganizeCommand) {
                 ShowAutoOrganizePreview();
                 return 0;
@@ -3228,6 +3370,7 @@ LRESULT MainWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
 
         case WM_EXITSIZEMOVE:
             SaveWindowConfig();
+            if (windowConfig_.viewMode == 0) SyncHostedWidgets();
             return 0;
 
         case WM_ERASEBKGND:
@@ -3238,6 +3381,9 @@ LRESULT MainWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
             return 0;
 
         case WM_DESTROY:
+            EndTemporaryAccess(true,true);
+            ReleaseAccessHotkeys();
+            if(tabTooltip_) {DestroyWindow(tabTooltip_);tabTooltip_=nullptr;}
             if (autoOrganizePreview_ != nullptr) {
                 autoOrganizePreview_->Close();
                 autoOrganizePreview_.reset();
@@ -3506,73 +3652,82 @@ bool MainWindow::HasPendingDesktopChanges() {
     return !pendingDesktopChanges_.Empty();
 }
 
-void MainWindow::RefreshSearchQuery() {
-    if (searchEdit_ == nullptr) {
-        searchQuery_.clear();
-    } else {
-        const int length = GetWindowTextLengthW(searchEdit_);
-        std::wstring value(static_cast<size_t>(std::max(0, length)) + 1, L'\0');
-        if (length > 0) {
-            GetWindowTextW(searchEdit_, value.data(), length + 1);
-            value.resize(static_cast<size_t>(length));
-        } else {
-            value.clear();
-        }
-        searchQuery_ = ToLowerCopy(value);
-    }
-    iconGrid_.SetScrollOffset(0);
-    RefreshCurrentItems();
-    InvalidateRect(hwnd_, nullptr, FALSE);
+void MainWindow::FinishAccessInteraction() {
+    if(accessInteractionDepth_)--accessInteractionDepth_;
+    if(!accessInteractionDepth_&&(temporaryEndPending_||temporaryHiddenCleanup_||pendingAccessHide_||pendingAccessExit_||pendingAccessRebuild_||pendingAccessMode_>=0))
+        PostMessageW(hwnd_,kFinishAccessInteractionMessage,0,0);
 }
 
-void MainWindow::LayoutSearchEdit() {
-    if (searchEdit_ == nullptr) {
-        return;
+void MainWindow::ToggleTemporaryAccess() {
+    if(temporaryAccess_) {EndTemporaryAccess();return;}
+    if(accessInteractionDepth_||temporaryHiddenCleanup_)return;
+    temporaryWasVisible_=organizerConfig_.settings.lastVisible;
+    temporaryAccess_=true;temporaryTransition_=true;
+    std::wstring error;
+    if(!desktopSurface_&&!EnableDesktopDisplayTakeover(error)) {
+        temporaryTransition_=false;temporaryAccess_=false;
+        ShowNonBlockingNotice(L"临时前台访问",error);return;
     }
-    RECT client{};
-    GetClientRect(hwnd_, &client);
-    const int clientWidth = static_cast<int>(client.right - client.left);
-    if (windowConfig_.viewMode == 1) {
-        if (searchScopeCombo_ != nullptr) {
-            ShowWindow(searchScopeCombo_, SW_HIDE);
-        }
-        const int width = std::max(160, clientWidth - 126);
-        SetWindowPos(searchEdit_, nullptr, 18, 7, width, 26, SWP_NOZORDER | SWP_NOACTIVATE);
-        return;
-    }
-    if (searchScopeCombo_ != nullptr) {
-        ShowWindow(searchScopeCombo_, SW_SHOW);
-    }
-    const int rightReserve = windowConfig_.tabSide == 3 ? kSideTabsWidth : 0;
-    const int width = std::clamp(std::min(clientWidth / 3, clientWidth - 300 - rightReserve), 180, 300);
-    SetWindowPos(searchEdit_, nullptr, 150, 7, std::max(120, width), 24, SWP_NOZORDER | SWP_NOACTIVATE);
-    if (searchScopeCombo_ != nullptr) {
-        SetWindowPos(searchScopeCombo_, nullptr, 158 + std::max(120, width), 7, 112, 24, SWP_NOZORDER | SWP_NOACTIVATE);
-    }
+    if(windowConfig_.viewMode==1)OpenAllCategoryWidgets();else SyncHostedWidgets();
+    desktopSurface_->Show();temporaryTransition_=false;
+    if(IsWindowVisible(desktopSurface_->Window()))PromoteTemporaryAccess();
 }
 
-bool MainWindow::MatchesSearch(const DesktopItem& item) const {
-    if (searchQuery_.empty()) {
-        return true;
+void MainWindow::PromoteTemporaryAccess() {
+    if(!temporaryAccess_||temporaryPromoted_||temporaryTransition_||!desktopSurface_)return;
+    temporaryTransition_=true;std::wstring error;
+    const bool success=desktopSurface_->SetTemporaryForeground(true,error);
+    temporaryPromoted_=success;temporaryTransition_=false;
+    if(!success) {
+#ifndef NDEBUG
+        const int size=WideCharToMultiByte(CP_UTF8,0,error.c_str(),-1,nullptr,0,nullptr,nullptr);
+        std::string text(static_cast<size_t>(std::max(1,size)),0);
+        WideCharToMultiByte(CP_UTF8,0,error.c_str(),-1,text.data(),size,nullptr,nullptr);
+        std::cout<<"temporary_layer_error="<<text.c_str()<<std::endl;
+#endif
+        EndTemporaryAccess();ShowNonBlockingNotice(L"临时前台访问",error);return;
     }
-    const std::wstring displayName = ToLowerCopy(item.displayName);
-    const std::wstring path = ToLowerCopy(item.path);
-    const std::wstring targetPath = ToLowerCopy(item.targetPath);
-    return displayName.find(searchQuery_) != std::wstring::npos ||
-           path.find(searchQuery_) != std::wstring::npos ||
-           targetPath.find(searchQuery_) != std::wstring::npos;
+    SyncTabContainer(true);SetForegroundWindow(GetAncestor(desktopSurface_->Window(),GA_ROOT));SetFocus(desktopSurface_->Window());
+}
+
+bool MainWindow::EndTemporaryAccess(bool restoreHidden,bool force) {
+    if(!temporaryAccess_)return true;
+    if(accessInteractionDepth_&&!force) {temporaryEndPending_=true;return false;}
+    const bool hide=restoreHidden&&!temporaryWasVisible_;
+    temporaryTransition_=true;temporaryAccess_=false;temporaryPromoted_=false;temporaryEndPending_=false;
+    ShowWindow(hwnd_,SW_HIDE);
+    SetWindowPos(hwnd_,HWND_NOTOPMOST,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
+    std::wstring error;
+    if(desktopSurface_)desktopSurface_->SetTemporaryForeground(false,error);
+    temporaryTransition_=false;
+    if(hide) {
+        hostedWidgetCategoryIds_.clear();
+        if(desktopSurface_) {
+            ShowWindow(desktopSurface_->Window(),SW_HIDE);
+            if(force||accessInteractionDepth_)temporaryHiddenCleanup_=true;
+            else {desktopSurface_->Close();desktopSurface_.reset();}
+        }
+    } else if(!force&&desktopSurface_&&error.empty()) {
+        desktopSurface_->Show();SyncTabContainer(true);
+    }
+    if(!error.empty()&&desktopSurface_) {desktopSurface_->RetreatForRenderFailure();ShowNonBlockingNotice(L"临时前台访问",error);}
+    if(temporaryHiddenCleanup_&&!accessInteractionDepth_)PostMessageW(hwnd_,kFinishAccessInteractionMessage,0,0);
+    return error.empty();
 }
 
 void MainWindow::ToggleAllVisible() {
+    if(temporaryAccess_&&accessInteractionDepth_) {pendingAccessHide_=true;return;}
+    const bool endingTemporary=temporaryAccess_;
+    if(temporaryAccess_)EndTemporaryAccess(false);
     if (hwnd_ == nullptr) {
         return;
     }
-    bool anyVisible = windowConfig_.viewMode == 1
+    bool anyVisible = endingTemporary || (windowConfig_.viewMode == 1
         ? desktopSurface_ != nullptr &&
             desktopSurface_->Window() != nullptr &&
             IsWindowVisible(desktopSurface_->Window()) != FALSE &&
             !hostedWidgetCategoryIds_.empty()
-        : IsWindowVisible(hwnd_) != FALSE;
+        : IsWindowVisible(hwnd_) != FALSE);
     const bool show = !anyVisible;
     if (show &&
         (desktopSurface_ == nullptr ||
@@ -3593,7 +3748,7 @@ void MainWindow::ToggleAllVisible() {
     if (windowConfig_.viewMode == 1) {
         ShowWindow(hwnd_, SW_HIDE);
     } else {
-        ShowWindow(hwnd_, show ? SW_SHOWNOACTIVATE : SW_HIDE);
+        if (!show) SyncTabContainer(false);
     }
     if (show) {
         organizerConfig_.settings.lastVisible = true;
@@ -3629,9 +3784,49 @@ AppSettings MainWindow::SettingsForDialog() const {
     return settings;
 }
 
+bool MainWindow::ConfigureAccessHotkeys(const AppSettings& settings,std::wstring& error) {
+    error.clear();
+    std::array<AccessHotkeyBinding,2> next{{{0,settings.quickHideKey,settings.quickHideModifiers},{0,settings.temporaryAccessKey,settings.temporaryAccessModifiers}}};
+    for(auto& binding:next) {
+        if(binding.key==0) {binding.modifiers=0;continue;}
+        if(binding.key<1 || binding.key>255 || binding.modifiers<0 || (binding.modifiers&~15)!=0 ||
+           (binding.modifiers&(MOD_CONTROL|MOD_ALT|MOD_WIN))==0 ||
+           binding.key==VK_SHIFT || binding.key==VK_CONTROL || binding.key==VK_MENU || binding.key==VK_LWIN || binding.key==VK_RWIN) {
+            error=L"请使用包含 Ctrl、Alt 或 Win 的组合键；Backspace/Delete 可清除。";return false;
+        }
+    }
+    if(next[0].key && next[0].key==next[1].key && next[0].modifiers==next[1].modifiers) {
+        error=L"快速隐藏与临时访问不能使用相同快捷键；原有效绑定保持。";return false;
+    }
+    std::vector<int> fresh;
+    for(auto& binding:next) {
+        if(!binding.key)continue;
+        for(const auto& old:accessHotkeys_)if(old.id && old.key==binding.key && old.modifiers==binding.modifiers)binding.id=old.id;
+        if(binding.id)continue;
+        for(int id=0x4A00;id<0x4A08;++id) {
+            const bool used=std::any_of(accessHotkeys_.begin(),accessHotkeys_.end(),[&](const auto& old){return old.id==id;}) ||
+                std::any_of(next.begin(),next.end(),[&](const auto& other){return other.id==id;});
+            if(!used) {binding.id=id;break;}
+        }
+        if(!binding.id || !RegisterHotKey(hwnd_,binding.id,static_cast<UINT>(binding.modifiers)|MOD_NOREPEAT,static_cast<UINT>(binding.key))) {
+            const DWORD failure=GetLastError();for(int id:fresh)UnregisterHotKey(hwnd_,id);
+            error=L"快捷键已被占用或 Windows 拒绝注册（错误 "+std::to_wstring(failure)+L"）。原有效快捷键保持，请更换或清除。";
+            return false;
+        }
+        fresh.push_back(binding.id);
+    }
+    for(const auto& old:accessHotkeys_)if(old.id && std::none_of(next.begin(),next.end(),[&](const auto& value){return value.id==old.id;}))UnregisterHotKey(hwnd_,old.id);
+    accessHotkeys_=next;return true;
+}
+void MainWindow::ReleaseAccessHotkeys() noexcept {
+    for(auto& binding:accessHotkeys_) {if(binding.id && hwnd_)UnregisterHotKey(hwnd_,binding.id);binding={};}
+}
+
 void MainWindow::ShowSettings() {
     AppSettings pending = SettingsForDialog();
-    if (!SettingsDialog::Show(instance_, hwnd_, pending)) {
+    int pendingMode = windowConfig_.viewMode;
+    if (!SettingsDialog::Show(instance_, hwnd_, pending, &pendingMode,
+        [this](const AppSettings& candidate,std::wstring& error){return ConfigureAccessHotkeys(candidate,error);})) {
         return;
     }
 
@@ -3647,6 +3842,10 @@ void MainWindow::ShowSettings() {
     organizerConfig_.settings = pending;
     if (!SaveOrganizerConfig()) {
         organizerConfig_.settings = previousSettings;
+        std::wstring hotkeyError;
+        if(!ConfigureAccessHotkeys(previousSettings,hotkeyError)) {
+            ReleaseAccessHotkeys();ShowNonBlockingNotice(L"旧快捷键未恢复",hotkeyError);
+        }
         organizerConfig_.settings.launchOnStartup =
             startupManager_.IsEnabled();
         MessageDialog::Show(
@@ -3656,6 +3855,7 @@ void MainWindow::ShowSettings() {
         return;
     }
     ApplyLiveSettings(publicDesktopChanged);
+    SetViewMode(pendingMode);
 }
 
 void MainWindow::ApplyLiveSettings(bool publicDesktopChanged) {
@@ -3676,6 +3876,9 @@ void MainWindow::ApplyLiveSettings(bool publicDesktopChanged) {
 AutoOrganizePreviewInput MainWindow::BuildAutoOrganizePreviewInput() const {
     AutoOrganizePreviewInput input;
     const AppConfig currentConfig = configStore_.LoadAppConfig();
+    input.useRules = organizeRulesPreview_;
+    input.rules = currentConfig.organizeRules;
+    input.rulesReadError = currentConfig.organizeRulesReadError;
     input.undoAvailable = !currentConfig.autoOrganizeUndoHistory.empty();
     input.snapshot.configRevision = AutoOrganizeRevision(currentConfig);
     input.layoutContext.gap = 12;
@@ -3797,6 +4000,8 @@ AutoOrganizeApplyRequest MainWindow::BuildAutoOrganizeApplyRequest(
     const lattice::organize::Plan& plan,
     const lattice::organize::LayoutPlan& layout) const {
     AutoOrganizeApplyRequest request;
+    request.usesRules = plan.usesRules;
+    request.expectedRules = plan.evaluatedRules;
     request.transactionId = plan.id + L"-" +
         std::to_wstring(GetTickCount64());
     std::unordered_set<std::wstring> selectedTargets;
@@ -3912,7 +4117,18 @@ AutoOrganizeApplyRequest MainWindow::BuildAutoOrganizeApplyRequest(
     return request;
 }
 
-void MainWindow::ShowAutoOrganizePreview() {
+void MainWindow::ShowOrganizeRules() {
+    const auto result = OrganizeRulesDialog::Show(instance_, hwnd_, configStore_);
+    if (result != OrganizeRulesDialog::Result::Cancelled && autoOrganizePreview_ != nullptr)
+        autoOrganizePreview_->MarkDesktopChanged();
+    if (result == OrganizeRulesDialog::Result::Preview) ShowAutoOrganizePreview(true);
+}
+
+void MainWindow::ShowAutoOrganizePreview(bool useRules) {
+    if (autoOrganizeOperation_ != AutoOrganizeOperation::None) return;
+    if (autoOrganizePreview_ != nullptr && organizeRulesPreview_ != useRules)
+        autoOrganizePreview_->Close();
+    organizeRulesPreview_ = useRules;
     if (autoOrganizePreview_ == nullptr) {
         autoOrganizePreview_ = std::make_unique<AutoOrganizePreviewWindow>(
             instance_, nullptr,
@@ -3940,6 +4156,11 @@ void MainWindow::ApplyAutoOrganizePlan(
     }
     const AutoOrganizePreviewInput current =
         BuildAutoOrganizePreviewInput();
+    if (plan.usesRules && (current.rulesReadError || plan.evaluatedRules != current.rules)) {
+        if (autoOrganizePreview_ != nullptr) autoOrganizePreview_->CompleteApply(
+            false, L"规则已改变，请重新生成预览；本次未应用。" );
+        return;
+    }
     bool relatedContextChanged = !lattice::organize::IsMonitorContextCurrent(
             layout.monitorContextSignature,
             current.layoutContext.monitors);
@@ -4059,7 +4280,7 @@ bool MainWindow::PublishReloadedOrganizerState(
     const std::vector<std::wstring> previousOpenCategories =
         hostedWidgetCategoryIds_;
     LoadOrganizerConfig();
-    windowConfig_ = organizerConfig_.window;
+    windowConfig_ = ActiveWindowConfig();
     if (!newCategoryIds.empty() &&
         ShouldInjectSmokeAutoOrganizeWindowFailure(
             configStore_.ConfigPath())) {
@@ -4230,28 +4451,28 @@ bool MainWindow::PublishLayoutConfig(
         return false;
     }
 
+    const WindowConfig& activeLayout = widgetMode ? config.window : config.tabContainer;
     if (SetLayeredWindowAttributes(
-            hwnd_, 0, static_cast<BYTE>(config.window.opacity),
+            hwnd_, 0, static_cast<BYTE>(activeLayout.opacity),
             LWA_ALPHA) == FALSE ||
         SetWindowPos(
             hwnd_, nullptr,
-            config.window.x,
-            config.window.y,
-            config.window.width,
-            config.window.height,
+            activeLayout.x,
+            activeLayout.y,
+            activeLayout.width,
+            activeLayout.height,
             SWP_NOZORDER | SWP_NOACTIVATE) == FALSE) {
         return false;
     }
 
     ApplyOrganizerConfig(config);
-    windowConfig_ = config.window;
+    windowConfig_ = ActiveWindowConfig();
     hostedWidgetCategoryIds_ = visible && widgetMode
         ? targetWidgetIds
         : std::vector<std::wstring>{};
     RepublishDesktopSnapshotMembership();
     RefreshCurrentItems();
     iconGrid_.SetBounds(GridBounds());
-    LayoutSearchEdit();
 
     if (desktopSurface_ != nullptr) {
         desktopSurface_->UpdateAssignedIdentities(
@@ -4272,7 +4493,7 @@ bool MainWindow::PublishLayoutConfig(
     if (widgetMode) {
         ShowWindow(hwnd_, SW_HIDE);
     } else {
-        ShowWindow(hwnd_, visible ? SW_SHOWNOACTIVATE : SW_HIDE);
+        SyncTabContainer(visible);
     }
     InvalidateRect(hwnd_, nullptr, FALSE);
     return true;
@@ -4391,7 +4612,7 @@ void MainWindow::ImportConfig() {
     }
 
     LoadOrganizerConfig();
-    windowConfig_ = organizerConfig_.window;
+    windowConfig_ = ActiveWindowConfig();
     const int height = windowConfig_.collapsed ? kTitleHeight + kTabsHeight + 12 : windowConfig_.height;
     SetLayeredWindowAttributes(hwnd_, 0, static_cast<BYTE>(windowConfig_.opacity), LWA_ALPHA);
     SetWindowPos(hwnd_, nullptr, windowConfig_.x, windowConfig_.y, windowConfig_.width, height, SWP_NOZORDER | SWP_NOACTIVATE);
@@ -4399,15 +4620,12 @@ void MainWindow::ImportConfig() {
         DockTileWindowToWorkArea(false);
     }
     EnsureWindowVisible();
-    searchQuery_.clear();
-    if (searchEdit_ != nullptr) {
-        SetWindowTextW(searchEdit_, L"");
-    }
     LoadDesktopItems();
     InvalidateRect(hwnd_, nullptr, FALSE);
 }
 
 void MainWindow::ShowTrayMenu() {
+    AccessInteractionScope access(*this);
     HMENU menu = CreatePopupMenu();
     if (menu == nullptr) {
         return;
@@ -4421,6 +4639,8 @@ void MainWindow::ShowTrayMenu() {
     AppendMenuW(menu, MF_STRING, kTrayToggleLockCommand, windowConfig_.locked ? L"解除布局锁定" : L"锁定全部布局");
     AppendMenuW(menu, MF_STRING, kTrayRefreshCommand, L"刷新桌面项目");
     AppendMenuW(menu, MF_STRING, kAutoOrganizeCommand, L"自动整理桌面…");
+    AppendMenuW(menu, MF_STRING, kOrganizeRulesCommand, L"整理规则…");
+    AppendMenuW(menu, MF_STRING, kRulesPreviewCommand, L"按规则整理…");
     const bool canUndoAutoOrganize =
         !configStore_.LoadAppConfig().autoOrganizeUndoHistory.empty();
     AppendMenuW(
@@ -4524,8 +4744,15 @@ void MainWindow::LoadOrganizerConfig() {
 }
 
 void MainWindow::ApplyOrganizerConfig(const AppConfig& appConfig) {
+    const bool shortcutsChanged=organizerConfig_.settings.quickHideKey!=appConfig.settings.quickHideKey ||
+        organizerConfig_.settings.quickHideModifiers!=appConfig.settings.quickHideModifiers ||
+        organizerConfig_.settings.temporaryAccessKey!=appConfig.settings.temporaryAccessKey ||
+        organizerConfig_.settings.temporaryAccessModifiers!=appConfig.settings.temporaryAccessModifiers;
+    if(shortcutsChanged&&hwnd_&&IsWindow(hwnd_)) {
+        std::wstring error;if(!ConfigureAccessHotkeys(appConfig.settings,error))ShowNonBlockingNotice(L"导入的快捷键未启用",error);
+    }
     organizerConfig_.window = appConfig.window;
-    organizerConfig_.window.viewMode = 1;
+    organizerConfig_.tabContainer = appConfig.tabContainer;
     organizerConfig_.settings = appConfig.settings;
     organizerConfig_.settings.launchOnStartup = startupManager_.IsEnabled();
     organizerConfig_.currentCategoryId = appConfig.currentCategoryId.empty() ? kUncategorizedCategoryId : appConfig.currentCategoryId;
@@ -4570,33 +4797,17 @@ void MainWindow::ApplyOrganizerConfig(const AppConfig& appConfig) {
 }
 
 RECT MainWindow::GridBounds() const {
-    RECT client{};
-    GetClientRect(hwnd_, &client);
-    if (windowConfig_.viewMode == 1) {
-        client.left += 12;
-        client.right -= 12;
-        client.top += kTitleHeight + 8;
-        client.bottom -= 12;
-        if (client.right <= client.left) {
-            client.right = client.left + 1;
-        }
-        if (client.bottom <= client.top) {
-            client.bottom = client.top + 1;
-        }
-        return client;
+    RECT r{}; GetClientRect(hwnd_,&r);
+    if(windowConfig_.viewMode==1) {
+        r.left+=12;r.right-=12;r.top+=kTitleHeight+8;r.bottom-=12;
+    } else {
+        const auto s=[&](int dip){return MulDiv(dip,static_cast<int>(GetDpiForWindow(hwnd_)),96);};
+        const int side=std::clamp(windowConfig_.tabSide,0,3);
+        r.left+=s(side==2?kSideTabsWidth:14);r.right-=s(side==3?kSideTabsWidth:14);
+        r.top+=s(32); // Top tabs share the existing widget title, without a second row.
+        r.bottom-=s(side==1?54:14);
     }
-    const int side = std::clamp(windowConfig_.tabSide, 0, 3);
-    client.left += side == 2 ? kSideTabsWidth : 22;
-    client.right -= side == 3 ? kSideTabsWidth : 18;
-    client.top += side >= 2 ? kTitleHeight + 8 : 84;
-    client.bottom -= side == 1 ? kTabsHeight + 16 : 18;
-    if (client.right <= client.left) {
-        client.right = client.left + 1;
-    }
-    if (client.bottom <= client.top) {
-        client.bottom = client.top + 1;
-    }
-    return client;
+    r.right=std::max(r.left+1,r.right);r.bottom=std::max(r.top+1,r.bottom);return r;
 }
 
 RECT MainWindow::CollapseButtonBounds() const {
@@ -4612,24 +4823,45 @@ RECT MainWindow::LockButtonBounds() const {
 }
 
 RECT MainWindow::TabBounds(size_t index) const {
-    const size_t newIndex = organizerConfig_.categories.size() + 1;
-    const int side = std::clamp(windowConfig_.tabSide, 0, 3);
-    const int tabExtent = index == newIndex ? 38 : 112;
-    RECT client{};
-    GetClientRect(hwnd_, &client);
-    if (side == 2 || side == 3) {
-        const int width = std::min(kSideTabsWidth - 16, 124);
-        const int top = kTitleHeight + 8 + static_cast<int>(index) * (kTabsHeight + 6);
-        const int left = side == 2 ? 8 : std::max(8, static_cast<int>(client.right) - width - 8);
-        return RECT{left, top, left + width, top + kTabsHeight};
+    RECT client{};GetClientRect(hwnd_,&client);
+    const int dpi=static_cast<int>(GetDpiForWindow(hwnd_));
+    const auto s=[&](int dip){return MulDiv(dip,dpi,96);};
+    const size_t newIndex=organizerConfig_.categories.size()+1;
+    const int side=std::clamp(windowConfig_.tabSide,0,3);
+    const int extent=index==newIndex?28:74;
+    if(side>=2) {
+        const int width=std::min(kSideTabsWidth-16,124);
+        const int left=side==2?8:MulDiv(client.right,96,dpi)-width-8;
+        const int top=37+static_cast<int>(index)*35-tileScrollOffset_;
+        return RECT{s(left),s(top),s(left+width),s(top+30)};
     }
+    int x=(side==0?52:8)-tileScrollOffset_;for(size_t i=0;i<index;++i)x+=(i==newIndex?28:74)+3;
+    return RECT{s(x),side==1?client.bottom-s(35):s(2),s(x+extent),side==1?client.bottom-s(5):s(30)};
+}
 
-    int x = 18;
-    for (size_t i = 0; i < index; ++i) {
-        x += (i == newIndex ? 38 : 112) + 8;
-    }
-    const int y = side == 1 ? static_cast<int>(client.bottom) - kTabsHeight : kTabsTop;
-    return RECT{x, y + 4, x + tabExtent, y + kTabsHeight - 4};
+RECT MainWindow::TabViewport() const {
+    RECT client{};GetClientRect(hwnd_,&client);
+    const int dpi=static_cast<int>(GetDpiForWindow(hwnd_));const auto s=[&](int v){return MulDiv(v,dpi,96);};
+    const int side=std::clamp(windowConfig_.tabSide,0,3);
+    if(side>=2)return RECT{side==2?s(8):client.right-s(132),s(37),side==2?s(132):client.right-s(8),client.bottom-s(8)};
+    return side==0 ? RECT{s(52),s(2),std::max<LONG>(s(52),client.right-s(101)),s(30)}
+        : RECT{s(8),client.bottom-s(35),client.right-s(8),client.bottom-s(5)};
+}
+void MainWindow::EnsureCurrentTabVisible() {
+    if(windowConfig_.viewMode!=0 || tabScrollCategory_==organizerConfig_.currentCategoryId)return;
+    tabScrollCategory_=organizerConfig_.currentCategoryId;
+    size_t index=0;for(size_t i=0;i<organizerConfig_.categories.size();++i)if(organizerConfig_.categories[i].id==tabScrollCategory_)index=i+1;
+    const RECT view=TabViewport(),tab=TabBounds(index);const bool vertical=windowConfig_.tabSide>=2;
+    const int a=vertical?tab.top:tab.left,b=vertical?tab.bottom:tab.right,lo=vertical?view.top:view.left,hi=vertical?view.bottom:view.right;
+    const int shift=a<lo?a-lo:b>hi?b-hi:0;
+    tileScrollOffset_=std::max(0,tileScrollOffset_+MulDiv(shift,96,static_cast<int>(GetDpiForWindow(hwnd_))));
+}
+std::wstring MainWindow::TabCategoryAtScreenPoint(POINT point) const {
+    if(windowConfig_.viewMode!=0 || (windowConfig_.collapsed && windowConfig_.tabSide!=0) || !IsWindowVisible(hwnd_))return {};
+    ScreenToClient(hwnd_,&point);const int index=HitTestTab(point);
+    if(index==0)return kUncategorizedCategoryId;
+    if(index>0&&static_cast<size_t>(index-1)<organizerConfig_.categories.size())return organizerConfig_.categories[static_cast<size_t>(index-1)].id;
+    return {};
 }
 
 RECT MainWindow::TileHeaderBounds(size_t index) const {
@@ -4640,7 +4872,60 @@ RECT MainWindow::TileHeaderBounds(size_t index) const {
     return RECT{bounds.left + 1, bounds.top + 1, bounds.right - 1, bounds.top + kTileHeaderHeight - 1};
 }
 
+void MainWindow::RefreshTabTooltips() {
+    if(tabTooltip_) {DestroyWindow(tabTooltip_);tabTooltip_=nullptr;}
+    tabTipTexts_.clear();
+    if(windowConfig_.viewMode!=0) return;
+    tabTooltip_=CreateWindowExW(WS_EX_TOPMOST,TOOLTIPS_CLASSW,nullptr,WS_POPUP|TTS_ALWAYSTIP|TTS_NOPREFIX,0,0,0,0,hwnd_,nullptr,instance_,nullptr);
+    if(!tabTooltip_)return;
+    SetWindowTheme(tabTooltip_,L"",L"");SendMessageW(tabTooltip_,TTM_SETTIPBKCOLOR,RGB(12,49,62),0);
+    SendMessageW(tabTooltip_,TTM_SETTIPTEXTCOLOR,RGB(244,249,251),0);SendMessageW(tabTooltip_,TTM_SETMAXTIPWIDTH,0,280);
+    SendMessageW(tabTooltip_,TTM_SETDELAYTIME,TTDT_INITIAL,500);
+    tabTipTexts_.push_back(L"显示未分类");
+    for(const auto& c:organizerConfig_.categories)tabTipTexts_.push_back(L"显示分类："+c.name);
+    tabTipTexts_.push_back(L"新增分类");
+    for(size_t i=0;i<tabTipTexts_.size();++i) {
+        TOOLINFOW ti{sizeof(ti)};ti.uFlags=TTF_SUBCLASS;ti.hwnd=hwnd_;ti.uId=i+1;
+        const RECT tab=TabBounds(i),viewport=TabViewport();
+        if(!IntersectRect(&ti.rect,&tab,&viewport))continue;
+        ti.lpszText=tabTipTexts_[i].data();
+        SendMessageW(tabTooltip_,TTM_ADDTOOLW,0,reinterpret_cast<LPARAM>(&ti));
+    }
+}
+void MainWindow::RenderTabChrome() {
+    PAINTSTRUCT paint{};BeginPaint(hwnd_,&paint);
+    if(!d2d_.Target())d2d_.RecreateTarget(hwnd_);
+    auto* t=d2d_.Target();
+    if(!t) {EndPaint(hwnd_,&paint);if(desktopSurface_)desktopSurface_->RetreatForRenderFailure();return;}
+    d2d_.BeginDraw();
+    Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> border,text,active,hover;
+    t->CreateSolidColorBrush(D2D1::ColorF(0x427C8F,1),&border);
+    t->CreateSolidColorBrush(D2D1::ColorF(0xF4F9FB,1),&text);
+    t->CreateSolidColorBrush(D2D1::ColorF(0x184150,1),&active);
+    t->CreateSolidColorBrush(D2D1::ColorF(0x24566A,1),&hover);
+    t->Clear(D2D1::ColorF(0x010203,1));
+    Microsoft::WRL::ComPtr<IDWriteTextFormat> format;
+    d2d_.WriteFactory()->CreateTextFormat(L"Microsoft YaHei UI",nullptr,DWRITE_FONT_WEIGHT_NORMAL,DWRITE_FONT_STYLE_NORMAL,DWRITE_FONT_STRETCH_NORMAL,13,L"zh-cn",&format);
+    if(format) {format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);}
+    const float k=96.0f/static_cast<float>(GetDpiForWindow(hwnd_));
+    const RECT viewport=TabViewport();
+    t->PushAxisAlignedClip(D2D1::RectF(viewport.left*k,viewport.top*k,viewport.right*k,viewport.bottom*k),D2D1_ANTIALIAS_MODE_ALIASED);
+    for(size_t i=0;i<organizerConfig_.categories.size()+2;++i) {
+        const RECT p=TabBounds(i);const auto r=D2D1::RectF(p.left*k,p.top*k,p.right*k,p.bottom*k);
+        const bool add=i==organizerConfig_.categories.size()+1;
+        const auto label=i==0?organizerConfig_.uncategorizedName:add?std::wstring(L"+"):organizerConfig_.categories[i-1].name;
+        const bool selected=!add&&(i==0?organizerConfig_.currentCategoryId==kUncategorizedCategoryId:organizerConfig_.currentCategoryId==organizerConfig_.categories[i-1].id);
+        if(selected||hoverTabIndex_==static_cast<int>(i))t->FillRoundedRectangle(D2D1::RoundedRect(r,4,4),selected?active.Get():hover.Get());
+        if(selected)t->DrawRoundedRectangle(D2D1::RoundedRect(r,4,4),border.Get(),1);
+        if(format)t->DrawTextW(label.c_str(),static_cast<UINT32>(label.size()),format.Get(),r,text.Get(),D2D1_DRAW_TEXT_OPTIONS_CLIP);
+    }
+    t->PopAxisAlignedClip();
+    const HRESULT hr=d2d_.EndDraw();EndPaint(hwnd_,&paint);
+    if(FAILED(hr)&&desktopSurface_)desktopSurface_->RetreatForRenderFailure();
+}
+
 void MainWindow::Render() {
+    if(windowConfig_.viewMode==0) {RenderTabChrome();return;}
     PAINTSTRUCT paint{};
     BeginPaint(hwnd_, &paint);
 
@@ -5190,7 +5475,7 @@ void MainWindow::SaveWindowConfig() {
 
     if (windowConfig_.viewMode == 1) {
         LoadOrganizerConfig();
-        windowConfig_ = organizerConfig_.window;
+        windowConfig_ = ActiveWindowConfig();
         return;
     }
 
@@ -5213,7 +5498,7 @@ void MainWindow::SaveWindowConfig() {
     if (!windowConfig_.collapsed) {
         windowConfig_.normalHeight = windowConfig_.height;
     }
-    organizerConfig_.window = windowConfig_;
+    StoreActiveWindowConfig();
     SaveOrganizerConfig();
 }
 
@@ -5236,7 +5521,9 @@ bool MainWindow::SaveOrganizerConfig(
     const auto s0ProfileLoaded = std::chrono::steady_clock::now();
 #endif
     appConfig.settings = organizerConfig_.settings;
-    appConfig.window = windowConfig_;
+    StoreActiveWindowConfig();
+    appConfig.window = organizerConfig_.window;
+    appConfig.tabContainer = organizerConfig_.tabContainer;
     appConfig.currentCategoryId = organizerConfig_.currentCategoryId;
     appConfig.uncategorizedName = organizerConfig_.uncategorizedName;
     appConfig.uncategorizedStorageFolder = organizerConfig_.uncategorizedStorageFolder;
@@ -5308,7 +5595,7 @@ bool MainWindow::SaveOrganizerConfig(
 #ifndef NDEBUG
     const auto s0ProfileBuilt = std::chrono::steady_clock::now();
 #endif
-    if (!configStore_.SaveAppConfig(appConfig)) {
+    if (!configStore_.SaveAppConfig(appConfig, true)) {
         return false;
     }
 #ifndef NDEBUG
@@ -5330,6 +5617,8 @@ int MainWindow::HitTestTab(POINT point) const {
     if (windowConfig_.viewMode == 1) {
         return -1;
     }
+    const RECT viewport=TabViewport();
+    if(!PtInRect(&viewport,point))return -1;
     const size_t tabCount = organizerConfig_.categories.size() + 2;
     for (size_t index = 0; index < tabCount; ++index) {
         RECT tab = TabBounds(index);
@@ -5351,6 +5640,7 @@ bool MainWindow::HitTestLockButton(POINT point) const {
 }
 
 int MainWindow::HoverButton() const {
+    if(windowConfig_.viewMode==0)return -1;
     if (HitTestCollapseButton(lastMousePoint_)) {
         return 1;
     }
@@ -5361,30 +5651,20 @@ int MainWindow::HoverButton() const {
 }
 
 void MainWindow::RefreshCurrentItems() {
-    std::vector<DesktopItem> nextItems;
-    if (searchScope_ == 1) {
-        nextItems = DesktopItems();
-    } else if (searchScope_ == 2 || organizerConfig_.currentCategoryId == kUncategorizedCategoryId) {
-        nextItems = desktopSnapshot_ == nullptr
-            ? std::vector<DesktopItem>{}
-            : desktopSnapshot_->CopyItemsForCategory(kUncategorizedCategoryId);
-    } else {
-        nextItems = desktopSnapshot_ == nullptr
-            ? std::vector<DesktopItem>{}
-            : desktopSnapshot_->CopyItemsForCategory(
-                  organizerConfig_.currentCategoryId);
-    }
-    nextItems.erase(
-        std::remove_if(nextItems.begin(), nextItems.end(), [&](const DesktopItem& item) {
-            return !MatchesSearch(item);
-        }),
-        nextItems.end());
+    EnsureCurrentTabVisible();
+    std::vector<DesktopItem> nextItems = desktopSnapshot_ == nullptr
+        ? std::vector<DesktopItem>{}
+        : desktopSnapshot_->CopyItemsForCategory(organizerConfig_.currentCategoryId);
     const bool changed = !SameDesktopItems(currentItems_, nextItems);
     currentItems_ = std::move(nextItems);
     if (changed) {
         iconGrid_.SetItems(currentItems_);
     }
     RefreshTileViews();
+    if (windowConfig_.viewMode == 0) {
+        SyncHostedWidgets();
+        if (desktopSurface_ && IsWindowVisible(desktopSurface_->Window())) SyncTabContainer(true);
+    }
 }
 
 void MainWindow::RefreshTileViews() {
@@ -5401,20 +5681,13 @@ void MainWindow::RefreshTileViews() {
         std::wstring color;
     };
     std::vector<Source> sources;
-    if (searchScope_ != 2) {
-        sources.push_back(Source{kUncategorizedCategoryId, L"\u672a\u5206\u7c7b", L"#2D8CFF"});
-    }
-    if (searchScope_ != 2) {
-        for (size_t categoryIndex = 0; categoryIndex < organizerConfig_.categories.size(); ++categoryIndex) {
-            const Category& category = organizerConfig_.categories[categoryIndex];
-            sources.push_back(Source{
-                category.id,
-                category.name,
-                EffectiveCategoryColor(category.color, categoryIndex)});
-        }
-    }
-    if (searchScope_ == 2) {
-        sources.push_back(Source{kUncategorizedCategoryId, L"\u672a\u5206\u7c7b", L"#2D8CFF"});
+    sources.push_back(Source{kUncategorizedCategoryId, L"\u672a\u5206\u7c7b", L"#2D8CFF"});
+    for (size_t categoryIndex = 0; categoryIndex < organizerConfig_.categories.size(); ++categoryIndex) {
+        const Category& category = organizerConfig_.categories[categoryIndex];
+        sources.push_back(Source{
+            category.id,
+            category.name,
+            EffectiveCategoryColor(category.color, categoryIndex)});
     }
 
     const RECT content = GridBounds();
@@ -5438,11 +5711,6 @@ void MainWindow::RefreshTileViews() {
         std::vector<DesktopItem> viewItems = desktopSnapshot_ == nullptr
             ? std::vector<DesktopItem>{}
             : desktopSnapshot_->CopyItemsForCategory(source.id);
-        viewItems.erase(
-            std::remove_if(
-                viewItems.begin(), viewItems.end(),
-                [&](const DesktopItem& item) { return !MatchesSearch(item); }),
-            viewItems.end());
         view.itemCount = viewItems.size();
         const int tileHeight = view.collapsed ? kTileHeaderHeight : kTileExpandedHeight;
         view.bounds = RECT{left, top, left + tileWidth, top + tileHeight};
@@ -5670,7 +5938,7 @@ void MainWindow::ImportCurrentCategory() {
     category->color = imported.color;
     category->icon = imported.icon;
     category->layout = imported.layout;
-    organizerConfig_.window = windowConfig_;
+    StoreActiveWindowConfig();
     SaveOrganizerConfig();
     InvalidateRect(hwnd_, nullptr, FALSE);
 }
@@ -5761,7 +6029,7 @@ void MainWindow::ResetLayout() {
         return;
     }
     windowConfig_ = WindowConfig{};
-    organizerConfig_.window = windowConfig_;
+    StoreActiveWindowConfig();
     SetLayeredWindowAttributes(hwnd_, 0, static_cast<BYTE>(windowConfig_.opacity), LWA_ALPHA);
     SetWindowPos(hwnd_, nullptr, windowConfig_.x, windowConfig_.y, windowConfig_.width, windowConfig_.height, SWP_NOZORDER | SWP_NOACTIVATE);
     EnsureWindowVisible();
@@ -5770,53 +6038,140 @@ void MainWindow::ResetLayout() {
     InvalidateRect(hwnd_, nullptr, FALSE);
 }
 
-void MainWindow::SetViewMode(int viewMode) {
-    const int nextViewMode = std::clamp(viewMode, 0, 1);
-    const int previousViewMode = windowConfig_.viewMode;
-    if (nextViewMode == 1 && previousViewMode != 1) {
-        windowConfig_.viewMode = nextViewMode;
-        OpenAllCategoryWidgets();
+WindowConfig MainWindow::ActiveWindowConfig() const {
+    WindowConfig config = organizerConfig_.window.viewMode == 0
+        ? organizerConfig_.tabContainer : organizerConfig_.window;
+    config.viewMode = organizerConfig_.window.viewMode;
+    return config;
+}
+
+void MainWindow::StoreActiveWindowConfig() {
+    if (windowConfig_.viewMode == 0) organizerConfig_.tabContainer = windowConfig_;
+    else organizerConfig_.window = windowConfig_;
+    organizerConfig_.window.viewMode = windowConfig_.viewMode;
+}
+
+void MainWindow::SyncTabContainer(bool visible, bool closing) {
+    if (!hwnd_ || !IsWindow(hwnd_) || tabGeometryUpdating_) return;
+    tabGeometryUpdating_ = true;
+    if (!visible || closing || windowConfig_.viewMode != 0 ||
+        (!organizerConfig_.settings.lastVisible&&!temporaryAccess_) || !desktopSurface_ ||
+        !IsWindowVisible(desktopSurface_->Window())) {
         ShowWindow(hwnd_, SW_HIDE);
-    } else if (nextViewMode == 0 && previousViewMode == 1 && hasTileRestoreConfig_) {
-        windowConfig_ = tileRestoreConfig_;
-        windowConfig_.viewMode = nextViewMode;
-        hasTileRestoreConfig_ = false;
-        hostedWidgetCategoryIds_.clear();
-        SyncHostedWidgets();
-        SetWindowPos(
-            hwnd_,
-            nullptr,
-            windowConfig_.x,
-            windowConfig_.y,
-            windowConfig_.width,
-            windowConfig_.height,
-            SWP_NOZORDER | SWP_NOACTIVATE);
-    } else {
-        windowConfig_.viewMode = nextViewMode;
-        if (nextViewMode == 1) {
-            OpenAllCategoryWidgets();
-            ShowWindow(hwnd_, SW_HIDE);
-        } else {
-            hostedWidgetCategoryIds_.clear();
-            SyncHostedWidgets();
-            ShowWindow(hwnd_, SW_SHOWNOACTIVATE);
+        if (closing) {
+            SetWindowPos(hwnd_, HWND_NOTOPMOST, 0,0,0,0, SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
+            SetWindowLongPtrW(hwnd_,GWL_STYLE,(GetWindowLongPtrW(hwnd_,GWL_STYLE)&~WS_CHILD)|WS_POPUP);
+            SetParent(hwnd_, nullptr);
+        }
+        tabGeometryUpdating_ = false;
+        return;
+    }
+    const HWND parent = GetAncestor(desktopSurface_->Window(), GA_PARENT);
+    if (!parent || !IsWindow(parent)) {
+        ShowWindow(hwnd_, SW_HIDE);
+        tabGeometryUpdating_ = false;
+        return;
+    }
+    const HWND currentParent=GetAncestor(hwnd_,GA_PARENT);
+    const bool parentChanged=(currentParent==GetDesktopWindow()?nullptr:currentParent)!=parent;
+    const LONG_PTR extendedStyle=GetWindowLongPtrW(hwnd_,GWL_EXSTYLE);
+    if(parentChanged) {
+        ShowWindow(hwnd_,SW_HIDE);iconCache_.Clear();d2d_.ReleaseTarget();
+        SetWindowLongPtrW(hwnd_,GWL_EXSTYLE,extendedStyle&~WS_EX_LAYERED);
+        const LONG_PTR style=GetWindowLongPtrW(hwnd_,GWL_STYLE);
+        SetWindowLongPtrW(hwnd_,GWL_STYLE,temporaryPromoted_?(style&~WS_POPUP)|WS_CHILD:(style&~WS_CHILD)|WS_POPUP);
+        SetParent(hwnd_,parent);
+        SetWindowLongPtrW(hwnd_,GWL_EXSTYLE,extendedStyle);
+        SetLayeredWindowAttributes(hwnd_,0,static_cast<BYTE>(windowConfig_.opacity),LWA_ALPHA);
+    }
+    RECT screen{};
+    GetWindowRect(hwnd_, &screen);
+    POINT origin{screen.left, screen.top};
+    if(parent)ScreenToClient(parent, &origin);
+    SetWindowPos(hwnd_, HWND_TOP, origin.x, origin.y, 0,0,SWP_NOSIZE|SWP_NOACTIVATE|SWP_FRAMECHANGED);
+    if(parentChanged)d2d_.RecreateTarget(hwnd_);
+    SetLayeredWindowAttributes(hwnd_, RGB(1,2,3), 255, LWA_COLORKEY);
+    RECT client{}; GetClientRect(hwnd_, &client);
+    const int dpi = static_cast<int>(GetDpiForWindow(hwnd_));
+    const auto scale = [dpi](int dip){return MulDiv(dip,dpi,96);};
+    const RECT headerTabs = TabViewport();
+    HRGN region = windowConfig_.tabSide == 0
+        ? CreateRectRgnIndirect(&headerTabs) : CreateRectRgn(0,0,0,0);
+    if (region && !windowConfig_.collapsed) {
+        const RECT content = GridBounds();
+        const int side = std::clamp(windowConfig_.tabSide,0,3);
+        if (region && side != 0) {
+            RECT tabs = side==1 ? RECT{scale(3),content.bottom,client.right-scale(3),client.bottom-scale(3)}
+                : side==2 ? RECT{scale(3),scale(32),content.left,client.bottom-scale(3)}
+                : RECT{content.right,scale(32),client.right-scale(3),client.bottom-scale(3)};
+            HRGN part = CreateRectRgnIndirect(&tabs);
+            if (!part || CombineRgn(region,region,part,RGN_OR)==ERROR) {
+                if (part) DeleteObject(part); DeleteObject(region); region=nullptr;
+            } else DeleteObject(part);
         }
     }
-    organizerConfig_.window = windowConfig_;
-    tileScrollOffset_ = 0;
-    iconGrid_.SetBounds(GridBounds());
+    if (!region || !SetWindowRgn(hwnd_, region, TRUE)) {
+        if (region) DeleteObject(region);
+        ShowWindow(hwnd_, SW_HIDE);
+    } else {
+        ShowWindow(hwnd_, SW_SHOWNOACTIVATE);
+        RefreshTabTooltips();
+        InvalidateRect(hwnd_, nullptr, FALSE);
+    }
+    tabGeometryUpdating_ = false;
+}
+
+void MainWindow::SetViewMode(int viewMode) {
+    const int next = std::clamp(viewMode, 0, 1);
+    if(next==windowConfig_.viewMode)return;
+    if(temporaryAccess_&&accessInteractionDepth_) {pendingAccessMode_=std::clamp(viewMode,0,1);temporaryEndPending_=true;return;}
+    EndTemporaryAccess();
+    if(tabTooltip_) {DestroyWindow(tabTooltip_);tabTooltip_=nullptr;tabTipTexts_.clear();}
+    if (next == windowConfig_.viewMode) return;
+    SaveWindowConfig();
+    const WindowConfig previousActive = windowConfig_;
+    const OrganizerConfig previous = organizerConfig_;
+    StoreActiveWindowConfig();
+    organizerConfig_.window.viewMode = next;
+    windowConfig_ = ActiveWindowConfig();
+    if (!SaveOrganizerConfig()) {
+        organizerConfig_ = previous; windowConfig_ = previousActive;
+        ShowNonBlockingNotice(L"分类显示方式", L"模式未保存，保留原布局，请重试。");
+        return;
+    }
+    ShowWindow(hwnd_, SW_HIDE);
+    hostedWidgetCategoryIds_.clear();
+    if (next == 0) {
+        SetLayeredWindowAttributes(hwnd_, 0, static_cast<BYTE>(windowConfig_.opacity), LWA_ALPHA);
+        SetWindowPos(hwnd_, nullptr, windowConfig_.x, windowConfig_.y,
+            windowConfig_.width, windowConfig_.height, SWP_NOZORDER|SWP_NOACTIVATE);
+    } else {
+        SetWindowRgn(hwnd_, nullptr, TRUE);
+    }
+    tileScrollOffset_ = 0;tabScrollCategory_.clear();
     RefreshCurrentItems();
-    LayoutSearchEdit();
-    SaveOrganizerConfig();
+    if (organizerConfig_.settings.lastVisible) {
+        if (!desktopSurface_) {
+            std::wstring error;
+            if (!EnableDesktopDisplayTakeover(error)) {
+                ShowNonBlockingNotice(L"分类显示方式", error);
+                return;
+            }
+        }
+        if (next == 1) OpenAllCategoryWidgets();
+        else SyncHostedWidgets();
+        desktopSurface_->Show();
+        SyncTabContainer(true);
+    }
     InvalidateRect(hwnd_, nullptr, FALSE);
 }
 
 void MainWindow::SetTabSide(int side) {
     windowConfig_.tabSide = std::clamp(side, 0, 3);
-    organizerConfig_.window = windowConfig_;
+    tileScrollOffset_=0;tabScrollCategory_.clear();EnsureCurrentTabVisible();
+    StoreActiveWindowConfig();
     iconGrid_.SetBounds(GridBounds());
     RefreshTileViews();
-    LayoutSearchEdit();
     SaveOrganizerConfig();
     InvalidateRect(hwnd_, nullptr, FALSE);
 }
@@ -5857,6 +6212,7 @@ void MainWindow::RefreshIconCache() {
 }
 
 void MainWindow::ShowBackgroundMenu(POINT screenPoint) {
+    AccessInteractionScope accessScope(*this);
     HMENU menu = CreatePopupMenu();
     const bool canEditCategory = organizerConfig_.currentCategoryId != kUncategorizedCategoryId;
     AppendMenuW(menu, canEditCategory ? MF_STRING : MF_GRAYED, kExportCategoryCommand, L"\u5bfc\u51fa\u5f53\u524d\u5206\u7c7b");
@@ -5895,6 +6251,8 @@ void MainWindow::ShowBackgroundMenu(POINT screenPoint) {
     AppendMenuW(menu, MF_STRING, kImportDesktopCommand, L"\u5bfc\u5165\u672a\u6536\u7eb3\u684c\u9762\u9879");
     AppendMenuW(menu, MF_STRING, kRefreshDesktopCommand, L"刷新桌面项目");
     AppendMenuW(menu, MF_STRING, kAutoOrganizeCommand, L"自动整理桌面…");
+    AppendMenuW(menu, MF_STRING, kOrganizeRulesCommand, L"整理规则…");
+    AppendMenuW(menu, MF_STRING, kRulesPreviewCommand, L"按规则整理…");
     AppendMenuW(
         menu,
         configStore_.LoadAppConfig().autoOrganizeUndoHistory.empty()
@@ -5935,6 +6293,7 @@ void MainWindow::ShowIconMenu(POINT screenPoint, int iconIndex) {
 }
 
 void MainWindow::ShowItemMenu(POINT screenPoint, const std::wstring& itemId) {
+    AccessInteractionScope accessScope(*this);
     const DesktopItem* item = FindItem(itemId);
     if (item == nullptr) {
         return;
@@ -5987,6 +6346,7 @@ void MainWindow::ShowItemMenu(POINT screenPoint, const std::wstring& itemId) {
 }
 
 void MainWindow::ShowTileMenu(POINT screenPoint, size_t tileIndex) {
+    AccessInteractionScope accessScope(*this);
     if (tileIndex >= tileViews_.size()) {
         return;
     }
@@ -6107,6 +6467,12 @@ void MainWindow::DeleteCurrentCategory() {
     }
 
     const std::wstring id = organizerConfig_.currentCategoryId;
+    std::wstring neighbor=kUncategorizedCategoryId;
+    for(size_t i=0;i<organizerConfig_.categories.size();++i)if(organizerConfig_.categories[i].id==id) {
+        if(i+1<organizerConfig_.categories.size())neighbor=organizerConfig_.categories[i+1].id;
+        else if(i>0)neighbor=organizerConfig_.categories[i-1].id;
+        break;
+    }
     const Category* category = FindCategory(id);
     const std::vector<std::wstring> itemIds = category == nullptr ? std::vector<std::wstring>{} : category->itemIds;
     for (const std::wstring& itemId : itemIds) {
@@ -6131,7 +6497,7 @@ void MainWindow::DeleteCurrentCategory() {
             return category.id == id;
         }),
         organizerConfig_.categories.end());
-    organizerConfig_.currentCategoryId = kUncategorizedCategoryId;
+    organizerConfig_.currentCategoryId = neighbor;
     RefreshCurrentItems();
     SaveOrganizerConfig();
     InvalidateRect(hwnd_, nullptr, FALSE);
@@ -6146,19 +6512,19 @@ void MainWindow::ToggleCollapsed() {
     windowConfig_.width = rect.right - rect.left;
     if (windowConfig_.collapsed) {
         windowConfig_.normalHeight = rect.bottom - rect.top;
-        windowConfig_.height = kTitleHeight + kTabsHeight + 12;
+        windowConfig_.height = windowConfig_.viewMode==0?MulDiv(32,static_cast<int>(GetDpiForWindow(hwnd_)),96):kTitleHeight + kTabsHeight + 12;
     } else {
         windowConfig_.height = std::max(windowConfig_.normalHeight, 320);
     }
     SetWindowPos(hwnd_, nullptr, windowConfig_.x, windowConfig_.y, windowConfig_.width, windowConfig_.height, SWP_NOZORDER);
-    organizerConfig_.window = windowConfig_;
+    StoreActiveWindowConfig();
     SaveOrganizerConfig();
     InvalidateRect(hwnd_, nullptr, FALSE);
 }
 
 void MainWindow::ToggleLocked() {
     windowConfig_.locked = !windowConfig_.locked;
-    organizerConfig_.window = windowConfig_;
+    StoreActiveWindowConfig();
     SaveOrganizerConfig();
     InvalidateRect(hwnd_, nullptr, FALSE);
 }
@@ -6166,7 +6532,7 @@ void MainWindow::ToggleLocked() {
 void MainWindow::ToggleAllLocked() {
     const bool locked = !windowConfig_.locked;
     windowConfig_.locked = locked;
-    organizerConfig_.window = windowConfig_;
+    StoreActiveWindowConfig();
     for (Category& category : organizerConfig_.categories) {
         category.layout.locked = locked;
     }
@@ -6180,7 +6546,7 @@ void MainWindow::SetIconSize(int iconSize) {
     iconGrid_.SetIconSize(windowConfig_.iconSize);
     iconGrid_.SetBounds(GridBounds());
     RefreshTileViews();
-    organizerConfig_.window = windowConfig_;
+    StoreActiveWindowConfig();
     SaveOrganizerConfig();
     InvalidateRect(hwnd_, nullptr, FALSE);
 }
@@ -6189,7 +6555,7 @@ void MainWindow::SetDensity(int density) {
     windowConfig_.density = std::clamp(density, 0, 2);
     iconGrid_.SetDensity(windowConfig_.density);
     RefreshTileViews();
-    organizerConfig_.window = windowConfig_;
+    StoreActiveWindowConfig();
     SaveOrganizerConfig();
     InvalidateRect(hwnd_, nullptr, FALSE);
 }
@@ -6217,9 +6583,6 @@ void MainWindow::ImportUnassignedDesktopItems() {
 }
 
 void MainWindow::ReorderCurrentCategoryItem(size_t fromIndex, size_t toIndex) {
-    if (!searchQuery_.empty() || searchScope_ != 0) {
-        return;
-    }
     if (fromIndex >= currentItems_.size() || toIndex >= currentItems_.size()) {
         return;
     }

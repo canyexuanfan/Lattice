@@ -35,6 +35,7 @@ struct RegisteredItem {
 struct OrganizerConfig {
     AppSettings settings;
     WindowConfig window;
+    WindowConfig tabContainer;
     std::wstring currentCategoryId = kUncategorizedCategoryId;
     std::wstring uncategorizedName = L"未分类";
     std::wstring uncategorizedStorageFolder = kUncategorizedCategoryId;

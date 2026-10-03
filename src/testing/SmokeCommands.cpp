@@ -72,6 +72,8 @@
 #include "ui/WidgetWindow.h"
 #include "ui/WidgetView.h"
 #include "testing/SmokeCommands.h"
+#include "testing/RuleSmoke.h"
+#include "testing/DisplayModesSmoke.h"
 
 #pragma comment(lib, "dwmapi.lib")
 
@@ -19616,6 +19618,13 @@ int RunSmokeNativeDesktopHost(HINSTANCE instance) {
             MsgWaitForMultipleObjects(0,nullptr,FALSE,10,QS_ALLINPUT);
         } while (GetTickCount64()<until);
     };
+    const auto positionPointer = [](int x, int y) {
+        INPUT event{}; event.type=INPUT_MOUSE;
+        event.mi.dx=MulDiv(x-GetSystemMetrics(SM_XVIRTUALSCREEN),65535,(std::max)(1,GetSystemMetrics(SM_CXVIRTUALSCREEN)-1));
+        event.mi.dy=MulDiv(y-GetSystemMetrics(SM_YVIRTUALSCREEN),65535,(std::max)(1,GetSystemMetrics(SM_CYVIRTUALSCREEN)-1));
+        event.mi.dwFlags=MOUSEEVENTF_MOVE|MOUSEEVENTF_ABSOLUTE|MOUSEEVENTF_VIRTUALDESK;
+        return SendInput(1,&event,sizeof(event))==1;
+    };
     DesktopLayout layout; DesktopViewSnapshot source; std::wstring error;
     std::vector<DesktopPosition> before, after;
     if (!layout.CaptureViewSnapshot(source,error) || !layout.CaptureAllPositions(before,error)) return 492;
@@ -19647,7 +19656,7 @@ int RunSmokeNativeDesktopHost(HINSTANCE instance) {
         if(focused!=source.items.end()) originalView->SelectItem(reinterpret_cast<PCUITEMID_CHILD>(focused->shellChildPidl.data()),SVSI_FOCUSED);
     };
     struct RestoreScope { std::function<void()> action; ~RestoreScope(){action();} } restore{[&]{
-        restoreSelection(); SetCursorPos(savedCursor.x,savedCursor.y);
+        restoreSelection(); positionPointer(savedCursor.x,savedCursor.y);
         if(savedForeground && IsWindow(savedForeground)) SetForegroundWindow(savedForeground);
     }};
     const POINT iconPoint{item->screenPoint.x+24,item->screenPoint.y+24};
@@ -19656,7 +19665,7 @@ int RunSmokeNativeDesktopHost(HINSTANCE instance) {
         return p.path!=item->path && std::abs(p.screenPoint.x-iconPoint.x)<144 && std::abs(p.screenPoint.y-iconPoint.y)<100;
     });
     const auto click=[&](POINT p) {
-        SetCursorPos(p.x,p.y); INPUT input[2]{}; input[0].type=input[1].type=INPUT_MOUSE;
+        positionPointer(p.x,p.y); INPUT input[2]{}; input[0].type=input[1].type=INPUT_MOUSE;
         input[0].mi.dwFlags=MOUSEEVENTF_LEFTDOWN; input[1].mi.dwFlags=MOUSEEVENTF_LEFTUP;
         return SendInput(2,input,sizeof(INPUT))==2;
     };
@@ -19682,7 +19691,7 @@ int RunSmokeNativeDesktopHost(HINSTANCE instance) {
         << (focusOther==source.items.end()?-1:focusOther->viewIndex) << " source_selected="
         << SendMessageW(source.listViewWindow,LVM_GETSELECTEDCOUNT,0,0) << '\n'; report.flush();
     RedrawWindow(source.listViewWindow,nullptr,nullptr,RDW_INVALIDATE|RDW_UPDATENOW|RDW_ALLCHILDREN);
-    SetCursorPos(iconPoint.x,iconPoint.y); pump(150); DwmFlush();
+    positionPointer(iconPoint.x,iconPoint.y); pump(150); DwmFlush();
     std::vector<std::uint32_t> sourceHover,sourceSelected,nativeHover,nativeSelected;
     const bool sourceHoverCaptured=CaptureScreenPixels(stateRect,sourceHover);
     const bool sourceClicked=click(iconPoint); pump(100); DwmFlush();
@@ -19714,7 +19723,7 @@ int RunSmokeNativeDesktopHost(HINSTANCE instance) {
         SVSI_FOCUSED|SVSI_SELECT|SVSI_DESELECTOTHERS);
     DesktopSurfaceWindowSmokeAccess::NativeSelect(surface,{},SVSI_DESELECTOTHERS);
     RedrawWindow(DesktopSurfaceWindowSmokeAccess::NativeList(surface),nullptr,nullptr,RDW_INVALIDATE|RDW_UPDATENOW|RDW_ALLCHILDREN);
-    SetCursorPos(iconPoint.x,iconPoint.y); pump(150); DwmFlush();
+    positionPointer(iconPoint.x,iconPoint.y); pump(150); DwmFlush();
     const bool hoverSame=nativeBlankClicked && sourceHoverCaptured && CaptureScreenPixels(stateRect,nativeHover) && sourceHover==nativeHover;
     const bool nativeClicked=click(iconPoint); pump(100); DwmFlush();
     const bool selectedSame=ready && sourceClicked && nativeClicked && sourceSelectedCaptured &&
@@ -19740,18 +19749,37 @@ int RunSmokeNativeDesktopHost(HINSTANCE instance) {
     const bool nativeRename=IsWindow(reinterpret_cast<HWND>(SendMessageW(nativeList,LVM_GETEDITCONTROL,0,0)))!=FALSE;
     key(VK_ESCAPE); pump(100);
     const bool renameCancelled=!IsWindow(reinterpret_cast<HWND>(SendMessageW(nativeList,LVM_GETEDITCONTROL,0,0)));
-    bool menuObserved=false;
+    bool menuObserved=false,menuFlagObserved=false;
+    bool menuInjected=false, menuHitNative=false;
     std::thread menuInput([&] {
         if(!keyboardFocus || !renameCancelled) return;
         SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-        SetCursorPos(iconPoint.x,iconPoint.y);
-        INPUT events[2]{}; events[0].type=events[1].type=INPUT_MOUSE;
-        events[0].mi.dwFlags=MOUSEEVENTF_RIGHTDOWN; events[1].mi.dwFlags=MOUSEEVENTF_RIGHTUP;
-        SendInput(2,events,sizeof(INPUT));
+        INPUT events[2]{};
+        for(int i=0;i<2;++i) {
+            events[i].type=INPUT_KEYBOARD;events[i].ki.wVk=VK_APPS;
+            events[i].ki.dwFlags=i?KEYEVENTF_KEYUP:0;
+        }
+        menuHitNative=WindowFromPoint(iconPoint)==nativeList;
+        menuInjected=SendInput(2,events,sizeof(INPUT))==2;
         const ULONGLONG until=GetTickCount64()+2500;
+        Sleep(250); // Allow the Shell popup to commit before cross-thread observation.
         do {
-            Sleep(20); GUITHREADINFO info{sizeof(info)};
-            menuObserved=GetGUIThreadInfo(GetWindowThreadProcessId(nativeList,nullptr),&info) && (info.flags&GUI_INMENUMODE)!=0;
+            Sleep(20);
+            GUITHREADINFO info{sizeof(info)};
+            menuFlagObserved=GetGUIThreadInfo(GetWindowThreadProcessId(nativeList,nullptr),&info) && (info.flags&GUI_INMENUMODE)!=0;
+            EnumWindows([](HWND window,LPARAM output)->BOOL {
+                DWORD pid=0;GetWindowThreadProcessId(window,&pid);
+                wchar_t name[32]{};RECT rect{};
+                if(pid==GetCurrentProcessId() && IsWindowVisible(window) &&
+                    GetClassNameW(window,name,ARRAYSIZE(name)) && wcscmp(name,L"#32768")==0 &&
+                    GetWindowRect(window,&rect) && rect.right>rect.left && rect.bottom>rect.top) {
+                    const POINT center{(rect.left+rect.right)/2,(rect.top+rect.bottom)/2};
+                    if(WindowFromPoint(center)==window) {
+                        *reinterpret_cast<bool*>(output)=true;return FALSE;
+                    }
+                }
+                return TRUE;
+            },reinterpret_cast<LPARAM>(&menuObserved));
         } while(!menuObserved && GetTickCount64()<until);
         key(VK_ESCAPE);
         Sleep(100);
@@ -19760,7 +19788,15 @@ int RunSmokeNativeDesktopHost(HINSTANCE instance) {
     });
     pump(3000); menuInput.join(); pump(100);
     report << "keyboard_focus=" << keyboardFocus << " f2_injected=" << f2Injected << " native_rename=" << nativeRename
-        << " rename_cancelled=" << renameCancelled << " menu_observed=" << menuObserved << '\n'; report.flush();
+        << " rename_cancelled=" << renameCancelled << " menu_observed=" << menuObserved
+        << " menu_flag=" << menuFlagObserved << " menu_visible=" << menuObserved
+        << " menu_injected=" << menuInjected << " menu_hit_native=" << menuHitNative
+        << '\n'; report.flush();
+    wchar_t menuOnly[2]{};
+    if(GetEnvironmentVariableW(L"LATTICE_SMOKE_NATIVE_MENU_ONLY",menuOnly,ARRAYSIZE(menuOnly))==1 && menuOnly[0]==L'1') {
+        report << "menu_only=1\n";report.flush();
+        return ready&&hoverSame&&selectedSame&&keyboardFocus&&nativeRename&&renameCancelled&&menuObserved ? 0:494;
+    }
     const auto injectDrag=[&](POINT start,POINT end) {
         std::atomic<bool> done{false}, injected{false};
         std::thread input([&] {
@@ -19874,7 +19910,7 @@ int RunSmokeNativeDesktopHost(HINSTANCE instance) {
         bool backgroundRefreshClicked=false;
         std::thread backgroundInput([&] {
             SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-            SetCursorPos(800,150);
+            positionPointer(800,150);
             INPUT events[2]{}; events[0].type=events[1].type=INPUT_MOUSE;
             events[0].mi.dwFlags=MOUSEEVENTF_RIGHTDOWN; events[1].mi.dwFlags=MOUSEEVENTF_RIGHTUP;
             SendInput(2,events,sizeof(INPUT));
@@ -19930,8 +19966,15 @@ int RunSmokeNativeDesktopHost(HINSTANCE instance) {
         const HWND beforeOpenList=DesktopSurfaceWindowSmokeAccess::NativeList(surface);
         controlledPoint.x+=24; controlledPoint.y+=24;
         pump(GetDoubleClickTime()+40);
-        opened=WindowFromPoint(controlledPoint)==nativeList && click(controlledPoint);
-        pump(60); opened=click(controlledPoint) && opened;
+        INPUT doubleClick[4]{};
+        for(size_t i=0;i<ARRAYSIZE(doubleClick);++i) {
+            doubleClick[i].type=INPUT_MOUSE;
+            doubleClick[i].mi.dx=MulDiv(controlledPoint.x-GetSystemMetrics(SM_XVIRTUALSCREEN),65535,(std::max)(1,GetSystemMetrics(SM_CXVIRTUALSCREEN)-1));
+            doubleClick[i].mi.dy=MulDiv(controlledPoint.y-GetSystemMetrics(SM_YVIRTUALSCREEN),65535,(std::max)(1,GetSystemMetrics(SM_CYVIRTUALSCREEN)-1));
+            doubleClick[i].mi.dwFlags=MOUSEEVENTF_MOVE|MOUSEEVENTF_ABSOLUTE|MOUSEEVENTF_VIRTUALDESK|
+                (i%2?MOUSEEVENTF_LEFTUP:MOUSEEVENTF_LEFTDOWN);
+        }
+        opened=WindowFromPoint(controlledPoint)==nativeList && SendInput(ARRAYSIZE(doubleClick),doubleClick,sizeof(INPUT))==ARRAYSIZE(doubleClick);
         const ULONGLONG until=GetTickCount64()+4000;
         while(receiptCount()==receiptsBefore && GetTickCount64()<until) pump(20);
         pump(400);
@@ -20126,7 +20169,7 @@ int RunSmokeNativeDesktopHost(HINSTANCE instance) {
         POINT paintPoint{};
         const bool positioned=DesktopSurfaceWindowSmokeAccess::NativePoint(openSurface,computer->path,paintPoint);
         const RECT rect{paintPoint.x,paintPoint.y,paintPoint.x+72,paintPoint.y+72};
-        SetCursorPos(paintPoint.x+180,paintPoint.y+200); pump(100);
+        positionPointer(paintPoint.x+180,paintPoint.y+200); pump(100);
         std::vector<std::uint32_t> beforePaint,afterPaint;
         const HWND parent=DesktopSurfaceWindowSmokeAccess::NativeParent(openSurface);
         const bool captured=positioned && WindowFromPoint({paintPoint.x+24,paintPoint.y+24})==DesktopSurfaceWindowSmokeAccess::NativeList(openSurface) && CaptureScreenPixels(rect,beforePaint);
@@ -20198,7 +20241,7 @@ int RunSmokeNativeDesktopHost(HINSTANCE instance) {
     openAppOwner=nullptr;
     openApp.reset();
     report << "app_close_complete=1\n"; report.flush();
-    surface.Close(); SetCursorPos(savedCursor.x,savedCursor.y);
+    surface.Close(); positionPointer(savedCursor.x,savedCursor.y);
     if(savedForeground && IsWindow(savedForeground)) SetForegroundWindow(savedForeground);
     pump(100);
     report << "original_positions_read_begin=1\n"; report.flush();
@@ -23835,6 +23878,11 @@ bool HasArgument(PWSTR commandLine, const wchar_t* target) {
 
 }  // namespace
 
+bool SaveSmokeWindowScreen(HWND window, const std::wstring& outputPath) {
+    RECT bounds{}; std::vector<std::uint32_t> pixels;
+    return GetWindowRect(window,&bounds) && CaptureScreenPixels(bounds,pixels) && SaveCapturedPixelsBmp(bounds,pixels,outputPath);
+}
+
 std::optional<int> RunSmokeOrPreviewCommand(
     HINSTANCE instance,
     PWSTR commandLine) {
@@ -23855,6 +23903,12 @@ std::optional<int> RunSmokeOrPreviewCommand(
     }
     if (HasArgument(commandLine, L"--smoke-auto-organize-logic")) {
         return RunSmokeAutoOrganizeLogic();
+    }
+    if (HasArgument(commandLine, L"--smoke-temporary-access")) return RunSmokeTemporaryAccess(instance);
+    if (HasArgument(commandLine, L"--smoke-access-hotkeys")) return RunSmokeAccessHotkeys(instance);
+    if (HasArgument(commandLine, L"--smoke-display-modes")) return RunSmokeDisplayModes(instance);
+    if (HasArgument(commandLine, L"--smoke-organize-rules")) {
+        return RunSmokeOrganizeRules(instance);
     }
     if (HasArgument(commandLine, L"--smoke-auto-organize-layout")) {
         return RunSmokeAutoOrganizeLayout();

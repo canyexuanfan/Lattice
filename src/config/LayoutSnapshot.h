@@ -33,6 +33,9 @@ struct LayoutSnapshot {
     bool globalVisible = true;
     int viewMode = 1;
     WindowConfig main;
+    bool hasTabContainer = false;
+    WindowConfig tabContainer;
+    std::wstring currentCategoryId;
     std::vector<std::wstring> uncategorizedItemOrder;
     std::vector<LayoutCategorySnapshot> categories;
     std::vector<DesktopPlacementConfig> desktopDisplayLayout;

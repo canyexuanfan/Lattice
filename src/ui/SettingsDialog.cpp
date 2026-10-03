@@ -1,4 +1,6 @@
 #include "ui/SettingsDialog.h"
+#include "ui/DialogStyle.h"
+#include "ui/MessageDialog.h"
 
 #include <CommCtrl.h>
 #include <dwmapi.h>
@@ -20,6 +22,9 @@ constexpr int kOkId = 1007;
 constexpr int kCancelId = 1008;
 constexpr int kStartHiddenId = 1009;
 constexpr int kIconCacheSizeId = 1010;
+constexpr int kDisplayModeId = 1011;
+constexpr int kQuickHideId = 1012;
+constexpr int kTemporaryAccessId = 1013;
 constexpr COLORREF kDialogBackground = RGB(7, 37, 48);
 constexpr COLORREF kDialogPanel = RGB(12, 49, 62);
 constexpr COLORREF kDialogPanelHover = RGB(24, 65, 80);
@@ -52,6 +57,16 @@ struct State {
     HWND backupCount = nullptr;
     HWND iconCacheSize = nullptr;
     AppSettings* settings = nullptr;
+    int* displayMode = nullptr;
+    HWND displayCombo = nullptr;
+    HWND quickHide = nullptr;
+    HWND temporaryAccess = nullptr;
+    int keys[2]{};
+    int modifiers[2]{};
+    bool hotkeyHovered[2]{};
+    std::function<bool(const AppSettings&,std::wstring&)> validateAccess;
+    std::wstring accessError;
+    HWND tooltip = nullptr;
     bool accepted = false;
     HWND ok = nullptr;
     HWND cancel = nullptr;
@@ -223,77 +238,12 @@ void DrawButton(const DRAWITEMSTRUCT& draw, const State& state) {
         return;
     }
 
-    const bool primary = draw.CtlID == kOkId;
-    const bool hovered = state.hoverButton == static_cast<int>(draw.CtlID);
-    const bool pressed = (draw.itemState & ODS_SELECTED) != 0;
-    const bool focused = (draw.itemState & ODS_FOCUS) != 0;
-    const COLORREF fill = primary
-        ? (pressed ? RGB(45, 126, 157) : hovered ? RGB(61, 151, 184) : RGB(48, 134, 166))
-        : (pressed ? RGB(25, 69, 84) : hovered ? kDialogPanelHover : kDialogPanel);
-    HBRUSH brush = CreateSolidBrush(fill);
-    HPEN pen = CreatePen(PS_SOLID, 1, hovered || focused || primary ? kDialogAccent : kDialogBorder);
-    HGDIOBJ oldBrush = SelectObject(draw.hDC, brush);
-    HGDIOBJ oldPen = SelectObject(draw.hDC, pen);
-    RoundRect(
-        draw.hDC,
-        draw.rcItem.left,
-        draw.rcItem.top,
-        draw.rcItem.right,
-        draw.rcItem.bottom,
-        Scale(state, 6),
-        Scale(state, 6));
-    SelectObject(draw.hDC, oldBrush);
-    SelectObject(draw.hDC, oldPen);
-    DeleteObject(brush);
-    DeleteObject(pen);
-    SetBkMode(draw.hDC, TRANSPARENT);
-    SetTextColor(draw.hDC, kDialogText);
-    SelectObject(draw.hDC, state.textFont);
-    wchar_t label[32]{};
-    GetWindowTextW(draw.hwndItem, label, ARRAYSIZE(label));
-    RECT bounds = draw.rcItem;
-    DrawTextW(draw.hDC, label, -1, &bounds, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    lattice::ui::DrawDialogButton(draw, state.textFont, state.dpi,
+        state.hoverButton == static_cast<int>(draw.CtlID), draw.CtlID == kOkId);
 }
 
 void DrawThemeCombo(HWND hwnd, HDC dc, const State& state) {
-    RECT bounds{};
-    GetClientRect(hwnd, &bounds);
-    HBRUSH background = CreateSolidBrush(state.themeHovered ? kDialogPanelHover : kDialogPanel);
-    FillRect(dc, &bounds, background);
-    DeleteObject(background);
-
-    HPEN border = CreatePen(PS_SOLID, 1, state.themeHovered || GetFocus() == hwnd ? kDialogAccent : kDialogBorder);
-    HGDIOBJ oldPen = SelectObject(dc, border);
-    HGDIOBJ oldBrush = SelectObject(dc, GetStockObject(HOLLOW_BRUSH));
-    Rectangle(dc, 0, 0, bounds.right, bounds.bottom);
-    SelectObject(dc, oldBrush);
-    SelectObject(dc, oldPen);
-    DeleteObject(border);
-
-    wchar_t text[64]{};
-    const LRESULT selected = SendMessageW(hwnd, CB_GETCURSEL, 0, 0);
-    if (selected != CB_ERR) {
-        SendMessageW(hwnd, CB_GETLBTEXT, static_cast<WPARAM>(selected), reinterpret_cast<LPARAM>(text));
-    }
-    SetBkMode(dc, TRANSPARENT);
-    SetTextColor(dc, kDialogText);
-    SelectObject(dc, state.textFont);
-    RECT textRect{
-        Scale(state, 8),
-        0,
-        bounds.right - Scale(state, 34),
-        bounds.bottom};
-    DrawTextW(dc, text, -1, &textRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-
-    const int centerX = bounds.right - Scale(state, 16);
-    const int centerY = bounds.bottom / 2;
-    HPEN arrow = CreatePen(PS_SOLID, std::max(1, Scale(state, 1)), state.themeHovered ? kDialogText : kDialogMutedText);
-    oldPen = SelectObject(dc, arrow);
-    MoveToEx(dc, centerX - Scale(state, 5), centerY - Scale(state, 2), nullptr);
-    LineTo(dc, centerX, centerY + Scale(state, 3));
-    LineTo(dc, centerX + Scale(state, 5), centerY - Scale(state, 2));
-    SelectObject(dc, oldPen);
-    DeleteObject(arrow);
+    lattice::ui::DrawDialogCombo(hwnd, dc, state.textFont, state.dpi, state.themeHovered);
 }
 
 void DrawThemeItem(const DRAWITEMSTRUCT& draw, const State& state) {
@@ -312,6 +262,39 @@ void DrawThemeItem(const DRAWITEMSTRUCT& draw, const State& state) {
     SetTextColor(draw.hDC, kDialogText);
     SelectObject(draw.hDC, state.textFont);
     DrawTextW(draw.hDC, text, -1, &textRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+}
+
+std::wstring HotkeyLabel(int key,int modifiers) {
+    if(!key)return L"已停用";
+    std::wstring label;
+    if(modifiers&MOD_CONTROL)label+=L"Ctrl + ";if(modifiers&MOD_ALT)label+=L"Alt + ";
+    if(modifiers&MOD_SHIFT)label+=L"Shift + ";if(modifiers&MOD_WIN)label+=L"Win + ";
+    if(key>=VK_F1&&key<=VK_F24)return label+L"F"+std::to_wstring(key-VK_F1+1);
+    wchar_t name[80]{};const UINT scan=MapVirtualKeyW(static_cast<UINT>(key),MAPVK_VK_TO_VSC);
+    GetKeyNameTextW(static_cast<LONG>(scan<<16),name,ARRAYSIZE(name));
+    label+=name[0]?std::wstring(name):std::to_wstring(key);return label;
+}
+LRESULT CALLBACK HotkeyEditSubclass(HWND h,UINT message,WPARAM key,LPARAM param,UINT_PTR id,DWORD_PTR reference) {
+    auto* state=reinterpret_cast<State*>(reference);const int role=id==kQuickHideId?0:1;
+    if(message==WM_GETDLGCODE)return DLGC_WANTALLKEYS;
+    if(message==WM_KEYDOWN || message==WM_SYSKEYDOWN) {
+        if(key==VK_SHIFT||key==VK_CONTROL||key==VK_MENU||key==VK_LWIN||key==VK_RWIN)return 0;
+        const int mods=((GetKeyState(VK_CONTROL)&0x8000)?MOD_CONTROL:0)|((GetKeyState(VK_MENU)&0x8000)?MOD_ALT:0)|
+            ((GetKeyState(VK_SHIFT)&0x8000)?MOD_SHIFT:0)|(((GetKeyState(VK_LWIN)|GetKeyState(VK_RWIN))&0x8000)?MOD_WIN:0);
+        if(key==VK_TAB && mods==0) {SetFocus(GetNextDlgTabItem(GetParent(h),h,FALSE));return 0;}
+        if(key==VK_ESCAPE && mods==0) {SendMessageW(GetParent(h),WM_CLOSE,0,0);return 0;}
+        state->keys[role]=(mods==0&&(key==VK_BACK||key==VK_DELETE))?0:static_cast<int>(key);
+        state->modifiers[role]=state->keys[role]?mods:0;
+        SetWindowTextW(h,HotkeyLabel(state->keys[role],state->modifiers[role]).c_str());
+        state->accessError.clear();InvalidateRect(GetParent(h),nullptr,FALSE);return 0;
+    }
+    if(message==WM_CHAR||message==WM_SYSCHAR)return 0;
+    if(message==WM_MOUSEMOVE) {state->hotkeyHovered[role]=true;TRACKMOUSEEVENT track{sizeof(track),TME_LEAVE,h,0};TrackMouseEvent(&track);RedrawWindow(h,nullptr,nullptr,RDW_FRAME|RDW_INVALIDATE);}
+    if(message==WM_MOUSELEAVE) {state->hotkeyHovered[role]=false;RedrawWindow(h,nullptr,nullptr,RDW_FRAME|RDW_INVALIDATE);}
+    if(message==WM_SETFOCUS||message==WM_KILLFOCUS)RedrawWindow(h,nullptr,nullptr,RDW_FRAME|RDW_INVALIDATE);
+    if(message==WM_NCPAINT) {lattice::ui::DrawDialogEditBorder(h,DialogPanelBrush(),state->hotkeyHovered[role],kDialogAccent,kDialogBorder,Scale(*state,10));return 0;}
+    if(message==WM_NCDESTROY)RemoveWindowSubclass(h,HotkeyEditSubclass,id);
+    return DefSubclassProc(h,message,key,param);
 }
 
 LRESULT CALLBACK ThemeComboSubclass(
@@ -333,7 +316,8 @@ LRESULT CALLBACK ThemeComboSubclass(
     } else if (message == WM_PAINT) {
         PAINTSTRUCT paint{};
         HDC dc = BeginPaint(hwnd, &paint);
-        DrawThemeCombo(hwnd, dc, *state);
+        if (id == kDisplayModeId) lattice::ui::DrawDialogCombo(hwnd, dc, state->textFont, state->dpi, GetFocus() == hwnd, {8});
+        else DrawThemeCombo(hwnd, dc, *state);
         EndPaint(hwnd, &paint);
         return 0;
     } else if (message == WM_PRINTCLIENT) {
@@ -438,13 +422,56 @@ LRESULT CALLBACK DialogProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
                 state->instance,
                 nullptr);
             SetFont(state, state->iconCacheSize);
+            if (state->displayMode) {
+                CreateLabel(state, L"分类与访问", 22, 366, 330, 26);
+                CreateLabel(state, L"分类显示方式", 22, 406, 138, 28);
+                state->displayCombo = CreateWindowW(L"COMBOBOX", L"",
+                    WS_CHILD|WS_VISIBLE|WS_TABSTOP|CBS_DROPDOWNLIST|CBS_OWNERDRAWFIXED|CBS_HASSTRINGS,
+                    Scale(*state,172),Scale(*state,400),Scale(*state,286),Scale(*state,120),hwnd,
+                    reinterpret_cast<HMENU>(static_cast<INT_PTR>(kDisplayModeId)),state->instance,nullptr);
+                SetFont(state,state->displayCombo);
+                SendMessageW(state->displayCombo,CB_ADDSTRING,0,reinterpret_cast<LPARAM>(L"多个格子"));
+                SendMessageW(state->displayCombo,CB_ADDSTRING,0,reinterpret_cast<LPARAM>(L"标签容器"));
+                SendMessageW(state->displayCombo,CB_SETCURSEL,*state->displayMode==0?1:0,0);
+                SendMessageW(state->displayCombo,CB_SETITEMHEIGHT,static_cast<WPARAM>(-1),Scale(*state,36));
+                SetWindowSubclass(state->displayCombo,ThemeComboSubclass,kDisplayModeId,reinterpret_cast<DWORD_PTR>(state));
+                CreateLabel(state,L"同一分类与顺序；分别记住两种模式的布局。",22,450,436,34);
+                CreateLabel(state,L"快速隐藏快捷键",22,498,138,28);
+                CreateLabel(state,L"临时访问快捷键",22,550,138,28);
+                state->keys[0]=state->settings->quickHideKey;state->modifiers[0]=state->settings->quickHideModifiers;
+                state->keys[1]=state->settings->temporaryAccessKey;state->modifiers[1]=state->settings->temporaryAccessModifiers;
+                for(int role=0;role<2;++role) {
+                    HWND field=CreateWindowExW(WS_EX_CLIENTEDGE,L"EDIT",HotkeyLabel(state->keys[role],state->modifiers[role]).c_str(),
+                        WS_CHILD|WS_VISIBLE|WS_TABSTOP|ES_READONLY|ES_AUTOHSCROLL,Scale(*state,172),Scale(*state,492+role*52),Scale(*state,286),Scale(*state,36),hwnd,
+                        reinterpret_cast<HMENU>(static_cast<INT_PTR>(role==0?kQuickHideId:kTemporaryAccessId)),state->instance,nullptr);
+                    if(role==0)state->quickHide=field;else state->temporaryAccess=field;
+                    SetFont(state,field);SetWindowTheme(field,L"",L"");
+                    SetWindowSubclass(field,HotkeyEditSubclass,role==0?kQuickHideId:kTemporaryAccessId,reinterpret_cast<DWORD_PTR>(state));
+                }
+                CreateLabel(state,L"点击后按组合键；Backspace/Delete 清除以停用。\n临时访问：再次触发或 Esc 结束；菜单与拖放期间保持。",22,598,436,48);
+                state->tooltip=CreateWindowExW(WS_EX_TOPMOST,TOOLTIPS_CLASSW,nullptr,WS_POPUP|TTS_ALWAYSTIP|TTS_NOPREFIX,
+                    0,0,0,0,hwnd,nullptr,state->instance,nullptr);
+                SetWindowTheme(state->tooltip,L"",L"");
+                SendMessageW(state->tooltip,TTM_SETTIPBKCOLOR,kDialogPanel,0);
+                SendMessageW(state->tooltip,TTM_SETTIPTEXTCOLOR,kDialogText,0);
+                SendMessageW(state->tooltip,TTM_SETMAXTIPWIDTH,0,Scale(*state,280));
+                SendMessageW(state->tooltip,TTM_SETDELAYTIME,TTDT_INITIAL,500);
+                TOOLINFOW ti{sizeof(ti)};ti.uFlags=TTF_IDISHWND|TTF_SUBCLASS;ti.hwnd=hwnd;
+                ti.uId=reinterpret_cast<UINT_PTR>(state->displayCombo);
+                ti.lpszText=const_cast<wchar_t*>(L"同一份分类和顺序；切换恢复本模式保存的布局");
+                SendMessageW(state->tooltip,TTM_ADDTOOLW,0,reinterpret_cast<LPARAM>(&ti));
+                ti.uId=reinterpret_cast<UINT_PTR>(state->quickHide);ti.lpszText=const_cast<wchar_t*>(L"点击后按组合键；冲突保留原绑定；Backspace/Delete 清除");
+                SendMessageW(state->tooltip,TTM_ADDTOOLW,0,reinterpret_cast<LPARAM>(&ti));
+                ti.uId=reinterpret_cast<UINT_PTR>(state->temporaryAccess);ti.lpszText=const_cast<wchar_t*>(L"再次触发或 Esc 结束，不因松键和普通失焦撤层");
+                SendMessageW(state->tooltip,TTM_ADDTOOLW,0,reinterpret_cast<LPARAM>(&ti));
+            }
             state->ok = CreateWindowW(
                 L"BUTTON", L"保存", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW | BS_DEFPUSHBUTTON,
-                Scale(*state, 208), Scale(*state, 370), Scale(*state, 86), Scale(*state, 32),
+                Scale(*state, state->displayMode ? 372 : 208), Scale(*state, state->displayMode ? 710 : 370), Scale(*state, 86), Scale(*state, 32),
                 hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kOkId)), state->instance, nullptr);
             state->cancel = CreateWindowW(
                 L"BUTTON", L"取消", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
-                Scale(*state, 302), Scale(*state, 370), Scale(*state, 86), Scale(*state, 32),
+                Scale(*state, state->displayMode ? 278 : 302), Scale(*state, state->displayMode ? 710 : 370), Scale(*state, 86), Scale(*state, 32),
                 hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kCancelId)), state->instance, nullptr);
             SetFont(state, state->ok);
             SetFont(state, state->cancel);
@@ -532,7 +559,7 @@ LRESULT CALLBACK DialogProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
 
         case WM_DRAWITEM: {
             const auto& draw = *reinterpret_cast<DRAWITEMSTRUCT*>(lParam);
-            if (draw.CtlID == kThemeId) {
+            if (draw.CtlID == kThemeId || draw.CtlID == kDisplayModeId) {
                 DrawThemeItem(draw, *state);
             } else {
                 DrawButton(draw, *state);
@@ -542,7 +569,7 @@ LRESULT CALLBACK DialogProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
 
         case WM_MEASUREITEM: {
             auto* measure = reinterpret_cast<MEASUREITEMSTRUCT*>(lParam);
-            if (measure->CtlID == kThemeId) {
+            if (measure->CtlID == kThemeId || measure->CtlID == kDisplayModeId) {
                 measure->itemHeight = Scale(*state, 26);
                 return TRUE;
             }
@@ -553,9 +580,10 @@ LRESULT CALLBACK DialogProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         case WM_CTLCOLORBTN: {
             HDC dc = reinterpret_cast<HDC>(wParam);
             SetTextColor(dc, kDialogText);
-            SetBkColor(dc, kDialogBackground);
-            SetBkMode(dc, TRANSPARENT);
-            return reinterpret_cast<LRESULT>(DialogBackgroundBrush());
+            const bool field=reinterpret_cast<HWND>(lParam)==state->quickHide || reinterpret_cast<HWND>(lParam)==state->temporaryAccess;
+            SetBkColor(dc,field?kDialogPanel:kDialogBackground);
+            SetBkMode(dc,field?OPAQUE:TRANSPARENT);
+            return reinterpret_cast<LRESULT>(field?DialogPanelBrush():DialogBackgroundBrush());
         }
 
         case WM_CTLCOLOREDIT:
@@ -580,11 +608,21 @@ LRESULT CALLBACK DialogProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
                 SetCheckBoxChecked(checkbox, !CheckBoxChecked(checkbox));
                 return 0;
             }
+            if (command == kDisplayModeId && HIWORD(wParam) == CBN_SELCHANGE) {
+                InvalidateRect(state->displayCombo,nullptr,FALSE); return 0;
+            }
             if (command == kThemeId && HIWORD(wParam) == CBN_SELCHANGE) {
                 InvalidateRect(state->theme, nullptr, FALSE);
                 return 0;
             }
             if (command == kOkId) {
+                if(state->displayMode) {
+                    AppSettings candidate=*state->settings;
+                    candidate.quickHideKey=state->keys[0];candidate.quickHideModifiers=state->modifiers[0];
+                    candidate.temporaryAccessKey=state->keys[1];candidate.temporaryAccessModifiers=state->modifiers[1];
+                    if(state->validateAccess&&!state->validateAccess(candidate,state->accessError)) {InvalidateRect(hwnd,nullptr,FALSE);return 0;}
+                    *state->settings=candidate;
+                }
                 state->settings->launchOnStartup = CheckBoxChecked(state->launchOnStartup);
                 state->settings->showPublicDesktopItems = CheckBoxChecked(state->showPublic);
                 state->settings->restoreHiddenState = CheckBoxChecked(state->restoreHidden);
@@ -605,6 +643,7 @@ LRESULT CALLBACK DialogProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
                 } catch (...) {
                     state->settings->iconCacheSize = 256;
                 }
+                if(state->displayMode) *state->displayMode=SendMessageW(state->displayCombo,CB_GETCURSEL,0,0)==1?0:1;
                 state->accepted = true;
                 DestroyWindow(hwnd);
                 return 0;
@@ -660,6 +699,11 @@ LRESULT CALLBACK DialogProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
             }
             SetTextColor(dc, state->closeHovered ? kDialogText : kDialogMutedText);
             DrawTextW(dc, L"×", -1, &close, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            if(state->displayMode&&!state->accessError.empty()) {
+                SetTextColor(dc,RGB(255,158,158));SelectObject(dc,state->textFont);
+                RECT error{Scale(*state,22),Scale(*state,653),Scale(*state,458),Scale(*state,701)};
+                DrawTextW(dc,state->accessError.c_str(),-1,&error,DT_LEFT|DT_WORDBREAK);
+            }
             EndPaint(hwnd, &paint);
             return 0;
         }
@@ -669,6 +713,7 @@ LRESULT CALLBACK DialogProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
             return 0;
 
         case WM_DESTROY:
+            if(state->tooltip) DestroyWindow(state->tooltip);
             DeleteObject(state->titleFont);
             DeleteObject(state->textFont);
             return 0;
@@ -679,7 +724,7 @@ LRESULT CALLBACK DialogProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
 
 }  // namespace
 
-bool SettingsDialog::Show(HINSTANCE instance, HWND owner, AppSettings& settings) {
+bool SettingsDialog::Show(HINSTANCE instance, HWND owner, AppSettings& settings, int* displayMode, std::function<bool(const AppSettings&,std::wstring&)> validateAccess) {
     ScopedPerMonitorV2Awareness dpiAwareness;
     WNDCLASSEXW windowClass{};
     windowClass.cbSize = sizeof(windowClass);
@@ -693,12 +738,14 @@ bool SettingsDialog::Show(HINSTANCE instance, HWND owner, AppSettings& settings)
     State state;
     state.instance = instance;
     state.settings = &settings;
+    state.displayMode = displayMode;
+    state.validateAccess=std::move(validateAccess);
     state.dpi = owner != nullptr ? GetDpiForWindow(owner) : GetDpiForSystem();
     if (state.dpi < 96) {
         state.dpi = 96;
     }
-    state.width = Scale(state, 420);
-    state.height = Scale(state, 420);
+    state.width = Scale(state, displayMode ? 480 : 420);
+    state.height = Scale(state, displayMode ? 762 : 420);
     HWND dialog = CreateWindowExW(
         WS_EX_TOOLWINDOW,
         kClassName,
@@ -725,9 +772,13 @@ bool SettingsDialog::Show(HINSTANCE instance, HWND owner, AppSettings& settings)
             ownerRect = monitorInfo.rcWork;
         }
     }
-    const int x = ownerRect.left + ((ownerRect.right - ownerRect.left) - state.width) / 2;
-    const int y = ownerRect.top + ((ownerRect.bottom - ownerRect.top) - state.height) / 2;
-    SetWindowPos(dialog, HWND_TOP, x, y, 0, 0, SWP_NOSIZE | SWP_SHOWWINDOW);
+    MONITORINFO placementMonitor{};
+    placementMonitor.cbSize = sizeof(placementMonitor);
+    const HMONITOR monitor = MonitorFromRect(&ownerRect, MONITOR_DEFAULTTONEAREST);
+    RECT workArea = ownerRect;
+    if (GetMonitorInfoW(monitor, &placementMonitor)) workArea = placementMonitor.rcWork;
+    const RECT placement = MessageDialog::CalculatePlacement(ownerRect, workArea, state.width, state.height);
+    SetWindowPos(dialog, HWND_TOP, placement.left, placement.top, 0, 0, SWP_NOSIZE | SWP_SHOWWINDOW);
     SetForegroundWindow(dialog);
     const bool ownerEnabled = owner != nullptr && IsWindowEnabled(owner);
     if (ownerEnabled) {

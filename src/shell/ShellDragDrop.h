@@ -5,6 +5,7 @@
 #include <ShObjIdl.h>
 
 #include <string>
+#include <functional>
 #include <vector>
 
 #include "shell/ShellItemReference.h"
@@ -42,6 +43,11 @@ bool StartShellDrag(const std::vector<std::wstring>& paths);
 bool StartShellDrag(
     HWND ownerWindow,
     const std::vector<std::wstring>& paths);
+bool StartShellDrag(
+    HWND ownerWindow,
+    const std::vector<std::wstring>& paths,
+    const SHDRAGIMAGE* dragImage,
+    std::function<void()> cancelHandler = {});
 bool StartShellDrag(
     HWND ownerWindow,
     const std::vector<ShellItemReference>& items);

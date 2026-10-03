@@ -1,4 +1,5 @@
 #include "ui/AutoOrganizePreviewWindow.h"
+#include "organize/RuleEvaluator.h"
 
 #include <windowsx.h>
 
@@ -636,6 +637,12 @@ void AutoOrganizePreviewWindow::StartScan() {
         return;
     }
     state_ = ViewState::Scanning;
+    if (input_.useRules && input_.rulesReadError) {
+        state_ = ViewState::ScanError;
+        stateMessage_ = L"规则配置损坏，未执行；请打开整理规则修复后重新生成预览。";
+        InvalidateRect(hwnd_, nullptr, FALSE);
+        return;
+    }
     desktopChangeBlocksApply_ = false;
     stateMessage_ = L"正在本机分析桌面项目、已有归属和显示器布局…";
     plan_ = {}; layoutPlan_ = {}; selectedDecision_ = -1; hoverHit_ = -1;
@@ -653,9 +660,15 @@ void AutoOrganizePreviewWindow::StartScan() {
             result->generation = generation;
             try {
                 if (!cancel->load()) {
-                    lattice::organize::EnrichSnapshotLocalMetadata(
-                        input.snapshot, cancel);
-                    result->plan = lattice::organize::BuildPlan(input.snapshot);
+                    if (input.useRules) {
+                        FILETIME now{}; GetSystemTimeAsFileTime(&now);
+                        const std::uint64_t ticks = (static_cast<std::uint64_t>(now.dwHighDateTime) << 32) | now.dwLowDateTime;
+                        lattice::organize::EnrichRuleFileTimes(input.snapshot, input.rules, cancel);
+                        result->plan = lattice::organize::BuildRulePlan(input.snapshot, input.rules, ticks, cancel);
+                    } else {
+                        lattice::organize::EnrichSnapshotLocalMetadata(input.snapshot, cancel);
+                        result->plan = lattice::organize::BuildPlan(input.snapshot);
+                    }
                 }
                 if (!cancel->load()) {
                     std::vector<lattice::organize::CandidateWidgetLayout> candidates;
@@ -1309,8 +1322,8 @@ void AutoOrganizePreviewWindow::RenderBase() {
 
     FillRounded(D2D1::RectF(16, 11, 41, 36), 5, Color(0x55C6E7));
     DrawText(L"L", D2D1::RectF(23, 12, 39, 34), titleFormat_.Get(), Color(0x061D27));
-    DrawText(L"Lattice 自动整理预览", D2D1::RectF(51, 13, 260, 38), titleFormat_.Get(), Color(0xF4FBFD));
-    DrawText(L"本地离线分析", D2D1::RectF(238, 17, 340, 37), smallFormat_.Get(), Color(0x82AAB5));
+    DrawText(input_.useRules ? L"Lattice 规则整理预览" : L"Lattice 自动整理预览", D2D1::RectF(51, 13, 260, 38), titleFormat_.Get(), Color(0xF4FBFD));
+    DrawText(input_.useRules ? L"首条匹配 · 本地" : L"本地离线分析", D2D1::RectF(238, 17, 340, 37), smallFormat_.Get(), Color(0x82AAB5));
     const bool minimizeHovered = IsHovered(HitKind::Minimize);
     const bool closeHovered = IsHovered(HitKind::Close);
     const D2D1_RECT_F minimizeBounds =
@@ -1621,7 +1634,7 @@ void AutoOrganizePreviewWindow::RenderOverlay() {
     switch (state_) {
         case ViewState::Scanning: title = L"正在生成整理建议"; action = L"取消扫描"; break;
         case ViewState::Cancelled: title = L"扫描已取消"; action = L"重新扫描"; break;
-        case ViewState::Empty: title = L"没有足够可靠的建议"; action = L"重新扫描"; tone = Color(0x66D2A2); break;
+        case ViewState::Empty: title = (input_.useRules ? L"没有需要调整的规则命中" : L"没有足够可靠的建议"); action = L"重新扫描"; tone = Color(0x66D2A2); break;
         case ViewState::Applying: title = L"正在原子应用调整"; action = L"正在应用…"; break;
         case ViewState::Success: title = L"整理已完成"; action = L"关闭"; tone = Color(0x66D2A2); break;
         case ViewState::ScanError: title = L"扫描失败"; action = L"重试"; tone = Color(0xFF7B87); break;

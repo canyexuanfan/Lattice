@@ -32,6 +32,7 @@ struct HostedWidgetDescriptor {
     bool visible = true;
     bool singleClickOpen = false;
     std::vector<DesktopItem> items;
+    std::optional<RECT> contentBounds;
 };
 
 enum class HostedWidgetCommandType {
@@ -73,6 +74,7 @@ struct HostedWidgetCommand {
 
 class DesktopSurfaceWindow {
 public:
+    void RetreatForRenderFailure() { StartWallpaperRecovery(true); }
     using DisplayPositionCommitHandler =
         std::function<bool(
             const std::vector<DesktopPosition>&)>;
@@ -95,6 +97,19 @@ public:
     bool Create(
         const std::vector<std::wstring>& assignedIdentities,
         std::wstring& errorMessage);
+    void SetVisibilityHandler(std::function<void(bool, bool)> handler);
+    void SetTabDropTargetHandler(std::function<std::wstring(POINT)> handler) {tabDropTargetHandler_=std::move(handler);}
+    void SelectHostedItemIds(const std::wstring& categoryId,const std::vector<std::wstring>& ids);
+    void SetTabInputHandler(std::function<bool(UINT,WPARAM,POINT)> handler) {
+        tabInputHandler_ = std::move(handler);
+    }
+    bool BeginHostedContainerMove(POINT screenPoint);
+    void SetHostedLayoutPreviewHandler(std::function<void(RECT)> handler) {
+        hostedLayoutPreviewHandler_ = std::move(handler);
+    }
+    bool SetTemporaryForeground(bool active, std::wstring& error);
+    void SetAccessInteractionHandler(std::function<void(bool)> handler) { accessInteractionHandler_=std::move(handler); }
+    void SetAccessEscapeHandler(std::function<void()> handler) { accessEscapeHandler_=std::move(handler); }
     void Show();
     void Hide();
     void Close();
@@ -147,6 +162,7 @@ public:
     bool IsDesktopHosted() const noexcept;
 
 private:
+    friend struct DisplayModesSmokeAccess;
     friend struct DesktopSurfaceWindowSmokeAccess;
 #ifndef NDEBUG
     unsigned debugRefreshRequests_=0, debugWallpaperRefreshes_=0;
@@ -343,7 +359,8 @@ private:
         POINT screenPoint);
     bool BuildShellDragImage(
         POINT sourceClientPoint,
-        SHDRAGIMAGE& dragImage);
+        SHDRAGIMAGE& dragImage,
+        const WidgetView* hostedView = nullptr);
     bool BeginInternalDragSession(POINT sourceClientPoint);
     void EndInternalDragSession() noexcept;
     bool CommitInternalDesktopDrop(POINT dropScreenPoint);
@@ -384,6 +401,11 @@ private:
         POINT viewPoint{};
     };
 
+    std::function<void(bool, bool)> visibilityHandler_;
+    std::function<bool(UINT,WPARAM,POINT)> tabInputHandler_;
+    std::function<std::wstring(POINT)> tabDropTargetHandler_;
+    bool tabPointerPressed_ = false;
+    std::function<void(RECT)> hostedLayoutPreviewHandler_;
     HINSTANCE instance_ = nullptr;
     HWND hwnd_ = nullptr;
     DesktopViewSnapshot snapshot_;
@@ -485,6 +507,15 @@ private:
     void* listViewQueryBuffer_ = nullptr;
     DWORD listViewProcessId_ = 0;
     bool listViewQueryReady_ = false;
+    bool temporaryForeground_ = false;
+    HWND temporaryOriginalParent_ = nullptr;
+    HWND temporaryForegroundHost_ = nullptr;
+    Microsoft::WRL::ComPtr<IDWriteTextFormat> temporaryLabelFormat_;
+    RECT TemporaryLabelBounds() const;
+    LONG_PTR temporaryOriginalStyle_ = 0, temporaryOriginalExStyle_ = 0;
+    RECT temporaryOriginalRect_{};
+    std::function<void(bool)> accessInteractionHandler_;
+    std::function<void()> accessEscapeHandler_;
     bool wallpaperReadyForTarget_ = false;
     bool wallpaperRecoveryActive_ = false;
     bool wallpaperRecoveryHidden_ = false;

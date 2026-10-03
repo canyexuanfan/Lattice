@@ -18,6 +18,9 @@ struct AutoOrganizePreviewInput {
     lattice::organize::Snapshot snapshot;
     lattice::organize::LayoutContext layoutContext;
     bool undoAvailable = false;
+    bool useRules = false;
+    bool rulesReadError = false;
+    std::vector<lattice::organize::OrganizeRule> rules;
 };
 
 class AutoOrganizePreviewWindow {
@@ -51,6 +54,7 @@ public:
 
 private:
     friend struct AutoOrganizePreviewWindowSmokeAccess;
+    friend struct OrganizeRulesSmokeAccess;
 
     enum class ViewState {
         Scanning,

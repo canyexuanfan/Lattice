@@ -12,6 +12,9 @@
 #include <cmath>
 #include <limits>
 #include <map>
+#ifndef NDEBUG
+#include <iostream>
+#endif
 #include <mutex>
 #include <set>
 
@@ -151,6 +154,9 @@ public:
         if (effect == nullptr) {
             return E_POINTER;
         }
+        if(!accessBusy_&&owner_&&owner_->temporaryForeground_&&owner_->accessInteractionHandler_) {
+            accessBusy_=true;owner_->accessInteractionHandler_(true);
+        }
         ResetInternalItemTarget(true);
         internalDataObject_.Reset();
         ResetExternalRoute(true);
@@ -233,7 +239,7 @@ public:
         if (dragImageHelper_ != nullptr) {
             dragImageHelper_->DragLeave();
         }
-        return S_OK;
+        FinishAccess();return S_OK;
     }
 
     HRESULT STDMETHODCALLTYPE Drop(
@@ -244,6 +250,7 @@ public:
         if (effect == nullptr) {
             return E_POINTER;
         }
+        struct FinishDrop {DesktopSurfaceDropTarget& target;~FinishDrop(){target.FinishAccess();}} finish{*this};
         POINT screenPoint{point.x, point.y};
 #ifndef NDEBUG
         if (owner_) SetPropW(owner_->Window(), L"Lattice.NativeDropStage", reinterpret_cast<HANDLE>(3));
@@ -281,6 +288,11 @@ public:
                 }
                 *effect = SUCCEEDED(result)
                     ? targetEffect : DROPEFFECT_NONE;
+            } else if (externalRoute_ == ExternalRoute::HostedTab) {
+                HostedWidgetCommand command;command.type=HostedWidgetCommandType::CollectPaths;
+                command.categoryId=externalTargetPath_;command.paths=externalPaths_;command.screenPoint=screenPoint;
+                if(owner_->hostedWidgetCommandHandler_)owner_->hostedWidgetCommandHandler_(command);
+                *effect=DROPEFFECT_NONE;
             } else if (externalRoute_ == ExternalRoute::HostedBlank) {
                 POINT clientPoint = screenPoint;
                 ScreenToClient(owner_->Window(), &clientPoint);
@@ -350,8 +362,14 @@ public:
         if (owner_ != nullptr) {
             POINT clientPoint = screenPoint;
             ScreenToClient(owner_->Window(), &clientPoint);
+            const std::wstring tabTarget=owner_->tabDropTargetHandler_?owner_->tabDropTargetHandler_(screenPoint):std::wstring{};
             const int hostedIndex = owner_->HostedWidgetIndexAt(clientPoint);
-            if (hostedIndex >= 0) {
+            if(!tabTarget.empty()) {
+                HostedWidgetCommand command;command.type=HostedWidgetCommandType::CollectPaths;command.categoryId=tabTarget;
+                for(const auto& source:owner_->internalDragOriginalPositions_)command.paths.push_back(source.path);
+                command.screenPoint=screenPoint;
+                if(owner_->hostedWidgetCommandHandler_)positioned=owner_->hostedWidgetCommandHandler_(command);
+            } else if (hostedIndex >= 0) {
                 const auto& hosted = owner_->hostedWidgets_[
                     static_cast<size_t>(hostedIndex)];
                 const WidgetViewAction action =
@@ -384,10 +402,15 @@ public:
     }
 
 private:
+    bool accessBusy_=false;
+    void FinishAccess() {
+        if(accessBusy_) {accessBusy_=false;if(owner_&&owner_->accessInteractionHandler_)owner_->accessInteractionHandler_(false);}
+    }
     enum class ExternalRoute {
         None,
         Explorer,
         HostedBlank,
+        HostedTab,
         HostedIcon,
     };
 
@@ -437,6 +460,8 @@ private:
             }
         }
 
+        const std::wstring tabTarget=owner_->tabDropTargetHandler_?owner_->tabDropTargetHandler_(screenPoint):std::wstring{};
+        if(!tabTarget.empty()&&!externalPaths_.empty()) {nextRoute=ExternalRoute::HostedTab;nextTargetPath=tabTarget;}
         const bool changed = nextRoute != externalRoute_ ||
             hostedIndex != externalWidgetIndex_ ||
             !IdentitiesEqual(nextTargetPath, externalTargetPath_);
@@ -508,7 +533,7 @@ private:
             hosted->view.SetInsertionIndex(action.insertionIndex);
             InvalidateRect(owner_->Window(), nullptr, FALSE);
         }
-        *effect = nextRoute == ExternalRoute::HostedBlank
+        *effect = (nextRoute == ExternalRoute::HostedBlank || nextRoute == ExternalRoute::HostedTab)
             ? PreferredShellDropPreviewEffect(externalAllowedEffects_)
             : DROPEFFECT_NONE;
         return S_OK;
@@ -886,6 +911,75 @@ bool DesktopSurfaceWindow::PreTranslateMessage(MSG& message) {
     return nativeDesktop_ && nativeDesktop_->TranslateMessage(message);
 }
 
+void DesktopSurfaceWindow::SetVisibilityHandler(std::function<void(bool, bool)> handler) {
+    visibilityHandler_ = std::move(handler);
+}
+
+bool DesktopSurfaceWindow::SetTemporaryForeground(bool active, std::wstring& error) {
+    error.clear();
+    if(active==temporaryForeground_)return true;
+    if(!hwnd_||!IsWindow(hwnd_)) {error=L"格子宿主尚未就绪。";return false;}
+    if(active) {
+        temporaryOriginalParent_=GetAncestor(hwnd_,GA_PARENT);
+        temporaryOriginalStyle_=GetWindowLongPtrW(hwnd_,GWL_STYLE);
+        temporaryOriginalExStyle_=GetWindowLongPtrW(hwnd_,GWL_EXSTYLE);
+        if(!GetWindowRect(hwnd_,&temporaryOriginalRect_)||!temporaryOriginalParent_||!IsWindow(temporaryOriginalParent_)) {
+            error=L"无法保存格子原桌面层级。";return false;
+        }
+        temporaryForegroundHost_=CreateWindowExW(WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE|WS_EX_TOPMOST,L"STATIC",L"Lattice temporary access",
+            WS_POPUP|WS_CLIPCHILDREN|SS_NOTIFY,temporaryOriginalRect_.left,temporaryOriginalRect_.top,
+            temporaryOriginalRect_.right-temporaryOriginalRect_.left,temporaryOriginalRect_.bottom-temporaryOriginalRect_.top,
+            nullptr,nullptr,GetModuleHandleW(nullptr),nullptr);
+        if(!temporaryForegroundHost_) {error=L"无法创建临时前台承载。";return false;}
+        temporaryForeground_=true;
+        d2d_.WriteFactory()->CreateTextFormat(L"Segoe UI",nullptr,DWRITE_FONT_WEIGHT_NORMAL,DWRITE_FONT_STYLE_NORMAL,
+            DWRITE_FONT_STRETCH_NORMAL,static_cast<float>(MulDiv(12,GetDpiForWindow(hwnd_),96)),L"zh-cn",temporaryLabelFormat_.GetAddressOf());
+        if(temporaryLabelFormat_)temporaryLabelFormat_->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+        UpdateNativeWidgetRegion();
+    } else if(temporaryForegroundHost_) {
+        ShowWindow(temporaryForegroundHost_,SW_HIDE);
+        SetWindowPos(temporaryForegroundHost_,HWND_NOTOPMOST,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
+    }
+    ResetHostedPointerGesture();if(GetCapture()==hwnd_)ReleaseCapture();ShowWindow(hwnd_,SW_HIDE);
+
+    const HWND parent=active?temporaryForegroundHost_:temporaryOriginalParent_;
+    const bool parentValid=parent&&IsWindow(parent);
+    SetWindowLongPtrW(hwnd_,GWL_STYLE,active?(temporaryOriginalStyle_&~WS_POPUP)|WS_CHILD:temporaryOriginalStyle_&~WS_VISIBLE);
+    SetLastError(ERROR_SUCCESS);SetParent(hwnd_,parentValid?parent:nullptr);
+    POINT point{temporaryOriginalRect_.left,temporaryOriginalRect_.top};
+    const bool mapped=parentValid&&ScreenToClient(parent,&point);
+    const bool positioned=mapped&&GetAncestor(hwnd_,GA_PARENT)==parent&&SetWindowPos(hwnd_,HWND_TOP,point.x,point.y,
+        temporaryOriginalRect_.right-temporaryOriginalRect_.left,temporaryOriginalRect_.bottom-temporaryOriginalRect_.top,
+        SWP_NOACTIVATE|SWP_FRAMECHANGED|(active?SWP_SHOWWINDOW:0));
+    RECT actualRect{};GetWindowRect(hwnd_,&actualRect);
+    bool valid=positioned&&EqualRect(&actualRect,&temporaryOriginalRect_);
+    if(active&&valid) {
+        HRGN region=CreateRectRgn(0,0,0,0);
+        valid=region&&GetWindowRgn(hwnd_,region)!=ERROR;
+        if(valid)valid=SetWindowRgn(temporaryForegroundHost_,region,FALSE)!=FALSE;
+        if(!valid&&region)DeleteObject(region);
+        if(valid)valid=SetWindowPos(temporaryForegroundHost_,HWND_TOPMOST,temporaryOriginalRect_.left,temporaryOriginalRect_.top,
+            temporaryOriginalRect_.right-temporaryOriginalRect_.left,temporaryOriginalRect_.bottom-temporaryOriginalRect_.top,
+            SWP_NOACTIVATE|SWP_SHOWWINDOW)&&(GetWindowLongPtrW(temporaryForegroundHost_,GWL_EXSTYLE)&WS_EX_TOPMOST);
+    }
+    if(!active) {
+        temporaryForeground_=false;temporaryLabelFormat_.Reset();
+        // Detach the owned tag strip before destroying its temporary parent.
+        if(visibilityHandler_)visibilityHandler_(false,true);
+        if(temporaryForegroundHost_)DestroyWindow(temporaryForegroundHost_);
+        temporaryForegroundHost_=nullptr;
+        valid=valid&&GetWindowLongPtrW(hwnd_,GWL_EXSTYLE)==temporaryOriginalExStyle_&&
+            (GetWindowLongPtrW(hwnd_,GWL_STYLE)&~WS_VISIBLE)==(temporaryOriginalStyle_&~WS_VISIBLE);
+    }
+    if(!valid) {
+        error=L"临时前台层级校验失败，覆盖层已撤下。 active="+std::to_wstring(active)+L" geometry="+std::to_wstring(positioned)+L" equal="+std::to_wstring(EqualRect(&actualRect,&temporaryOriginalRect_))+L" rootTop="+std::to_wstring(temporaryForegroundHost_&&(GetWindowLongPtrW(temporaryForegroundHost_,GWL_EXSTYLE)&WS_EX_TOPMOST))+L" winerror="+std::to_wstring(GetLastError());
+        if(active){std::wstring ignored;SetTemporaryForeground(false,ignored);}
+        ShowWindow(hwnd_,SW_HIDE);return false;
+    }
+    if(nativeDesktop_)nativeDesktop_->RefreshWallpaper();
+    InvalidateRect(hwnd_,nullptr,FALSE);return true;
+}
+
 void DesktopSurfaceWindow::Show() {
     nativeShowRequested_ = true;
     if (hwnd_ == nullptr) {
@@ -904,12 +998,14 @@ void DesktopSurfaceWindow::Show() {
     }
     ShowWindow(hwnd_, SW_SHOWNOACTIVATE);
     MaintainDesktopLayer();
+    if (visibilityHandler_) visibilityHandler_(true, false);
     RedrawWindow(
         hwnd_, nullptr, nullptr,
         RDW_INVALIDATE | RDW_UPDATENOW | RDW_ERASE);
 }
 
 void DesktopSurfaceWindow::Hide() {
+    if (visibilityHandler_) visibilityHandler_(false, false);
     nativeShowRequested_ = false;
     if (nativeDesktop_) nativeDesktop_->Show(false);
     if (hwnd_ != nullptr) {
@@ -1121,6 +1217,8 @@ void DesktopSurfaceWindow::ConfirmUnassignedItemAt(
 }
 
 void DesktopSurfaceWindow::Close() {
+    if (visibilityHandler_) visibilityHandler_(false, true);
+    if(temporaryForeground_) {std::wstring ignored;SetTemporaryForeground(false,ignored);}
     nativeShowRequested_ = false;
     nativeDragSession_ = false;
     if (nativeDesktop_) nativeDesktop_->Close();
@@ -1317,6 +1415,7 @@ void DesktopSurfaceWindow::StartWallpaperRecovery(bool hideSurface) {
         return;
     }
     if (hideSurface) {
+        if (visibilityHandler_) visibilityHandler_(false, false);
         if (nativeDesktop_) nativeDesktop_->Show(false);
         if (IsWindowVisible(hwnd_) != FALSE) {
             ShowWindow(hwnd_, SW_HIDE);
@@ -1503,7 +1602,7 @@ bool DesktopSurfaceWindow::Refresh(
         snapshot_.screenRect.left,
         snapshot_.screenRect.top};
     if (ScreenToClient(
-            snapshot_.desktopHost,
+            GetAncestor(hwnd_,GA_PARENT),
             &parentOrigin) == FALSE) {
         errorMessage =
             L"无法刷新 Explorer 图标区域的父窗口坐标。";
@@ -1654,6 +1753,26 @@ LRESULT DesktopSurfaceWindow::HandleMessage(
             return menuResult;
         }
     }
+    if (tabPointerPressed_ && message == WM_LBUTTONUP) {
+        tabPointerPressed_ = false;
+        if (hostedPointerGesture_ == HostedPointerGesture::None) return 0;
+    }
+    if (tabInputHandler_ && hostedPointerGesture_ == HostedPointerGesture::None &&
+        pointerGesture_ == PointerGesture::None &&
+        (message == WM_LBUTTONDOWN || message == WM_LBUTTONDBLCLK || message == WM_MOUSEMOVE || message == WM_CONTEXTMENU || message == WM_MOUSEWHEEL)) {
+        POINT point{GET_X_LPARAM(lParam),GET_Y_LPARAM(lParam)};
+        if(message != WM_CONTEXTMENU && message != WM_MOUSEWHEEL)ClientToScreen(hwnd_,&point);
+        if(tabInputHandler_(message,wParam,point)) {
+            if(message==WM_LBUTTONDOWN)tabPointerPressed_=true;
+            if(message==WM_MOUSEMOVE) {
+                bool changed=false;
+                POINT local=point;ScreenToClient(hwnd_,&local);
+                for(auto& hosted:hostedWidgets_)if(hosted)changed=hosted->view.SetVisualPointerState(local)||changed;
+                if(changed)InvalidateRect(hwnd_,nullptr,FALSE);
+            }
+            return 0;
+        }
+    }
     switch (message) {
         case WM_MOUSEACTIVATE:
         {
@@ -1733,7 +1852,18 @@ LRESULT DesktopSurfaceWindow::HandleMessage(
                 return 0;
             }
             break;
+        case WM_WINDOWPOSCHANGED:
+            if (visibilityHandler_ && IsWindowVisible(hwnd_)) visibilityHandler_(true, false);
+            break;
         case WM_KEYDOWN:
+            if(temporaryForeground_&&wParam==VK_ESCAPE&&accessEscapeHandler_) {accessEscapeHandler_();return 0;}
+            if (wParam == VK_ESCAPE &&
+                hostedPointerGesture_ != HostedPointerGesture::None) {
+                ResetHostedPointerGesture();
+                if (GetCapture() == hwnd_) ReleaseCapture();
+                InvalidateRect(hwnd_, nullptr, FALSE);
+                return 0;
+            }
             if (activeHostedWidgetIndex_ >= 0 &&
                 static_cast<size_t>(activeHostedWidgetIndex_) <
                     hostedWidgets_.size() &&
@@ -2120,10 +2250,18 @@ LRESULT DesktopSurfaceWindow::HandleMessage(
                     hosted.view.HitTestHostPoint(clientPoint);
                 activeHostedWidgetIndex_ = raisedIndex;
                 if (hit.kind == WidgetViewHitKind::Header) {
-                    DispatchHostedHeaderButton(
-                        static_cast<size_t>(raisedIndex),
-                        1,
-                        POINT{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)});
+                    if (hosted.descriptor.contentBounds) {
+                        // A tab container only collapses by an explicit action.
+                        // Treat a rapid second header press as the next drag.
+                        swallowDoubleClickRelease_ = false;
+                        BeginHostedPointerGesture(
+                            clientPoint, (wParam & MK_CONTROL) != 0);
+                    } else {
+                        DispatchHostedHeaderButton(
+                            static_cast<size_t>(raisedIndex),
+                            1,
+                            POINT{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)});
+                    }
                 } else if ((hit.kind == WidgetViewHitKind::ItemIcon ||
                             hit.kind == WidgetViewHitKind::ItemCellGap) &&
                            hit.itemIndex >= 0) {
@@ -2567,6 +2705,13 @@ void DesktopSurfaceWindow::Render() {
         hostedWidgetSlice_->Draw(d2d_, iconCache_);
     }
 #endif
+    if(temporaryForeground_&&temporaryLabelFormat_) {
+        const RECT label=TemporaryLabelBounds();Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> brush;
+        if(!IsRectEmpty(&label)&&SUCCEEDED(target->CreateSolidColorBrush(D2D1::ColorF(0x72dcb3),brush.GetAddressOf()))) {
+            constexpr wchar_t text[]=L"临时前台访问 · Esc 或再次按快捷键结束";
+            target->DrawTextW(text,ARRAYSIZE(text)-1,temporaryLabelFormat_.Get(),D2D1::RectF(static_cast<float>(label.left),static_cast<float>(label.top),static_cast<float>(label.right),static_cast<float>(label.bottom)),brush.Get());
+        }
+    }
     const HRESULT result = d2d_.EndDraw();
     EndPaint(hwnd_, &paint);
 #ifndef NDEBUG
@@ -2649,7 +2794,8 @@ bool DesktopSurfaceWindow::ApplyHostedWidgets(
             viewConfig,
             descriptor.theme,
             bounds,
-            descriptor.items);
+            descriptor.items,
+            descriptor.contentBounds);
         const auto previous = std::find_if(
             hostedWidgets_.begin(), hostedWidgets_.end(),
             [&](const std::unique_ptr<HostedWidgetEntry>& value) {
@@ -2682,7 +2828,8 @@ bool DesktopSurfaceWindow::ApplyHostedWidgets(
     ResetHostedPointerGesture();
     hostedWidgets_.swap(candidate);
     if (nativeDesktop_) UpdateNativeWidgetRegion();
-    activeHostedWidgetIndex_ = -1;
+    activeHostedWidgetIndex_ = hostedWidgets_.size() == 1 &&
+        hostedWidgets_.front()->descriptor.contentBounds ? 0 : -1;
     if (!activeCategory.empty()) {
         for (size_t index = 0; index < hostedWidgets_.size(); ++index) {
             if (hostedWidgets_[index] != nullptr &&
@@ -2698,6 +2845,11 @@ bool DesktopSurfaceWindow::ApplyHostedWidgets(
         InvalidateRect(hwnd_, nullptr, FALSE);
     }
     return true;
+}
+
+void DesktopSurfaceWindow::SelectHostedItemIds(const std::wstring& categoryId,const std::vector<std::wstring>& ids) {
+    for(auto& entry:hostedWidgets_)if(entry&&IdentitiesEqual(entry->descriptor.categoryId,categoryId))entry->view.SetSelectedItemIds(ids);
+    if(hwnd_)InvalidateRect(hwnd_,nullptr,FALSE);
 }
 
 void DesktopSurfaceWindow::ClearHostedWidgets() {
@@ -2866,6 +3018,18 @@ bool DesktopSurfaceWindow::DispatchHostedWidgetAction(
          hostedWidgetCommandHandler_(command));
 }
 
+bool DesktopSurfaceWindow::BeginHostedContainerMove(POINT screenPoint) {
+    if (!hwnd_) return false;
+    ScreenToClient(hwnd_, &screenPoint);
+    const int index = HostedWidgetIndexAt(screenPoint);
+    if (index < 0) return false;
+    const auto& entry = *hostedWidgets_[static_cast<size_t>(index)];
+    if (!entry.descriptor.contentBounds || entry.descriptor.config.locked ||
+        entry.view.HitTestHostPoint(screenPoint).kind != WidgetViewHitKind::Header) return false;
+    SetFocus(hwnd_);
+    return BeginHostedPointerGesture(screenPoint, false);
+}
+
 bool DesktopSurfaceWindow::BeginHostedPointerGesture(
     POINT clientPoint,
     bool controlPressed) {
@@ -2988,6 +3152,9 @@ void DesktopSurfaceWindow::ContinueHostedPointerGesture(
             nullptr) {
         return;
     }
+    if ((hostedPointerGesture_ == HostedPointerGesture::Moving ||
+         hostedPointerGesture_ == HostedPointerGesture::Resizing) &&
+        clientPoint.x == hostedPointerCurrent_.x && clientPoint.y == hostedPointerCurrent_.y) return;
     hostedPointerCurrent_ = clientPoint;
     HostedWidgetEntry& source = *hostedWidgets_[
         static_cast<size_t>(hostedPointerWidgetIndex_)];
@@ -3006,7 +3173,17 @@ void DesktopSurfaceWindow::ContinueHostedPointerGesture(
             hostedAlignmentRects_);
         WidgetAlignmentGuideOverlay::Update(instance_, guides);
         OffsetRect(&bounds, -hostScreen.left, -hostScreen.top);
+        const RECT previousBounds = source.view.HostPixelBounds();
+        if (EqualRect(&bounds, &previousBounds) != FALSE) return;
         source.view.SetHostPixelBounds(bounds);
+        if (source.descriptor.contentBounds && hostedLayoutPreviewHandler_) {
+            RECT screenBounds = bounds;
+            OffsetRect(&screenBounds, hostScreen.left, hostScreen.top);
+            UpdateNativeWidgetRegion();
+            InvalidateRect(hwnd_, nullptr, FALSE);
+            UpdateWindow(hwnd_);
+            hostedLayoutPreviewHandler_(screenBounds);
+        }
     } else if (hostedPointerGesture_ ==
                    HostedPointerGesture::Resizing) {
         RECT bounds = hostedPointerOriginalBounds_;
@@ -3045,7 +3222,17 @@ void DesktopSurfaceWindow::ContinueHostedPointerGesture(
             hostedAlignmentRects_);
         WidgetAlignmentGuideOverlay::Update(instance_, guides);
         OffsetRect(&bounds, -hostScreen.left, -hostScreen.top);
+        const RECT previousBounds = source.view.HostPixelBounds();
+        if (EqualRect(&bounds, &previousBounds) != FALSE) return;
         source.view.SetHostPixelBounds(bounds);
+        if (source.descriptor.contentBounds && hostedLayoutPreviewHandler_) {
+            RECT screenBounds = bounds;
+            OffsetRect(&screenBounds, hostScreen.left, hostScreen.top);
+            UpdateNativeWidgetRegion();
+            InvalidateRect(hwnd_, nullptr, FALSE);
+            UpdateWindow(hwnd_);
+            hostedLayoutPreviewHandler_(screenBounds);
+        }
     } else if (hostedPointerGesture_ ==
                    HostedPointerGesture::MarqueePending ||
                hostedPointerGesture_ ==
@@ -3080,6 +3267,26 @@ void DesktopSurfaceWindow::ContinueHostedPointerGesture(
             hostedDragActivationPointForSmoke_ = clientPoint;
 #endif
             hostedPointerGesture_ = HostedPointerGesture::ItemDragging;
+            if(temporaryForeground_) {
+                std::vector<std::wstring> items;
+                for(size_t index=0;index<source.descriptor.items.size();++index) {
+                    const DesktopItem* selected=source.view.ItemAt(index);
+                    if(selected&&std::find(hostedDraggingItemIds_.begin(),hostedDraggingItemIds_.end(),selected->id)!=hostedDraggingItemIds_.end()) {
+                        items.push_back(selected->path);
+                    }
+                }
+                const size_t expected=hostedDraggingItemIds_.size();
+                SHDRAGIMAGE image{};const bool hasImage=BuildShellDragImage(hostedPointerStart_,image,&source.view);
+                ResetHostedPointerGesture();if(GetCapture()==hwnd_)ReleaseCapture();
+                if(items.size()==expected&&!items.empty()) {
+                    if(accessInteractionHandler_)accessInteractionHandler_(true);
+                    ++shellDragStartCount_;
+                    StartShellDrag(hwnd_,items,hasImage?&image:nullptr,[this]{if(accessEscapeHandler_)accessEscapeHandler_();});
+                    if(accessInteractionHandler_)accessInteractionHandler_(false);
+                }
+                if(image.hbmpDragImage)DeleteObject(image.hbmpDragImage);
+                return;
+            }
             const DesktopItem* item = hostedPointerHit_.itemIndex < 0
                 ? nullptr
                 : source.view.ItemAt(
@@ -3133,6 +3340,8 @@ void DesktopSurfaceWindow::ContinueHostedPointerGesture(
         }
     }
 
+    if (hostedPointerGesture_ == HostedPointerGesture::Moving ||
+        hostedPointerGesture_ == HostedPointerGesture::Resizing) UpdateNativeWidgetRegion();
     const int hoveredHostedIndex = HostedWidgetIndexAt(clientPoint);
     for (size_t index = 0; index < hostedWidgets_.size(); ++index) {
         if (hostedWidgets_[index] == nullptr) {
@@ -3235,9 +3444,17 @@ void DesktopSurfaceWindow::CompleteHostedPointerGesture(
             command.layout.height = bounds.bottom - bounds.top;
             command.layout.normalHeight = command.layout.height;
         }
+        const RECT originalBounds = hostedPointerOriginalBounds_;
+        const bool container = source.descriptor.contentBounds.has_value();
+        hostedPointerGesture_ = HostedPointerGesture::None;
         if (hostedWidgetCommandHandler_ == nullptr ||
             !hostedWidgetCommandHandler_(command)) {
-            source.view.SetHostPixelBounds(hostedPointerOriginalBounds_);
+            source.view.SetHostPixelBounds(originalBounds);
+            if (container && hostedLayoutPreviewHandler_) {
+                RECT screenBounds = originalBounds;
+                OffsetRect(&screenBounds, hostScreen.left, hostScreen.top);
+                hostedLayoutPreviewHandler_(screenBounds);
+            }
         }
     } else if (hostedPointerGesture_ ==
                    HostedPointerGesture::ItemPressed) {
@@ -3265,6 +3482,15 @@ void DesktopSurfaceWindow::CompleteHostedPointerGesture(
             DragGhostWindow::Instance().IsCommitted()
             ? DragGhostWindow::Instance().TopLeftScreenPoint()
             : screenPoint;
+        const std::wstring tabTarget=tabDropTargetHandler_?tabDropTargetHandler_(screenPoint):std::wstring{};
+        if(!tabTarget.empty()) {
+            HostedWidgetCommand command;command.type=HostedWidgetCommandType::MoveSelectionToCategory;
+            command.categoryId=source.descriptor.categoryId;command.targetCategoryId=tabTarget;
+            command.itemIds=hostedDraggingItemIds_;command.screenPoint=screenPoint;
+            ResetHostedPointerGesture();if(GetCapture()==hwnd_)ReleaseCapture();
+            if(hostedWidgetCommandHandler_)hostedWidgetCommandHandler_(command);
+            return;
+        }
         const int targetIndex = HostedWidgetIndexAt(clientPoint);
         if (targetIndex >= 0 &&
             static_cast<size_t>(targetIndex) < hostedWidgets_.size() &&
@@ -3343,6 +3569,7 @@ void DesktopSurfaceWindow::CompleteHostedPointerGesture(
 }
 
 void DesktopSurfaceWindow::ResetHostedPointerGesture() noexcept {
+    tabPointerPressed_ = false;
     WidgetAlignmentGuideOverlay::Hide();
     if ((hostedPointerGesture_ == HostedPointerGesture::Moving ||
          hostedPointerGesture_ == HostedPointerGesture::Resizing) &&
@@ -3353,6 +3580,16 @@ void DesktopSurfaceWindow::ResetHostedPointerGesture() noexcept {
             nullptr) {
         hostedWidgets_[static_cast<size_t>(hostedPointerWidgetIndex_)]->
             view.SetHostPixelBounds(hostedPointerOriginalBounds_);
+        if (hostedWidgets_[static_cast<size_t>(hostedPointerWidgetIndex_)]->descriptor.contentBounds &&
+            hostedLayoutPreviewHandler_) {
+            RECT screenBounds = hostedPointerOriginalBounds_, hostScreen{};
+            GetWindowRect(hwnd_, &hostScreen);
+            OffsetRect(&screenBounds, hostScreen.left, hostScreen.top);
+            UpdateNativeWidgetRegion();
+            InvalidateRect(hwnd_, nullptr, FALSE);
+            UpdateWindow(hwnd_);
+            hostedLayoutPreviewHandler_(screenBounds);
+        }
     }
     if (hostedPointerWidgetIndex_ >= 0 &&
         static_cast<size_t>(hostedPointerWidgetIndex_) <
@@ -5118,7 +5355,8 @@ void DesktopSurfaceWindow::SetItemScreenPoint(
 
 bool DesktopSurfaceWindow::BuildShellDragImage(
     POINT sourceClientPoint,
-    SHDRAGIMAGE& dragImage) {
+    SHDRAGIMAGE& dragImage,
+    const WidgetView* hostedView) {
     dragImage = {};
     struct DragPart {
         HICON icon = nullptr;
@@ -5128,7 +5366,19 @@ bool DesktopSurfaceWindow::BuildShellDragImage(
     std::vector<DragPart> parts;
     RECT bounds{};
     bool hasBounds = false;
-    for (const DesktopViewItem& item : visibleItems_) {
+    const int dragIconSize = hostedView ? MulDiv(hostedView->Config().iconSize,std::max(96,hostedView->Config().dpi),96) : iconSize_;
+    const int dragCellWidth = hostedView ? MulDiv(hostedView->SlotSize().cx,std::max(96,hostedView->Config().dpi),96) : cellWidth_;
+    if(hostedView) {
+        for(size_t index=0;const DesktopItem* item=hostedView->ItemAt(index);++index) {
+            const auto& selected=hostedView->SelectedItemIds();
+            if(std::find(selected.begin(),selected.end(),item->id)==selected.end())continue;
+            HICON icon=iconCache_.CopyReadyIconForDrag(item->path);
+            if(!icon) {for(const auto& part:parts)DestroyIcon(part.icon);return false;}
+            RECT cell=hostedView->ItemHostCell(index);
+            parts.push_back(DragPart{icon,cell,dragIconSize});
+            if(!hasBounds) {bounds=cell;hasBounds=true;}else UnionRect(&bounds,&bounds,&cell);
+        }
+    } else for (const DesktopViewItem& item : visibleItems_) {
         if (!IsSelected(item.path)) {
             continue;
         }
@@ -5220,15 +5470,15 @@ bool DesktopSurfaceWindow::BuildShellDragImage(
             static_cast<HBRUSH>(GetStockObject(WHITE_BRUSH)));
         for (const DragPart& part : parts) {
             const int left = part.cell.left - bounds.left +
-                (cellWidth_ - iconSize_) / 2;
+                (dragCellWidth - dragIconSize) / 2;
             const int top = part.cell.top - bounds.top;
             if (DrawIconEx(
                     blackDc, left, top, part.icon,
-                    iconSize_, part.height, 0, nullptr,
+                    dragIconSize, part.height, 0, nullptr,
                     DI_NORMAL) == FALSE ||
                 DrawIconEx(
                     whiteDc, left, top, part.icon,
-                    iconSize_, part.height, 0, nullptr,
+                    dragIconSize, part.height, 0, nullptr,
                     DI_NORMAL) == FALSE) {
                 succeeded = false;
                 break;
@@ -5692,6 +5942,7 @@ bool DesktopSurfaceWindow::CommitInternalDesktopDrop(
 }
 
 void DesktopSurfaceWindow::MaintainDesktopLayer() {
+    if(temporaryForeground_)return;
     if (hwnd_ == nullptr || IsWindow(hwnd_) == FALSE) {
         return;
     }
@@ -5713,11 +5964,26 @@ void DesktopSurfaceWindow::UpdateNativeDesktop() {
     nativeDesktop_->Update(projected);
 }
 
+RECT DesktopSurfaceWindow::TemporaryLabelBounds() const {
+    if(!temporaryForeground_||!hwnd_)return RECT{};
+    for(const auto& hosted:hostedWidgets_)if(hosted&&hosted->descriptor.visible) {
+        RECT rect=hosted->view.HostPixelBounds(),client{};GetClientRect(hwnd_,&client);
+        const int gap=MulDiv(12,GetDpiForWindow(hwnd_),96),height=MulDiv(20,GetDpiForWindow(hwnd_),96);
+        const int width=std::min(static_cast<int>(client.right),MulDiv(360,GetDpiForWindow(hwnd_),96));
+        const int left=std::clamp(static_cast<int>(rect.left),0,std::max(0,static_cast<int>(client.right)-width));
+        int top=rect.bottom+gap;if(top+height>client.bottom-MulDiv(32,GetDpiForWindow(hwnd_),96))top=std::max(0L,rect.top-gap-height);
+        return RECT{left,top,left+width,top+height};
+    }
+    return RECT{};
+}
+
 void DesktopSurfaceWindow::UpdateNativeWidgetRegion() {
     if (!nativeDesktop_ || !hwnd_) return;
     std::vector<RECT> bounds;
     for (const auto& hosted : hostedWidgets_)
-        if (hosted && hosted->descriptor.visible) bounds.push_back(hosted->view.HostPixelBounds());
+        if (hosted && hosted->descriptor.visible)
+            bounds.push_back(hosted->view.HostPixelBounds());
+    const RECT label=TemporaryLabelBounds();if(!IsRectEmpty(&label))bounds.push_back(label);
     const bool same = bounds.size() == nativeWidgetRegion_.size() &&
         std::equal(bounds.begin(), bounds.end(), nativeWidgetRegion_.begin(),
             [](const RECT& a, const RECT& b) { return EqualRect(&a, &b) != FALSE; });
@@ -5733,6 +5999,12 @@ void DesktopSurfaceWindow::UpdateNativeWidgetRegion() {
     }
     if (!valid || !SetWindowRgn(hwnd_, region, TRUE)) {
         DeleteObject(region); Hide(); return;
+    }
+    if(temporaryForegroundHost_) {
+        HRGN copy=CreateRectRgn(0,0,0,0);
+        if(!copy||GetWindowRgn(hwnd_,copy)==ERROR||!SetWindowRgn(temporaryForegroundHost_,copy,TRUE)) {
+            if(copy)DeleteObject(copy);Hide();return;
+        }
     }
     nativeWidgetRegion_ = std::move(bounds);
     nativeWidgetRegionSet_ = true;

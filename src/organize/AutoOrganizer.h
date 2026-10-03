@@ -1,4 +1,5 @@
 #pragma once
+#include "organize/OrganizeRule.h"
 
 #include <cstdint>
 #include <atomic>
@@ -38,6 +39,8 @@ struct ItemSnapshot {
     int displayY = 0;
     bool hasDisplayPosition = false;
     bool missing = false;
+    std::uint64_t creationTime = 0;
+    std::uint64_t modificationTime = 0;
 };
 
 struct ExistingCategorySnapshot {
@@ -84,10 +87,14 @@ struct Plan {
     std::uint64_t baseConfigRevision = 0;
     std::vector<Decision> decisions;
     std::vector<GroupPlan> groups;
+    bool usesRules = false;
+    std::vector<OrganizeRule> evaluatedRules;
 };
 
 bool IsOwnershipAdjustment(const Decision& decision) noexcept;
 Plan BuildPlan(const Snapshot& snapshot);
+void RebuildPlanGroups(Plan& plan, std::size_t minimumNewGroupItems = 2);
+std::wstring OrganizeCategoryId(const std::wstring& monitorId, const std::wstring& name);
 void EnrichSnapshotLocalMetadata(
     Snapshot& snapshot,
     const std::atomic<bool>* cancelRequested = nullptr);

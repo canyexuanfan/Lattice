@@ -314,6 +314,9 @@ bool ParseLayoutSnapshot(
     loaded.globalVisible = readBool(L"global.visible", true);
     loaded.viewMode = readInt(L"global.viewMode", 1);
     loaded.main = ReadWindowConfig(values, L"main.");
+    loaded.hasTabContainer = values.find(L"tabs.width") != values.end();
+    if (loaded.hasTabContainer) loaded.tabContainer = ReadWindowConfig(values, L"tabs.");
+    loaded.currentCategoryId = readString(L"tabs.currentCategoryId");
 
     const int uncategorizedCount = readInt(
         L"uncategorized.item.count", -1);
@@ -970,7 +973,7 @@ WindowConfig ConfigStore::Load() const {
 bool ConfigStore::Save(const WindowConfig& config) const {
     AppConfig appConfig = LoadAppConfig();
     appConfig.window = config;
-    return SaveAppConfig(appConfig);
+    return SaveAppConfig(appConfig, true);
 }
 
 AppConfig ConfigStore::LoadAppConfig() const {
@@ -1074,9 +1077,29 @@ AppConfig ConfigStore::LoadAppConfigFromDisk() const {
     config.settings.backupCount = std::clamp(readInt(L"settings.backupCount", config.settings.backupCount), 1, 10);
     config.settings.iconCacheSize = std::clamp(readInt(L"settings.iconCacheSize", config.settings.iconCacheSize), 64, 4096);
     config.settings.theme = std::clamp(readInt(L"settings.theme", config.settings.theme), 0, 2);
+    config.settings.quickHideKey=readInt(L"settings.quickHideKey",config.settings.quickHideKey);
+    config.settings.quickHideModifiers=readInt(L"settings.quickHideModifiers",config.settings.quickHideModifiers);
+    config.settings.temporaryAccessKey=readInt(L"settings.temporaryAccessKey",config.settings.temporaryAccessKey);
+    config.settings.temporaryAccessModifiers=readInt(L"settings.temporaryAccessModifiers",config.settings.temporaryAccessModifiers);
     config.settings.desktopGridAlignmentInitialized = readBool(
         L"settings.desktopGridAlignmentInitialized",
         config.settings.desktopGridAlignmentInitialized);
+    // Existing layouts remain untouched; the first tab container has its own geometry.
+    WindowConfig tabDefault;
+    tabDefault.viewMode = 0;
+    const int initialDpi = std::max(96, static_cast<int>(GetDpiForSystem()));
+    tabDefault.dpi = initialDpi;
+    tabDefault.width = MulDiv(390, initialDpi, 96);
+    tabDefault.height = tabDefault.normalHeight = MulDiv(489, initialDpi, 96);
+    if (schemaVersion < 15 && config.window.viewMode == 0) tabDefault = config.window;
+    config.tabContainer = ReadWindowConfig(values, L"tabs.", tabDefault);
+    config.tabContainer.viewMode = 0;
+    config.tabContainer.width = std::max(260, config.tabContainer.width);
+    config.tabContainer.height = std::max(120, config.tabContainer.height);
+    config.tabContainer.normalHeight = std::max(120, config.tabContainer.normalHeight);
+    config.tabContainer.dpi = std::max(96, config.tabContainer.dpi);
+    config.tabContainer.opacity = std::clamp(config.tabContainer.opacity, 80, 255);
+    config.tabContainer.tabSide = std::clamp(config.tabContainer.tabSide, 0, 3);
     const auto currentIt = values.find(L"currentCategoryId");
     if (currentIt != values.end() && !currentIt->second.empty()) {
         config.currentCategoryId = currentIt->second;
@@ -1360,20 +1383,101 @@ AppConfig ConfigStore::LoadAppConfigFromDisk() const {
             config.autoOrganizeUndoHistory.push_back(std::move(record));
         }
     }
+    const auto ruleCountValue = values.find(L"organizeRule.count");
+    const int ruleCount = readInt(L"organizeRule.count", ruleCountValue == values.end() ? 0 : -1);
+    config.organizeRulesReadError = ruleCount < 0 || ruleCount > 64;
+    if (ruleCountValue != values.end() && (ruleCountValue->second.empty() ||
+        ruleCountValue->second.find_first_not_of(L"0123456789") != std::wstring::npos))
+        config.organizeRulesReadError = true;
+    const auto readRuleText = [&](const std::wstring& key) {
+        const auto found = values.find(key);
+        return found == values.end() ? std::wstring{} : found->second;
+    };
+    for (int index = 0; !config.organizeRulesReadError && index < ruleCount; ++index) {
+        const std::wstring prefix = L"organizeRule." + std::to_wstring(index) + L".";
+        lattice::organize::OrganizeRule rule;
+        rule.id = readRuleText(prefix + L"id");
+        rule.name = readRuleText(prefix + L"name");
+        rule.enabled = readBool(prefix + L"enabled", true);
+        rule.namePattern = readRuleText(prefix + L"namePattern");
+        rule.itemType = static_cast<lattice::organize::RuleItemType>(readInt(prefix + L"itemType", -1));
+        rule.extensions = readRuleText(prefix + L"extensions");
+        rule.targetPattern = readRuleText(prefix + L"targetPattern");
+        rule.timeField = static_cast<lattice::organize::RuleTimeField>(readInt(prefix + L"timeField", -1));
+        rule.age = static_cast<lattice::organize::RuleAge>(readInt(prefix + L"age", -1));
+        rule.days = readInt(prefix + L"days", 0);
+        rule.targetCategoryId = readRuleText(prefix + L"targetCategoryId");
+        rule.newCategoryName = readRuleText(prefix + L"newCategoryName");
+        for (const wchar_t* field : {L"enabled", L"itemType", L"timeField", L"age", L"days"}) {
+            const auto value = readRuleText(prefix + field);
+            if (value.empty() || value.find_first_not_of(L"0123456789") != std::wstring::npos)
+                config.organizeRulesReadError = true;
+        }
+        if (readRuleText(prefix + L"enabled") != L"0" && readRuleText(prefix + L"enabled") != L"1")
+            config.organizeRulesReadError = true;
+        config.organizeRules.push_back(std::move(rule));
+    }
+    std::wstring ruleError;
+    if (!lattice::organize::ValidateOrganizeRules(config.organizeRules, ruleError))
+        config.organizeRulesReadError = true;
+    if (config.organizeRulesReadError) config.organizeRules.clear();
     return config;
 }
 
-bool ConfigStore::SaveAppConfig(const AppConfig& config) const {
+bool ConfigStore::SaveAppConfig(const AppConfig& config, bool preserveOrganizeRules) const {
     std::lock_guard<std::mutex> fileLock(ConfigFileWriteMutex());
     const std::vector<InteractionMutation> mutations =
         SnapshotInteractionMutations(configPath_);
     AppConfig merged = config;
+    if (preserveOrganizeRules) {
+        const AppConfig latest = LoadAppConfigFromDisk();
+        merged.organizeRules = latest.organizeRules;
+        merged.organizeRulesReadError = latest.organizeRulesReadError;
+    }
     ApplyInteractionMutations(mutations, merged);
     if (!SaveAppConfigToDisk(merged)) {
         return false;
     }
     RemoveAppliedInteractionMutations(configPath_, mutations);
     return true;
+}
+
+bool ConfigStore::SaveOrganizeRulesAsync(
+    const std::vector<lattice::organize::OrganizeRule>& expected,
+    const std::vector<lattice::organize::OrganizeRule>& rules,
+    HWND notificationWindow, UINT notificationMessage, std::uint64_t token) const {
+    std::wstring error;
+    if (!lattice::organize::ValidateOrganizeRules(rules, error) || !notificationMessage) return false;
+    const ConfigStore store = *this;
+    return AsyncConfigWriter::Instance().Enqueue(
+        configPath_ + L"\x1frules:" + std::to_wstring(token),
+        [store, expected, rules, notificationWindow, notificationMessage, token]() {
+            auto result = std::make_unique<AutoOrganizeTransactionResult>();
+            result->token = token;
+            bool writerSucceeded = true;
+            {
+                std::lock_guard<std::mutex> fileLock(ConfigFileWriteMutex());
+                const auto mutations = SnapshotInteractionMutations(store.configPath_);
+                AppConfig current = store.LoadAppConfigFromDisk();
+                ApplyInteractionMutations(mutations, current);
+                if (current.organizeRules != expected) {
+                    result->conflict = true;
+                    result->message = L"规则已被其它操作修改，请关闭后重新打开；本次未保存。";
+                } else {
+                    current.organizeRules = rules;
+                    current.organizeRulesReadError = false;
+                    result->succeeded = store.SaveAppConfigToDisk(current);
+                    writerSucceeded = result->succeeded;
+                    result->message = result->succeeded ? L"规则已保存，桌面保持原样。" :
+                        L"规则保存失败，原配置保持不变。";
+                    if (result->succeeded) RemoveAppliedInteractionMutations(store.configPath_, mutations);
+                }
+            }
+            if (notificationWindow && IsWindow(notificationWindow) &&
+                PostMessageW(notificationWindow, notificationMessage, 0, reinterpret_cast<LPARAM>(result.get())))
+                result.release();
+            return writerSucceeded;
+        });
 }
 
 bool ConfigStore::SaveInteractionStateAsync(
@@ -1849,9 +1953,29 @@ bool ConfigStore::FlushInteractionStateToDisk() const {
 }
 
 bool ConfigStore::SaveAppConfigToDisk(const AppConfig& config) const {
+    if (config.organizeRulesReadError) return false;
     if (ShouldInjectSmokeConfigWriteFailure(configPath_)) return false;
+    std::wstring ruleError;
+    if (!lattice::organize::ValidateOrganizeRules(config.organizeRules, ruleError)) return false;
     std::ostringstream output;
-    output << "schemaVersion=13\n";
+    output << "schemaVersion=15\n";
+    output << "organizeRule.count=" << config.organizeRules.size() << "\n";
+    for (std::size_t index = 0; index < config.organizeRules.size(); ++index) {
+        const auto& rule = config.organizeRules[index];
+        const std::string prefix = "organizeRule." + std::to_string(index) + ".";
+        output << prefix << "id=" << WideToUtf8(rule.id) << "\n"
+            << prefix << "name=" << WideToUtf8(rule.name) << "\n"
+            << prefix << "enabled=" << (rule.enabled ? 1 : 0) << "\n"
+            << prefix << "namePattern=" << WideToUtf8(rule.namePattern) << "\n"
+            << prefix << "itemType=" << static_cast<int>(rule.itemType) << "\n"
+            << prefix << "extensions=" << WideToUtf8(rule.extensions) << "\n"
+            << prefix << "targetPattern=" << WideToUtf8(rule.targetPattern) << "\n"
+            << prefix << "timeField=" << static_cast<int>(rule.timeField) << "\n"
+            << prefix << "age=" << static_cast<int>(rule.age) << "\n"
+            << prefix << "days=" << rule.days << "\n"
+            << prefix << "targetCategoryId=" << WideToUtf8(rule.targetCategoryId) << "\n"
+            << prefix << "newCategoryName=" << WideToUtf8(rule.newCategoryName) << "\n";
+    }
     output << "settings.launchOnStartup=" << (config.settings.launchOnStartup ? 1 : 0) << "\n";
     output << "settings.showPublicDesktopItems=" << (config.settings.showPublicDesktopItems ? 1 : 0) << "\n";
     output << "settings.restoreHiddenState=" << (config.settings.restoreHiddenState ? 1 : 0) << "\n";
@@ -1861,6 +1985,10 @@ bool ConfigStore::SaveAppConfigToDisk(const AppConfig& config) const {
     output << "settings.backupCount=" << config.settings.backupCount << "\n";
     output << "settings.iconCacheSize=" << std::clamp(config.settings.iconCacheSize, 64, 4096) << "\n";
     output << "settings.theme=" << config.settings.theme << "\n";
+    output << "settings.quickHideKey=" << config.settings.quickHideKey << "\n";
+    output << "settings.quickHideModifiers=" << config.settings.quickHideModifiers << "\n";
+    output << "settings.temporaryAccessKey=" << config.settings.temporaryAccessKey << "\n";
+    output << "settings.temporaryAccessModifiers=" << config.settings.temporaryAccessModifiers << "\n";
     output << "settings.desktopGridAlignmentInitialized="
            << (config.settings.desktopGridAlignmentInitialized ? 1 : 0)
            << "\n";
@@ -1884,6 +2012,7 @@ bool ConfigStore::SaveAppConfigToDisk(const AppConfig& config) const {
     output << "window.showBorder=" << (config.window.showBorder ? 1 : 0) << "\n";
     output << "window.autoArrange=" << (config.window.autoArrange ? 1 : 0) << "\n";
     output << "window.fixedExpanded=" << (config.window.fixedExpanded ? 1 : 0) << "\n";
+    WriteWindowConfig(output, "tabs.", config.tabContainer);
     output << "currentCategoryId=" << WideToUtf8(config.currentCategoryId) << "\n";
     output << "uncategorized.name=" << WideToUtf8(config.uncategorizedName.empty() ? L"未分类" : config.uncategorizedName) << "\n";
     output << "uncategorized.storageFolder=" << WideToUtf8(
@@ -2233,6 +2362,10 @@ bool ConfigStore::SaveLayoutProfile(const LayoutSnapshot& snapshot) const {
     output << "global.viewMode=" << snapshot.viewMode << "\n";
     output << "global.visible=" << (snapshot.globalVisible ? 1 : 0) << "\n";
     WriteWindowConfig(output, "main.", snapshot.main);
+    if (snapshot.hasTabContainer) {
+        WriteWindowConfig(output, "tabs.", snapshot.tabContainer);
+        output << "tabs.currentCategoryId=" << WideToUtf8(snapshot.currentCategoryId) << "\n";
+    }
     output << "uncategorized.item.count="
            << snapshot.uncategorizedItemOrder.size() << "\n";
     for (std::size_t index = 0;

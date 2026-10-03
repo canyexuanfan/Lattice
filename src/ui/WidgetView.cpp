@@ -43,12 +43,14 @@ void WidgetView::Configure(
     const WindowConfig& config,
     int theme,
     RECT hostPixelBounds,
-    std::vector<DesktopItem> items) {
+    std::vector<DesktopItem> items,
+    std::optional<RECT> contentBounds) {
     categoryId_ = std::move(categoryId);
     title_ = std::move(title);
     config_ = config;
     theme_ = theme;
     hostPixelBounds_ = hostPixelBounds;
+    contentBounds_ = contentBounds;
     items_ = std::move(items);
     selectedItemIds_.clear();
     selectionAnchorIndex_ = -1;
@@ -72,6 +74,12 @@ void WidgetView::Configure(
 }
 
 void WidgetView::SetHostPixelBounds(RECT bounds) {
+    if(contentBounds_) {
+        contentBounds_->right += MulDiv(bounds.right-bounds.left,96,Dpi())-
+            MulDiv(hostPixelBounds_.right-hostPixelBounds_.left,96,Dpi());
+        contentBounds_->bottom += MulDiv(bounds.bottom-bounds.top,96,Dpi())-
+            MulDiv(hostPixelBounds_.bottom-hostPixelBounds_.top,96,Dpi());
+    }
     hostPixelBounds_ = bounds;
     grid_.SetBounds(LocalGridBounds());
 }
@@ -116,6 +124,7 @@ RECT WidgetView::LocalGridBounds() const noexcept {
     if (config_.collapsed) {
         return RECT{};
     }
+    if (contentBounds_) return *contentBounds_;
     const int width = std::max(
         0,
         MulDiv(
@@ -182,7 +191,7 @@ int WidgetView::HeaderButtonAtLocalPoint(POINT point) const noexcept {
 }
 
 WidgetViewHit WidgetView::HitTestHostPoint(POINT point) const {
-    if (PtInRect(&hostPixelBounds_, point) == FALSE) {
+    if (!ContainsHostPoint(point)) {
         return {};
     }
     const POINT local = HostPixelsToLocalDips(point);
