@@ -1,3 +1,5 @@
+[English](README.md) | 简体中文
+
 # Lattice
 
 一个本地化、低资源占用的 Windows 桌面分类格子整理工具。

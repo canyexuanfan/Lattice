@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Build (Debug x64)
+        run: msbuild Lattice.vcxproj /p:Configuration=Debug /p:Platform=x64 /m /nologo /verbosity:minimal
+
+      - name: Collect artifacts
+        run: |
+          New-Item -ItemType Directory -Force -Path build-artifacts | Out-Null
+          Get-ChildItem -Recurse -Include *.exe,*.dll -Path x64 |
+            Where-Object { $_.FullName -notmatch '\\(obj|tmp)\\' } |
+            Copy-Item -Destination build-artifacts
+          Get-ChildItem build-artifacts
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: lattice-debug-x64
+          path: build-artifacts/
+          if-no-files-found: warn
