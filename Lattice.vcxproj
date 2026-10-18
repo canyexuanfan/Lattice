@@ -1,4 +1,4 @@
-<?xml version="1.0" encoding="utf-8"?>
+﻿<?xml version="1.0" encoding="utf-8"?>
 <Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup Label="ProjectConfigurations">
     <ProjectConfiguration Include="Debug|x64">
@@ -162,6 +162,16 @@
     <ClCompile Include="src\ui\MainWindow.cpp" />
     <ClCompile Include="src\ui\SettingsDialog.cpp" />
     <ClCompile Include="src\ui\WidgetWindow.cpp" />
+    <ClCompile Include="src\config\LayoutSnapshot.cpp" />
+    <ClCompile Include="src\desktop\DesktopSnapshot.cpp" />
+    <ClCompile Include="src\organize\RuleEvaluator.cpp" />
+    <ClCompile Include="src\testing\DisplayModesSmoke.cpp" />
+    <ClCompile Include="src\testing\RuleSmoke.cpp" />
+    <ClCompile Include="src\ui\NativeDesktopView.cpp" />
+    <ClCompile Include="src\ui\OrganizeRulesDialog.cpp" />
+    <ClCompile Include="src\ui\WidgetAlignment.cpp" />
+    <ClCompile Include="src\ui\WidgetView.cpp" />
+    <ClCompile Include="src\ui\WidgetViewRenderer.cpp" />
   </ItemGroup>
 
   <ItemGroup>
