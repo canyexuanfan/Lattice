@@ -9,6 +9,8 @@ Lattice lets you group desktop icons, files, and folders into persistent
 without a network, and can be expanded or collapsed without disturbing the
 real Explorer desktop icons underneath.
 
+![Lattice overlay on the desktop](docs/screenshots/lattice-desktop.png)
+
 This is the open-source release of Lattice. The proprietary development
 history, internal automation, and Windows desktop integration details are
 intentionally not included.
