@@ -19,6 +19,15 @@ jobs:
         with:
           arch: x64
 
+      - name: Placeholder for missing overlay icon
+        # Lattice.rc 引用 assets/branding/lattice-shortcut-overlay.ico，
+        # 该文件仅在开发机存在、未入库；CI 用 logo ico 占位以保证可编译
+        run: |
+          if (!(Test-Path assets/branding/lattice-shortcut-overlay.ico)) {
+            Copy-Item assets/branding/lattice-logo.ico assets/branding/lattice-shortcut-overlay.ico
+            Write-Host 'placeholder overlay icon created'
+          }
+
       - name: Build (Debug x64)
         run: msbuild Lattice.vcxproj /p:Configuration=Debug /p:Platform=x64 /m /nologo /verbosity:minimal
 
