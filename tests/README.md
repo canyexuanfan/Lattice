@@ -1,6 +1,6 @@
-# Luno 测试入口
+# Lattice 测试入口
 
-Luno 的自动化回归不是独立的空测试工程。真实 Win32、Explorer、窗口层级和拖放场景由
+Lattice 的自动化回归不是独立的空测试工程。真实 Win32、Explorer、窗口层级和拖放场景由
 `src/testing/SmokeCommands.cpp` 中的内置命令实现，并由 `scripts/smoke.ps1` 统一运行。
 
 当前 runner 会：
