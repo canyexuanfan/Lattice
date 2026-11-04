@@ -121,6 +121,8 @@ Lattice/
 Lattice 以 **GNU 通用公共许可证 v3 (GPL-3.0-only)** 发布。
 完整文本见 [`LICENSE`](./LICENSE)。
 
+版权所有 (C) 2026 Lattice Contributors · SPDX-License-Identifier: `GPL-3.0-only`
+
 任何你分发的衍生作品也必须以 GPL-3.0 发布，并按相同条款公开
 对应源码。实际含义参见 [GPL-3.0 FAQ](https://www.gnu.org/licenses/gpl-faq.html)。
 

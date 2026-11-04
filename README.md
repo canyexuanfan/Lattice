@@ -132,6 +132,8 @@ Lattice/
 Lattice is released under the **GNU General Public License v3 (GPL-3.0-only)**.
 See [`LICENSE`](./LICENSE) for the full text.
 
+Copyright (C) 2026 Lattice Contributors · SPDX-License-Identifier: `GPL-3.0-only`
+
 Any derivative work that you distribute must also be released under
 GPL-3.0, with the corresponding source made available under the same
 terms. See the [GPL-3.0 FAQ](https://www.gnu.org/licenses/gpl-faq.html)
