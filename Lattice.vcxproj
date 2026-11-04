@@ -1,4 +1,4 @@
-﻿<?xml version="1.0" encoding="utf-8"?>
+<?xml version="1.0" encoding="utf-8"?>
 <Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup Label="ProjectConfigurations">
     <ProjectConfiguration Include="Debug|x64">
@@ -127,11 +127,13 @@
     <ClCompile Include="src\app\TrayIcon.cpp" />
     <ClCompile Include="src\app\UpdateService.cpp" />
     <ClCompile Include="src\config\ConfigStore.cpp" />
+    <ClCompile Include="src\config\LayoutSnapshot.cpp" />
     <ClCompile Include="src\desktop\CategoryStorageManager.cpp" />
     <ClCompile Include="src\desktop\DesktopLayout.cpp" />
     <ClCompile Include="src\desktop\LegacyStorageMigrator.cpp" />
     <ClCompile Include="src\desktop\DesktopPlacementCoordinator.cpp" />
     <ClCompile Include="src\desktop\DesktopScanner.cpp" />
+    <ClCompile Include="src\desktop\DesktopSnapshot.cpp" />
     <ClCompile Include="src\desktop\DesktopSession.cpp">
       <ExcludedFromBuild Condition="'$(Configuration)'=='Release'">true</ExcludedFromBuild>
       <ExcludedFromBuild Condition="'$(Configuration)'=='ReleaseOffline'">true</ExcludedFromBuild>
@@ -153,43 +155,54 @@
       <ExcludedFromBuild Condition="'$(Configuration)'=='Release'">true</ExcludedFromBuild>
       <ExcludedFromBuild Condition="'$(Configuration)'=='ReleaseOffline'">true</ExcludedFromBuild>
     </ClCompile>
+    <ClCompile Include="src\testing\RuleSmoke.cpp">
+      <ExcludedFromBuild Condition="'$(Configuration)'=='Release'">true</ExcludedFromBuild>
+      <ExcludedFromBuild Condition="'$(Configuration)'=='ReleaseOffline'">true</ExcludedFromBuild>
+    </ClCompile>
+    <ClCompile Include="src\testing\DisplayModesSmoke.cpp">
+      <ExcludedFromBuild Condition="'$(Configuration)'=='Release'">true</ExcludedFromBuild>
+      <ExcludedFromBuild Condition="'$(Configuration)'=='ReleaseOffline'">true</ExcludedFromBuild>
+    </ClCompile>
     <ClCompile Include="src\ui\DragGhostWindow.cpp" />
     <ClCompile Include="src\ui\AutoOrganizePreviewWindow.cpp" />
     <ClCompile Include="src\ui\DesktopSurfaceWindow.cpp" />
+    <ClCompile Include="src\ui\NativeDesktopView.cpp" />
     <ClCompile Include="src\ui\IconGrid.cpp" />
     <ClCompile Include="src\ui\InputDialog.cpp" />
     <ClCompile Include="src\ui\MessageDialog.cpp" />
     <ClCompile Include="src\ui\MainWindow.cpp" />
     <ClCompile Include="src\ui\SettingsDialog.cpp" />
-    <ClCompile Include="src\ui\WidgetWindow.cpp" />
-    <ClCompile Include="src\config\LayoutSnapshot.cpp" />
-    <ClCompile Include="src\desktop\DesktopSnapshot.cpp" />
     <ClCompile Include="src\organize\RuleEvaluator.cpp" />
-    <ClCompile Include="src\testing\DisplayModesSmoke.cpp" />
-    <ClCompile Include="src\testing\RuleSmoke.cpp" />
-    <ClCompile Include="src\ui\NativeDesktopView.cpp" />
     <ClCompile Include="src\ui\OrganizeRulesDialog.cpp" />
-    <ClCompile Include="src\ui\WidgetAlignment.cpp" />
+    <ClCompile Include="src\ui\WidgetWindow.cpp">
+      <ExcludedFromBuild Condition="'$(Configuration)'=='Release'">true</ExcludedFromBuild>
+      <ExcludedFromBuild Condition="'$(Configuration)'=='ReleaseOffline'">true</ExcludedFromBuild>
+    </ClCompile>
     <ClCompile Include="src\ui\WidgetView.cpp" />
+    <ClCompile Include="src\ui\WidgetAlignment.cpp" />
     <ClCompile Include="src\ui\WidgetViewRenderer.cpp" />
   </ItemGroup>
 
   <ItemGroup>
     <ClInclude Include="src\app\App.h" />
+    <ClInclude Include="src\ui\WidgetAlignment.h" />
     <ClInclude Include="src\app\StartupManager.h" />
     <ClInclude Include="src\app\SingleInstance.h" />
     <ClInclude Include="src\app\TrayIcon.h" />
     <ClInclude Include="src\app\UpdateService.h" />
     <ClInclude Include="src\app\resource.h" />
     <ClInclude Include="src\config\ConfigStore.h" />
+    <ClInclude Include="src\config\LayoutSnapshot.h" />
     <ClInclude Include="src\desktop\CategoryStorageManager.h" />
     <ClInclude Include="src\desktop\DesktopLayout.h" />
     <ClInclude Include="src\desktop\LegacyStorageMigrator.h" />
     <ClInclude Include="src\desktop\DesktopPlacementCoordinator.h" />
     <ClInclude Include="src\desktop\DesktopItem.h" />
+    <ClInclude Include="src\desktop\DesktopItemOrder.h" />
     <ClInclude Include="src\desktop\DesktopSession.h" />
     <ClInclude Include="src\desktop\ManagedShortcutStore.h" />
     <ClInclude Include="src\desktop\DesktopScanner.h" />
+    <ClInclude Include="src\desktop\DesktopSnapshot.h" />
     <ClInclude Include="src\desktop\DesktopWatcher.h" />
     <ClInclude Include="src\desktop\ShortcutResolver.h" />
     <ClInclude Include="src\rendering\D2DContext.h" />
@@ -200,17 +213,26 @@
     <ClInclude Include="src\shell\ShellItemReference.h" />
     <ClInclude Include="src\shell\ShellDropTarget.h" />
     <ClInclude Include="src\testing\SmokeCommands.h" />
+    <ClInclude Include="src\testing\RuleSmoke.h" />
+    <ClInclude Include="src\testing\DisplayModesSmoke.h" />
     <ClInclude Include="src\ui\DragGhostWindow.h" />
     <ClInclude Include="src\ui\AutoOrganizePreviewWindow.h" />
     <ClInclude Include="src\ui\DesktopSurfaceWindow.h" />
+    <ClInclude Include="src\ui\NativeDesktopView.h" />
     <ClInclude Include="src\ui\IconGrid.h" />
     <ClInclude Include="src\ui\InputDialog.h" />
     <ClInclude Include="src\ui\MessageDialog.h" />
     <ClInclude Include="src\ui\MainWindow.h" />
     <ClInclude Include="src\ui\SettingsDialog.h" />
     <ClInclude Include="src\ui\WidgetWindow.h" />
+    <ClInclude Include="src\ui\WidgetView.h" />
+    <ClInclude Include="src\ui\WidgetViewRenderer.h" />
     <ClInclude Include="src\model\OrganizerModel.h" />
     <ClInclude Include="src\organize\AutoOrganizer.h" />
+    <ClInclude Include="src\organize\OrganizeRule.h" />
+    <ClInclude Include="src\organize\RuleEvaluator.h" />
+    <ClInclude Include="src\ui\OrganizeRulesDialog.h" />
+    <ClInclude Include="src\ui\DialogStyle.h" />
     <ClInclude Include="src\organize\AutoOrganizeLayout.h" />
     <ClInclude Include="src\organize\AutoOrganizeTransaction.h" />
     <ClInclude Include="src\util\ComInit.h" />
