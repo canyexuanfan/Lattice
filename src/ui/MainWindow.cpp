@@ -595,6 +595,10 @@ bool MainWindow::EnableDesktopDisplayTakeover(
     });
     surface->SetAccessEscapeHandler([this] {EndTemporaryAccess();});
     surface->SetTabDropTargetHandler([this](POINT point) { return TabCategoryAtScreenPoint(point); });
+    surface->SetPresentationWindowHandler([this](HWND target) {
+        return target != nullptr &&
+            (target == hwnd_ || IsChild(hwnd_, target) != FALSE);
+    });
     surface->SetTabInputHandler([this](UINT message,WPARAM key,POINT screen) {
         if(windowConfig_.viewMode!=0 || (windowConfig_.collapsed && windowConfig_.tabSide!=0) || !IsWindowVisible(hwnd_))return false;
         POINT local=screen;ScreenToClient(hwnd_,&local);
@@ -2169,12 +2173,18 @@ void MainWindow::Show(int showCommand, bool enableDesktopTakeover) {
 
 void MainWindow::CheckForUpdates(HWND sourceWindow) {
     if (!UpdateService::Start(hwnd_, true, sourceWindow)) {
-        MessageDialog::Show(instance_, sourceWindow, L"无法开始检查更新，请稍后重试。", L"检查更新", MB_OK | MB_ICONWARNING);
+        MessageDialog::Show(
+            instance_, sourceWindow,
+            UpdateService::FormatVersionStatus(
+                {}, L"无法开始检查更新，请稍后重试。"),
+            L"检查更新", MB_OK | MB_ICONWARNING);
         return;
     }
     MessageDialog::Show(
         instance_, sourceWindow,
-        L"正在检查公开版本，请稍候。检查完成后会显示结果。",
+        UpdateService::FormatVersionStatus(
+            L"正在检查…",
+            L"正在检查公开版本，请稍候。检查完成后会显示结果。"),
         L"检查更新", MB_OK | MB_ICONINFORMATION,
         &updateProgressDialog_);
 }
@@ -2996,6 +3006,17 @@ LRESULT MainWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
                 if (autoOrganizePreview_ != nullptr) {
                     autoOrganizePreview_->MarkDesktopChanged();
                 }
+                if (NeedsDesktopProjectionRetry(changes)) {
+                    constexpr unsigned kMaximumProjectionAttempts = 2;
+                    if (changes.projectionAttempt <
+                        kMaximumProjectionAttempts) {
+                        ++changes.projectionAttempt;
+                        QueueDesktopChanges(std::move(changes));
+                    } else {
+                        OutputDebugStringW(
+                            L"Lattice desktop projection did not converge after bounded refresh attempts.\n");
+                    }
+                }
                 InvalidateRect(hwnd_, nullptr, FALSE);
                 return 0;
             }
@@ -3616,6 +3637,12 @@ void MainWindow::QueueDesktopChanges(DesktopChangeBatch changes) {
     }
     {
         std::lock_guard<std::mutex> lock(desktopChangesMutex_);
+        const bool hadPending = !pendingDesktopChanges_.Empty();
+        pendingDesktopChanges_.projectionAttempt = hadPending
+            ? std::min(
+                  pendingDesktopChanges_.projectionAttempt,
+                  changes.projectionAttempt)
+            : changes.projectionAttempt;
         pendingDesktopChanges_.requiresRescan |=
             changes.requiresRescan;
         for (std::wstring& path : changes.paths) {
@@ -3650,6 +3677,47 @@ DesktopChangeBatch MainWindow::TakePendingDesktopChanges() {
 bool MainWindow::HasPendingDesktopChanges() {
     std::lock_guard<std::mutex> lock(desktopChangesMutex_);
     return !pendingDesktopChanges_.Empty();
+}
+
+bool MainWindow::NeedsDesktopProjectionRetry(
+    const DesktopChangeBatch& changes) const {
+    if (!changes.requiresRescan || desktopSurface_ == nullptr) {
+        return false;
+    }
+    const auto scanContains = [&](const std::wstring& path) {
+        return std::any_of(
+            DesktopItems().begin(), DesktopItems().end(),
+            [&](const DesktopItem& item) {
+                return CompareStringOrdinal(
+                           item.path.c_str(), -1,
+                           path.c_str(), -1, TRUE) == CSTR_EQUAL;
+            });
+    };
+    const auto projectionContains = [&](const std::wstring& path) {
+        return std::any_of(
+            desktopSurface_->Snapshot().items.begin(),
+            desktopSurface_->Snapshot().items.end(),
+            [&](const DesktopViewItem& item) {
+                return CompareStringOrdinal(
+                           item.path.c_str(), -1,
+                           path.c_str(), -1, TRUE) == CSTR_EQUAL;
+            });
+    };
+    const auto isMissingProjection = [&](const std::wstring& path) {
+        return !path.empty() && shortcutStore_.IsDesktopPath(path) &&
+            GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES &&
+            scanContains(path) && !projectionContains(path);
+    };
+    if (!changes.paths.empty()) {
+        return std::any_of(
+            changes.paths.begin(), changes.paths.end(),
+            isMissingProjection);
+    }
+    return std::any_of(
+        DesktopItems().begin(), DesktopItems().end(),
+        [&](const DesktopItem& item) {
+            return isMissingProjection(item.path);
+        });
 }
 
 void MainWindow::FinishAccessInteraction() {

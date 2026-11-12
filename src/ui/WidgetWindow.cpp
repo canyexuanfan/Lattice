@@ -20,6 +20,7 @@
 #include "desktop/CategoryStorageManager.h"
 #include "app/resource.h"
 #include "app/StartupManager.h"
+#include "app/UpdateService.h"
 #include "model/OrganizerModel.h"
 #include "shell/ShellDragDrop.h"
 #include "shell/ShellDropTarget.h"
@@ -48,7 +49,6 @@ constexpr UINT kInteractionSaveDelayMilliseconds = 240;
 constexpr UINT_PTR kShellMutationCleanupTimerId = 7;
 constexpr UINT kShellMutationCleanupDelayMilliseconds = 500;
 constexpr unsigned int kMaximumShellMutationCleanupAttempts = 20;
-constexpr wchar_t kCurrentVersion[] = L"0.4.73";
 constexpr UINT kShellNewCommandFirst = 0x5000;
 constexpr UINT kShellNewCommandLast = 0x5FFF;
 
@@ -2422,7 +2422,7 @@ void WidgetWindow::OpenFeedbackDraft() {
                 L"请描述遇到的问题：\r\n\r\n"
                 L"复现步骤：\r\n1. \r\n2. \r\n\r\n"
                 L"期望结果：\r\n\r\n"
-                L"当前版本：" + kCurrentVersion + L"\r\n";
+                L"当前版本：" + UpdateService::kCurrentVersion + L"\r\n";
             const WORD bom = 0xFEFF;
             DWORD written = 0;
             WriteFile(file, &bom, sizeof(bom), &written, nullptr);
@@ -2442,7 +2442,7 @@ void WidgetWindow::ShowPersonalCenter() {
     const AppConfig config = configStore_.LoadAppConfig();
     const std::wstring message = std::wstring(L"当前用户：") + userName +
         L"\n格子数量：" + std::to_wstring(config.categories.size()) +
-        L"\n当前版本：" + kCurrentVersion +
+        L"\n当前版本：" + UpdateService::kCurrentVersion +
         L"\n\n整理数据保存在当前用户的 Lattice 数据目录中。";
     MessageDialog::Show(instance_, hwnd_, message.c_str(), L"个人中心", MB_OK | MB_ICONINFORMATION);
 }

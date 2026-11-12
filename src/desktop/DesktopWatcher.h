@@ -9,6 +9,7 @@
 struct DesktopChangeBatch {
     std::vector<std::wstring> paths;
     bool requiresRescan = false;
+    unsigned projectionAttempt = 0;
 
     bool Empty() const noexcept {
         return paths.empty() && !requiresRescan;

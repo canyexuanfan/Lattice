@@ -1500,6 +1500,26 @@ bool DesktopSurfaceWindow::Refresh(
     bool refreshWallpaper) {
 #ifndef NDEBUG
     ++debugRefreshRequests_;
+    if (refreshOverrideForSmoke_) {
+        DesktopViewSnapshot next = snapshot_;
+        if (!refreshOverrideForSmoke_(next, errorMessage)) {
+            return false;
+        }
+        std::vector<std::wstring> newlyObserved;
+        for (const DesktopViewItem& item : next.items) {
+            const bool wasPresent = std::any_of(
+                snapshot_.items.begin(), snapshot_.items.end(),
+                [&](const DesktopViewItem& previous) {
+                    return IdentitiesEqual(previous.path, item.path);
+                });
+            if (!wasPresent) {
+                newlyObserved.push_back(item.path);
+            }
+        }
+        snapshot_ = std::move(next);
+        RebuildVisibleItems(newlyObserved);
+        return true;
+    }
 #endif
     if (hwnd_ == nullptr) {
         errorMessage = L"Lattice 桌面显示接管尚未创建。";
@@ -3319,6 +3339,50 @@ void DesktopSurfaceWindow::ContinueHostedPointerGesture(
         if (hostedPointerGesture_ == HostedPointerGesture::ItemDragging) {
             POINT screenPoint = clientPoint;
             ClientToScreen(hwnd_, &screenPoint);
+            const bool overCategoryTab = tabDropTargetHandler_ &&
+                !tabDropTargetHandler_(screenPoint).empty();
+            const HWND actualTarget = WindowFromPoint(screenPoint);
+#ifndef NDEBUG
+            hostedActualTargetForSmoke_ = actualTarget;
+#endif
+            if (!overCategoryTab && actualTarget != nullptr &&
+                !IsDesktopPresentationWindow(actualTarget)) {
+                std::vector<std::wstring> items;
+                for (size_t index = 0;
+                     index < source.descriptor.items.size(); ++index) {
+                    const DesktopItem* selected = source.view.ItemAt(index);
+                    if (selected != nullptr &&
+                        std::find(
+                            hostedDraggingItemIds_.begin(),
+                            hostedDraggingItemIds_.end(),
+                            selected->id) != hostedDraggingItemIds_.end()) {
+                        items.push_back(selected->path);
+                    }
+                }
+                const size_t expected = hostedDraggingItemIds_.size();
+                SHDRAGIMAGE image{};
+                const bool hasImage = BuildShellDragImage(
+                    hostedPointerStart_, image, &source.view);
+                ResetHostedPointerGesture();
+                if (GetCapture() == hwnd_) {
+                    ReleaseCapture();
+                }
+                if (items.size() == expected && !items.empty()) {
+                    ++shellDragStartCount_;
+#ifndef NDEBUG
+                    hostedShellDragPathsForSmoke_ = items;
+                    if (!suppressShellDragForSmoke_)
+#endif
+                    {
+                        StartShellDrag(
+                            hwnd_, items, hasImage ? &image : nullptr);
+                    }
+                }
+                if (image.hbmpDragImage != nullptr) {
+                    DeleteObject(image.hbmpDragImage);
+                }
+                return;
+            }
             DragGhostWindow::Instance().Update(screenPoint);
             ClearHostedDragFeedback();
             const int targetIndex = HostedWidgetIndexAt(clientPoint);
@@ -3357,6 +3421,27 @@ void DesktopSurfaceWindow::ContinueHostedPointerGesture(
         }
     }
     InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+bool DesktopSurfaceWindow::IsDesktopPresentationWindow(
+    HWND target) const noexcept {
+    if (target == nullptr || IsWindow(target) == FALSE) {
+        return false;
+    }
+    const auto ownsOrContains = [target](HWND root) {
+        return root != nullptr && IsWindow(root) != FALSE &&
+            (target == root || IsChild(root, target) != FALSE);
+    };
+    if (ownsOrContains(hwnd_) ||
+        ownsOrContains(temporaryForegroundHost_)) {
+        return true;
+    }
+    if (nativeDesktop_ != nullptr &&
+        ownsOrContains(nativeDesktop_->Window())) {
+        return true;
+    }
+    return presentationWindowHandler_ &&
+        presentationWindowHandler_(target);
 }
 
 void DesktopSurfaceWindow::DispatchHostedHeaderButton(

@@ -103,6 +103,10 @@ public:
     void SetTabInputHandler(std::function<bool(UINT,WPARAM,POINT)> handler) {
         tabInputHandler_ = std::move(handler);
     }
+    void SetPresentationWindowHandler(
+        std::function<bool(HWND)> handler) {
+        presentationWindowHandler_ = std::move(handler);
+    }
     bool BeginHostedContainerMove(POINT screenPoint);
     void SetHostedLayoutPreviewHandler(std::function<void(RECT)> handler) {
         hostedLayoutPreviewHandler_ = std::move(handler);
@@ -323,6 +327,7 @@ private:
     void FinishRename(bool commit);
     void UpdateRenameEditGeometry();
     bool FocusKeyboardWindow(HWND target) const noexcept;
+    bool IsDesktopPresentationWindow(HWND target) const noexcept;
     void ReplaceRenamedIdentity(
         const std::wstring& previousIdentity,
         const DesktopShellRenameResult& renamedItem);
@@ -403,6 +408,7 @@ private:
 
     std::function<void(bool, bool)> visibilityHandler_;
     std::function<bool(UINT,WPARAM,POINT)> tabInputHandler_;
+    std::function<bool(HWND)> presentationWindowHandler_;
     std::function<std::wstring(POINT)> tabDropTargetHandler_;
     bool tabPointerPressed_ = false;
     std::function<void(RECT)> hostedLayoutPreviewHandler_;
@@ -477,6 +483,10 @@ private:
     std::uint64_t hostedDragGhostGeneration_ = 0;
 #ifndef NDEBUG
     bool s0TraceEnabled_ = false;
+    std::function<bool(DesktopViewSnapshot&, std::wstring&)>
+        refreshOverrideForSmoke_;
+    HWND hostedActualTargetForSmoke_ = nullptr;
+    std::vector<std::wstring> hostedShellDragPathsForSmoke_;
     std::uint64_t s0RenderCount_ = 0;
     std::uint64_t s0DrawPixels_ = 0;
     std::uint64_t s0DirtyPixels_ = 0;

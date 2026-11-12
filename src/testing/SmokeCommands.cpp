@@ -1040,6 +1040,12 @@ struct WidgetWindowSmokeAccess {
 };
 
 struct DesktopSurfaceWindowSmokeAccess {
+    static void SetDesktopRefreshOverride(
+        DesktopSurfaceWindow& surface,
+        std::function<bool(DesktopViewSnapshot&, std::wstring&)> handler) {
+        surface.refreshOverrideForSmoke_ = std::move(handler);
+    }
+
     static bool NativeReady(const DesktopSurfaceWindow& surface) {
         return surface.nativeDesktop_ && surface.nativeDesktop_->Ready();
     }
@@ -2551,6 +2557,16 @@ struct DesktopSurfaceWindowSmokeAccess {
     static size_t ShellDragStartCount(
         const DesktopSurfaceWindow& surface) {
         return surface.shellDragStartCount_;
+    }
+
+    static std::vector<std::wstring> HostedShellDragPaths(
+        const DesktopSurfaceWindow& surface) {
+        return surface.hostedShellDragPathsForSmoke_;
+    }
+
+    static HWND HostedActualTarget(
+        const DesktopSurfaceWindow& surface) {
+        return surface.hostedActualTargetForSmoke_;
     }
 
     static int InternalDropStageValue(
@@ -5573,6 +5589,49 @@ int RunSmokeConfig() {
     runtimeDiagnostics << "SAME_PATH_RECREATION_AND_DELETE=1\n";
     runtimeDiagnostics.flush();
     std::wcout << L"Desktop runtime watcher/timer, temporary deletions, rename and recreation converged\n";
+
+    // Model an exporter whose final filesystem path is visible to the scanner
+    // before Explorer exposes it through the desktop Shell projection.
+    const std::filesystem::path exportedPath =
+        desktopRoot / L"external-export-final.txt";
+    unsigned projectionRefreshes = 0;
+    DesktopSurfaceWindowSmokeAccess::SetDesktopRefreshOverride(
+        *cachedSurface,
+        [&](DesktopViewSnapshot& next, std::wstring&) {
+            ++projectionRefreshes;
+            if (projectionRefreshes >= 2 &&
+                std::none_of(
+                    next.items.begin(), next.items.end(),
+                    [&](const DesktopViewItem& item) {
+                        return item.path == exportedPath.wstring();
+                    })) {
+                DesktopViewItem exported;
+                exported.path = exportedPath.wstring();
+                exported.displayName = exportedPath.filename().wstring();
+                next.items.push_back(std::move(exported));
+            }
+            return true;
+        });
+    {
+        std::ofstream exported(exportedPath, std::ios::binary);
+        exported << "third-party-export";
+        if (!exported) return 250;
+    }
+    pump(2200);
+    const bool exportedScanned =
+        MainWindowSmokeAccess::HasDesktopPath(
+            runtimeWindow, exportedPath.wstring());
+    const bool exportedProjected = cachedHas(exportedPath);
+    runtimeDiagnostics << "EXPORT_SCANNED=" << exportedScanned
+        << "\nEXPORT_PROJECTED=" << exportedProjected
+        << "\nEXPORT_PROJECTION_REFRESHES=" << projectionRefreshes
+        << "\n";
+    runtimeDiagnostics.flush();
+    if (!exportedScanned || !exportedProjected ||
+        projectionRefreshes < 2 || projectionRefreshes > 3) {
+        std::wcerr << L"External export did not converge after stale Shell projection\n";
+        return 250;
+    }
 
     // A widget-to-desktop drop must replace the old Lattice display point,
     // without teaching Explorer's independent native layout that point.
@@ -8623,9 +8682,34 @@ int RunSmokeDesktopDisplayTakeover(HINSTANCE instance) {
     }
     if (!DesktopSurfaceWindowSmokeAccess::AllVisibleIconsReady(
             surface)) {
+        const auto unready =
+            DesktopSurfaceWindowSmokeAccess::UnreadyVisibleIconPaths(
+                surface);
+        const DWORD required = GetEnvironmentVariableW(
+            L"DESKTOP_ORGANIZER_SMOKE_ITEMS_DIR", nullptr, 0);
+        if (required != 0) {
+            std::wstring root(required, L'\0');
+            const DWORD copied = GetEnvironmentVariableW(
+                L"DESKTOP_ORGANIZER_SMOKE_ITEMS_DIR",
+                root.data(), required);
+            if (copied != 0 && copied < required) {
+                root.resize(copied);
+                std::ofstream diagnostic(
+                    std::filesystem::path(root) /
+                        L"desktop-takeover-unready-icons.txt",
+                    std::ios::trunc);
+                for (const std::wstring& path : unready) {
+                    diagnostic << Utf8Text(path) << "\n";
+                }
+            }
+        }
         surface.Close();
         std::wcerr
-            << L"Desktop takeover left a visible Shell item on a placeholder icon\n";
+            << L"Desktop takeover left visible Shell items on placeholder icons: "
+            << unready.size() << L"\n";
+        for (const std::wstring& path : unready) {
+            std::wcerr << L"UNREADY_ICON=" << path << L"\n";
+        }
         return 115;
     }
     const auto pumpMessagesFor = [](DWORD milliseconds) {
@@ -15612,6 +15696,26 @@ int RunSmokeUpdatePackages() {
 
 int RunSmokeUpdateAndDialog() {
     AttachParentConsole();
+    const std::wstring pendingStatus =
+        UpdateService::FormatVersionStatus(
+            L"正在检查…", L"正在检查公开版本，请稍候。");
+    const std::wstring offlineStatus =
+        UpdateService::FormatVersionStatus(
+            {}, L"无法连接公开更新源，请检查网络后重试。");
+    const std::wstring completedStatus =
+        UpdateService::FormatVersionStatus(
+            L"9.8.7", L"检查完成。");
+    const std::wstring currentLabel =
+        std::wstring(L"当前版本：") + UpdateService::kCurrentVersion;
+    if (pendingStatus.find(currentLabel) == std::wstring::npos ||
+        pendingStatus.find(L"最新版本：正在检查…") == std::wstring::npos ||
+        offlineStatus.find(currentLabel) == std::wstring::npos ||
+        offlineStatus.find(L"最新版本：无法获取") == std::wstring::npos ||
+        completedStatus.find(currentLabel) == std::wstring::npos ||
+        completedStatus.find(L"最新版本：9.8.7") == std::wstring::npos) {
+        std::wcerr << L"Update status hid local version before network completion\n";
+        return 27;
+    }
     std::wstring version;
     std::wstring url;
     const std::string olderIncompleteRelease =
@@ -15829,7 +15933,7 @@ int RunSmokeUpdateAndDialog() {
     });
     HWND activeProgress = nullptr;
     MessageDialog::Show(
-        GetModuleHandleW(nullptr), nullptr, L"正在检查公开版本，请稍候。",
+        GetModuleHandleW(nullptr), nullptr, pendingStatus,
         L"Lattice 更新可见性烟测", MB_OK | MB_ICONINFORMATION,
         &activeProgress);
     closeProgress.join();
@@ -23467,9 +23571,16 @@ int RunSmokeUnifiedHostProduction(HINSTANCE instance) {
     const std::filesystem::path sourcePath =
         std::filesystem::path(smokeItemsDirectory) /
         L"unified-host-external-source.txt";
+    const std::filesystem::path secondSourcePath =
+        std::filesystem::path(smokeItemsDirectory) /
+        L"unified-host-external-source-2.txt";
     {
         std::ofstream sourceFile(sourcePath, std::ios::binary);
         sourceFile << "external source";
+    }
+    {
+        std::ofstream sourceFile(secondSourcePath, std::ios::binary);
+        sourceFile << "external source 2";
     }
     Microsoft::WRL::ComPtr<IDataObject> externalData;
     if (FAILED(CreateShellDragDataObject(
@@ -23589,6 +23700,183 @@ int RunSmokeUnifiedHostProduction(HINSTANCE instance) {
         cleanup();
         std::wcerr << L"Unified production OLE target leave failed\n";
         return 306;
+    }
+
+    // An ordinary hosted-widget drag that reaches an unrelated application
+    // must become a real Shell/OLE drag.  It must not be finalized as the
+    // Lattice-only "move out to desktop" command.
+    widgets[0].items[0].path = sourcePath.wstring();
+    widgets[0].items[1].path = secondSourcePath.wstring();
+    errorMessage.clear();
+    if (!surface.ApplyHostedWidgets(widgets, errorMessage)) {
+        cleanup();
+        std::wcerr << L"Unified production external OLE source setup failed\n";
+        return 324;
+    }
+    WidgetView* externalSourceView =
+        DesktopSurfaceWindowSmokeAccess::HostedWidgetAt(surface, 0);
+    if (externalSourceView == nullptr) {
+        cleanup();
+        return 324;
+    }
+    externalSourceView->SetSelectedItemIds({
+        widgets[0].items[0].id, widgets[0].items[1].id});
+    const RECT externalSourceCell = externalSourceView->ItemHostCell(0);
+    const POINT externalSourcePoint{
+        (externalSourceCell.left + externalSourceCell.right) / 2,
+        externalSourceCell.top + 12};
+    const size_t internalDragStartsBefore =
+        DesktopSurfaceWindowSmokeAccess::ShellDragStartCount(surface);
+    ShowWindow(hostWindow, SW_SHOWNOACTIVATE);
+    SetWindowPos(
+        hostWindow, HWND_TOPMOST, 0, 0, 0, 0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    const bool internalPressed =
+        DesktopSurfaceWindowSmokeAccess::PressHostedPoint(
+            surface, externalSourcePoint, false);
+    if (internalPressed) {
+        DesktopSurfaceWindowSmokeAccess::MoveHostedPoint(
+            surface, blankClient);
+    }
+    const bool internalStayedCustom = internalPressed &&
+        DragGhostWindow::Instance().IsVisible() &&
+        DesktopSurfaceWindowSmokeAccess::ShellDragStartCount(surface) ==
+            internalDragStartsBefore;
+    DesktopSurfaceWindowSmokeAccess::CancelHostedPoint(surface);
+    ShowWindow(hostWindow, SW_HIDE);
+    if (!internalStayedCustom || DragGhostWindow::Instance().IsVisible()) {
+        cleanup();
+        std::wcerr << L"Hosted internal blank drag escaped to external OLE\n";
+        return 324;
+    }
+    externalSourceView->SetSelectedItemIds({
+        widgets[0].items[0].id, widgets[0].items[1].id});
+    const int virtualLeft = GetSystemMetrics(SM_XVIRTUALSCREEN);
+    const int virtualTop = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    const int virtualWidth = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+    const int virtualHeight = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    const int receiverWidth = std::min(320, std::max(160, virtualWidth / 4));
+    const int receiverHeight = std::min(240, std::max(120, virtualHeight / 4));
+    const int receiverX = virtualLeft + std::max(
+        0, (virtualWidth - receiverWidth) / 2);
+    const int receiverY = virtualTop + std::max(
+        0, (virtualHeight - receiverHeight) / 2);
+    HWND externalReceiver = CreateWindowExW(
+        WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
+        L"STATIC",
+        L"Lattice external OLE smoke receiver",
+        WS_POPUP | WS_BORDER | SS_NOTIFY,
+        receiverX,
+        receiverY,
+        receiverWidth,
+        receiverHeight,
+        nullptr,
+        nullptr,
+        instance,
+        nullptr);
+    if (externalReceiver == nullptr) {
+        cleanup();
+        std::wcerr << L"Unified production external OLE receiver missing\n";
+        return 324;
+    }
+    std::vector<std::wstring> externallyDropped;
+    const bool receiverRegistered = RegisterShellDropTarget(
+        externalReceiver,
+        [&](IDataObject*, const auto& paths, POINT, DWORD, DWORD,
+            DWORD* performedEffect) {
+            externallyDropped = paths;
+            *performedEffect = DROPEFFECT_COPY;
+            return true;
+        },
+        [] { return true; });
+    POINT savedCursor{};
+    GetCursorPos(&savedCursor);
+    ShowWindow(externalReceiver, SW_SHOWNOACTIVATE);
+    SetWindowPos(
+        externalReceiver, HWND_TOPMOST, 0, 0, 0, 0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    POINT externalTargetScreen{
+        receiverX + receiverWidth / 2,
+        receiverY + receiverHeight / 2};
+    POINT externalTargetClient = externalTargetScreen;
+    ScreenToClient(hostWindow, &externalTargetClient);
+    POINT externalSourceScreen = externalSourcePoint;
+    ClientToScreen(hostWindow, &externalSourceScreen);
+    SetCursorPos(externalSourceScreen.x, externalSourceScreen.y);
+    commands.clear();
+    const size_t shellDragStartsBefore =
+        DesktopSurfaceWindowSmokeAccess::ShellDragStartCount(surface);
+    DesktopSurfaceWindowSmokeAccess::SuppressShellDragForSmoke(
+        surface, true);
+    const bool externalDragPressed = receiverRegistered &&
+        DesktopSurfaceWindowSmokeAccess::PressHostedPoint(
+            surface, externalSourcePoint, false);
+    if (externalDragPressed) {
+        DesktopSurfaceWindowSmokeAccess::MoveHostedPoint(
+            surface, externalTargetClient);
+    }
+    DesktopSurfaceWindowSmokeAccess::SuppressShellDragForSmoke(
+        surface, false);
+    if (DesktopSurfaceWindowSmokeAccess::HostedPointerGestureForSmoke(
+            surface) != 0) {
+        DesktopSurfaceWindowSmokeAccess::CancelHostedPoint(surface);
+    }
+    const HWND observedExternalTarget =
+        DesktopSurfaceWindowSmokeAccess::HostedActualTarget(surface);
+    wchar_t observedTargetClass[128]{};
+    if (observedExternalTarget != nullptr) {
+        GetClassNameW(
+            observedExternalTarget,
+            observedTargetClass,
+            ARRAYSIZE(observedTargetClass));
+    }
+    UnregisterShellDropTarget(externalReceiver);
+    DestroyWindow(externalReceiver);
+    SetCursorPos(savedCursor.x, savedCursor.y);
+    // The remaining pointer checks are synthetic while the fixture host is
+    // intentionally hidden. Treat their underlying screen windows as part of
+    // the fixture so only the explicit receiver above exercises OLE handoff.
+    surface.SetPresentationWindowHandler([](HWND) { return true; });
+    const bool movedOut = std::any_of(
+        commands.begin(), commands.end(),
+        [](const HostedWidgetCommand& command) {
+            return command.type == HostedWidgetCommandType::MoveSelectionOut;
+        });
+    {
+        std::ofstream diagnostic(
+            std::filesystem::path(smokeItemsDirectory) /
+                L"external-ole-result.txt",
+            std::ios::trunc);
+        diagnostic << "registered=" << receiverRegistered
+                   << " pressed=" << externalDragPressed
+                   << " moved_out=" << movedOut
+                   << " dropped=" << externallyDropped.size()
+                   << " selected="
+                   << externalSourceView->SelectedItemIds().size()
+                   << " drag_starts="
+                   << DesktopSurfaceWindowSmokeAccess::ShellDragStartCount(
+                          surface)
+                   << " receiver="
+                   << reinterpret_cast<std::uintptr_t>(externalReceiver)
+                   << " observed="
+                   << reinterpret_cast<std::uintptr_t>(observedExternalTarget)
+                   << " observed_class=" << Utf8Text(observedTargetClass)
+                   << '\n';
+    }
+    if (!externalDragPressed || movedOut ||
+        DesktopSurfaceWindowSmokeAccess::ShellDragStartCount(surface) !=
+            shellDragStartsBefore + 1 ||
+        DesktopSurfaceWindowSmokeAccess::HostedShellDragPaths(surface) !=
+            std::vector<std::wstring>{
+            sourcePath.wstring(), secondSourcePath.wstring()} ||
+        DesktopSurfaceWindowSmokeAccess::HostedActualTarget(surface) !=
+            externalReceiver ||
+        externalSourceView->SelectedItemIds().size() != 2) {
+        cleanup();
+        std::wcerr << L"Ordinary hosted drag did not hand original files to external OLE target: pressed="
+                   << externalDragPressed << L" movedOut=" << movedOut
+                   << L" dropped=" << externallyDropped.size() << L"\n";
+        return 324;
     }
 
     std::vector<HostedWidgetDescriptor> overlap{widgets[0], widgets[1]};

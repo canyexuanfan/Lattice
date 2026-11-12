@@ -47,11 +47,14 @@ enum class UpdateInstallerValidationFailure {
 
 class UpdateService {
 public:
-    static constexpr wchar_t kCurrentVersion[] = L"0.4.85";
+    static constexpr wchar_t kCurrentVersion[] = L"0.4.86";
 
     static bool Start(HWND notificationWindow, bool manual, HWND dialogOwner = nullptr);
     static int CompareVersions(const std::wstring& left, const std::wstring& right);
     static bool ParseReleaseVersion(const std::string& json, std::wstring& version);
+    static std::wstring FormatVersionStatus(
+        const std::wstring& latestVersion,
+        const std::wstring& detail = {});
     static bool SelectReleaseAsset(
         const std::string& json,
         std::wstring& version,

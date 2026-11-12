@@ -809,22 +809,22 @@ UpdateServiceResult RunUpdate(bool manual) {
     result.manual = manual;
     std::string json;
     if (!FetchLatestRelease(json)) {
-        result.message = L"无法连接公开更新源，请检查网络后重试。";
+        result.message = UpdateService::FormatVersionStatus(
+            {}, L"无法连接公开更新源，请检查网络后重试。");
         return result;
     }
 
     std::wstring releaseVersion;
     if (!UpdateService::ParseReleaseVersion(json, releaseVersion)) {
-        result.message = L"公开更新源返回的版本信息无效，未执行更新。";
+        result.message = UpdateService::FormatVersionStatus(
+            {}, L"公开更新源返回的版本信息无效，未执行更新。");
         return result;
     }
     if (UpdateService::CompareVersions(
             releaseVersion, UpdateService::kCurrentVersion) <= 0) {
         result.status = UpdateServiceStatus::UpToDate;
-        result.message = std::wstring(L"当前版本：") +
-            UpdateService::kCurrentVersion +
-            L"\n公开版本：" + releaseVersion +
-            L"\n\n已经是最新版本。";
+        result.message = UpdateService::FormatVersionStatus(
+            releaseVersion, L"已经是最新版本。");
         return result;
     }
 
@@ -833,24 +833,29 @@ UpdateServiceResult RunUpdate(bool manual) {
             json,
             kCurrentUpdatePackageVariant,
             asset)) {
-        result.message =
-            L"公开更新源返回的安装包信息不完整或不唯一（需要HTTPS地址、大小和SHA-256），未执行更新。";
+        result.message = UpdateService::FormatVersionStatus(
+            releaseVersion,
+            L"公开更新源返回的安装包信息不完整或不唯一（需要HTTPS地址、大小和SHA-256），未执行更新。");
         return result;
     }
     std::wstring installerPath;
     const DownloadFailure failure = DownloadInstaller(asset, installerPath);
     if (failure != DownloadFailure::None) {
-        result.message = DownloadFailureMessage(failure, asset.version);
+        result.message = UpdateService::FormatVersionStatus(
+            asset.version, DownloadFailureMessage(failure, asset.version));
         return result;
     }
     if (!LaunchSilentInstaller(installerPath)) {
-        result.message =
-            L"安装包已通过大小、SHA-256和产品身份校验，但无法启动静默更新。";
+        result.message = UpdateService::FormatVersionStatus(
+            asset.version,
+            L"安装包已通过大小、SHA-256和产品身份校验，但无法启动静默更新。");
         return result;
     }
     result.status = UpdateServiceStatus::UpdateLaunched;
-    result.message = L"Lattice " + asset.version +
-        L" 已下载并通过完整性校验，正在后台更新。";
+    result.message = UpdateService::FormatVersionStatus(
+        asset.version,
+        L"Lattice " + asset.version +
+            L" 已下载并通过完整性校验，正在后台更新。");
     return result;
 }
 
@@ -869,6 +874,18 @@ int UpdateService::CompareVersions(
     if (lhs < rhs) return -1;
     if (lhs > rhs) return 1;
     return 0;
+}
+
+std::wstring UpdateService::FormatVersionStatus(
+    const std::wstring& latestVersion,
+    const std::wstring& detail) {
+    std::wstring message = std::wstring(L"当前版本：") +
+        kCurrentVersion + L"\n最新版本：" +
+        (latestVersion.empty() ? L"无法获取" : latestVersion);
+    if (!detail.empty()) {
+        message += L"\n\n" + detail;
+    }
+    return message;
 }
 
 bool UpdateService::ParseReleaseVersion(
@@ -1219,7 +1236,8 @@ bool UpdateService::Start(
                 result = new UpdateServiceResult(RunUpdate(manual));
             } catch (...) {
                 result = new UpdateServiceResult{};
-                result->message = L"检查更新时发生异常，请稍后重试。";
+                result->message = FormatVersionStatus(
+                    {}, L"检查更新时发生异常，请稍后重试。");
             }
             {
                 std::lock_guard<std::mutex> lock(stateMutex_);

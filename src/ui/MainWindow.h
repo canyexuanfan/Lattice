@@ -119,6 +119,8 @@ private:
     void QueueDesktopChanges(DesktopChangeBatch changes);
     DesktopChangeBatch TakePendingDesktopChanges();
     bool HasPendingDesktopChanges();
+    bool NeedsDesktopProjectionRetry(
+        const DesktopChangeBatch& changes) const;
     void ToggleAllVisible();
     void ToggleAllLocked();
     void ToggleStartup();
