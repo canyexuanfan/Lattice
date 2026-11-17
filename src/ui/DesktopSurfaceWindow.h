@@ -328,6 +328,7 @@ private:
     void UpdateRenameEditGeometry();
     bool FocusKeyboardWindow(HWND target) const noexcept;
     bool IsDesktopPresentationWindow(HWND target) const noexcept;
+    void ForwardDesktopBackgroundContextMenu(POINT screenPoint) const;
     void ReplaceRenamedIdentity(
         const std::wstring& previousIdentity,
         const DesktopShellRenameResult& renamedItem);

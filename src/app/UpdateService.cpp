@@ -416,9 +416,10 @@ bool RequestHttps(
     HINTERNET& requestOut,
     InternetHandle& session,
     InternetHandle& connection,
-    InternetHandle& request) {
+    InternetHandle& request,
+    DWORD* statusCodeOut = nullptr) {
     session.value = WinHttpOpen(
-        L"Lattice/0.4.75",
+        (std::wstring(L"Lattice/") + UpdateService::kCurrentVersion).c_str(),
         WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
         WINHTTP_NO_PROXY_NAME,
         WINHTTP_NO_PROXY_BYPASS,
@@ -457,6 +458,7 @@ bool RequestHttps(
             0,
             0) == FALSE ||
         WinHttpReceiveResponse(request.value, nullptr) == FALSE) {
+        if (statusCodeOut != nullptr) *statusCodeOut = 0;
         return false;
     }
     DWORD status = 0;
@@ -469,17 +471,19 @@ bool RequestHttps(
             &statusSize,
             WINHTTP_NO_HEADER_INDEX) == FALSE ||
         status != 200) {
+        if (statusCodeOut != nullptr) *statusCodeOut = status;
         return false;
     }
     requestOut = request.value;
     return true;
 }
 
-bool FetchLatestRelease(std::string& json) {
+bool FetchLatestRelease(std::string& json, DWORD* statusCodeOut = nullptr) {
     InternetHandle session;
     InternetHandle connection;
     InternetHandle request;
     HINTERNET rawRequest = nullptr;
+    if (statusCodeOut != nullptr) *statusCodeOut = 0;
     if (!RequestHttps(
             kApiHost,
             INTERNET_DEFAULT_HTTPS_PORT,
@@ -487,7 +491,8 @@ bool FetchLatestRelease(std::string& json) {
             rawRequest,
             session,
             connection,
-            request)) {
+            request,
+            statusCodeOut)) {
         return false;
     }
     return ReadResponse(rawRequest, kMaximumMetadataBytes, json);
@@ -808,9 +813,18 @@ UpdateServiceResult RunUpdate(bool manual) {
     UpdateServiceResult result;
     result.manual = manual;
     std::string json;
-    if (!FetchLatestRelease(json)) {
+    DWORD fetchStatus = 0;
+    if (!FetchLatestRelease(json, &fetchStatus)) {
+        // GitHub returns 403 "rate limit exceeded" when the anonymous
+        // 60-per-hour quota of the egress IP is exhausted; that is a
+        // different situation from a network failure and deserves an
+        // accurate message.
         result.message = UpdateService::FormatVersionStatus(
-            {}, L"无法连接公开更新源，请检查网络后重试。");
+            {},
+            fetchStatus == 403
+                ? L"公开更新源暂时拒绝访问（GitHub 对出口 IP 限制访问频率），"
+                  L"请稍后重试或更换网络。"
+                : L"无法连接公开更新源，请检查网络后重试。");
         return result;
     }
 

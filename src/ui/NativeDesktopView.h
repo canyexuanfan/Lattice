@@ -16,6 +16,10 @@ public:
     using StateHandler = std::function<void(bool)>;
     using DragHandler = std::function<void(const std::vector<std::wstring>&, POINT, bool)>;
     using RenameHandler = std::function<bool(const std::wstring&, const std::wstring&, const std::wstring&)>;
+    // Receives the release point (screen coordinates) of a right press that
+    // started on the view background, so the real Explorer desktop can show
+    // its native background menu instead of this synthetic results folder.
+    using BlankContextMenuHandler = std::function<void(POINT)>;
     NativeDesktopView() = default;
     bool Create(const DesktopViewSnapshot& source, HWND widgetWindow, IDropTarget* target,
         StateHandler stateHandler, DragHandler dragHandler, std::wstring& error);
@@ -26,6 +30,7 @@ public:
     bool Resize(const DesktopViewSnapshot& source);
     bool TranslateMessage(MSG& message);
     void SetRenameHandler(RenameHandler handler) { renameHandler_=std::move(handler); }
+    void SetBlankContextMenuHandler(BlankContextMenuHandler handler) { blankContextMenuHandler_=std::move(handler); }
     bool Ready() const noexcept { return ready_ && !failed_; }
     HWND Window() const noexcept { return parent_; }
     HWND ListWindow() const noexcept { return list_; }
@@ -91,4 +96,11 @@ private:
     StateHandler stateHandler_;
     DragHandler dragHandler_;
     RenameHandler renameHandler_;
+    BlankContextMenuHandler blankContextMenuHandler_;
+    bool rightPressedOnItem_ = false;
+    bool rightBackgroundForwarded_ = false;
+#ifndef NDEBUG
+    unsigned debugBlankMenuEvents_ = 0;
+    unsigned debugBlankMenuDownOnItem_ = 0;
+#endif
 };

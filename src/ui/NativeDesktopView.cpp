@@ -440,6 +440,46 @@ LRESULT CALLBACK NativeDesktopView::ListProc(HWND hwnd, UINT message, WPARAM wp,
         self.pressedScreen_ = POINT{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
         ClientToScreen(hwnd, &self.pressedScreen_);
     }
+    if (message == WM_RBUTTONDOWN) {
+        // Decide once per gesture whether the press started on an item. A
+        // background press must reach the real Explorer desktop background
+        // menu instead of this synthetic results folder view menu.
+        // LVM_HITTEST returns -1 when nothing is hit, so only a non-negative
+        // index plus an ONITEM flag counts as a real item press. The desktop
+        // DefView opens its background menu on the button-DOWN itself, so a
+        // background press is swallowed here and the injected handler shows
+        // the real Explorer menu; the matching button-up is swallowed too.
+        LVHITTESTINFO hit{};
+        hit.pt = POINT{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        const LRESULT hitItem = SendMessageW(
+            hwnd, LVM_HITTEST, 0, reinterpret_cast<LPARAM>(&hit));
+        self.rightPressedOnItem_ =
+            hitItem >= 0 && (hit.flags & LVHT_ONITEM) != 0;
+#ifndef NDEBUG
+        self.debugBlankMenuEvents_ |= 0x1;
+        self.debugBlankMenuDownOnItem_ = self.rightPressedOnItem_ ? 1u : 0u;
+#endif
+        if (!self.rightPressedOnItem_ &&
+            self.ready_ && !self.closing_ && !self.failed_ &&
+            self.blankContextMenuHandler_) {
+            POINT screen{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+            ClientToScreen(hwnd, &screen);
+            self.rightBackgroundForwarded_ = true;
+            self.blankContextMenuHandler_(screen);
+#ifndef NDEBUG
+            self.debugBlankMenuEvents_ |= 0x4;
+#endif
+            return 0;
+        }
+    } else if (message == WM_RBUTTONUP) {
+#ifndef NDEBUG
+        self.debugBlankMenuEvents_ |= 0x2;
+#endif
+        if (!self.rightPressedOnItem_) {
+            self.rightBackgroundForwarded_ = false;
+            return 0;
+        }
+    }
     // DefView can clear its results internally on Refresh without sending
     // ListView deletion messages. Its ensuing paint is the existing event
     // boundary; validate only the O(1) row count, then reuse the projection.

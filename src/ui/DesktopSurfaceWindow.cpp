@@ -902,6 +902,9 @@ bool DesktopSurfaceWindow::Create(
         ReplaceRenamedIdentity(previous,renamed);
         UpdateNativeDesktop(); return true;
     });
+    nativeDesktop_->SetBlankContextMenuHandler([this](POINT screenPoint) {
+        ForwardDesktopBackgroundContextMenu(screenPoint);
+    });
     UpdateNativeDesktop();
     UpdateNativeWidgetRegion();
     return true;
@@ -2419,15 +2422,7 @@ LRESULT DesktopSurfaceWindow::HandleMessage(
                 selectedIdentities_.clear();
                 SynchronizeExplorerSelection();
                 InvalidateRect(hwnd_, nullptr, FALSE);
-                if (snapshot_.listViewWindow != nullptr &&
-                    IsWindow(snapshot_.listViewWindow) != FALSE) {
-                    SendMessageW(
-                        snapshot_.listViewWindow,
-                        WM_CONTEXTMENU,
-                        reinterpret_cast<WPARAM>(
-                            snapshot_.listViewWindow),
-                        MAKELPARAM(screenPoint.x, screenPoint.y));
-                }
+                ForwardDesktopBackgroundContextMenu(screenPoint);
             }
             return 0;
         }
@@ -3442,6 +3437,36 @@ bool DesktopSurfaceWindow::IsDesktopPresentationWindow(
     }
     return presentationWindowHandler_ &&
         presentationWindowHandler_(target);
+}
+
+// The single entry point that shows the real Explorer desktop background
+// menu: the keyboard/recovery WM_CONTEXTMENU path and the native view's
+// blank-background right press both forward through here. Two properties
+// make this work like a physical desktop right press:
+// 1. TrackPopupMenu only dismisses on outside clicks when its owning thread
+//    is foreground, so the foreground moves to the real desktop root first
+//    (the desktop root underlies every window, so raising it never lifts the
+//    native list above the takeover layers).
+// 2. The request is posted, not sent: the menu's modal loop lives in
+//    Explorer, and a cross-process SendMessage would block this UI thread
+//    until the menu closes, swallowing the very outside click that should
+//    dismiss it.
+void DesktopSurfaceWindow::ForwardDesktopBackgroundContextMenu(
+    POINT screenPoint) const {
+    if (snapshot_.listViewWindow == nullptr ||
+        IsWindow(snapshot_.listViewWindow) == FALSE) {
+        return;
+    }
+    const HWND desktopRoot =
+        GetAncestor(snapshot_.listViewWindow, GA_ROOT);
+    if (desktopRoot != nullptr && IsWindow(desktopRoot) != FALSE) {
+        SetForegroundWindow(desktopRoot);
+    }
+    PostMessageW(
+        snapshot_.listViewWindow,
+        WM_CONTEXTMENU,
+        reinterpret_cast<WPARAM>(snapshot_.listViewWindow),
+        MAKELPARAM(screenPoint.x, screenPoint.y));
 }
 
 void DesktopSurfaceWindow::DispatchHostedHeaderButton(

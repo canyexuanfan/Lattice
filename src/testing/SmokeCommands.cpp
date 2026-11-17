@@ -1052,6 +1052,30 @@ struct DesktopSurfaceWindowSmokeAccess {
     static HWND NativeList(const DesktopSurfaceWindow& surface) {
         return surface.nativeDesktop_ ? surface.nativeDesktop_->ListWindow() : nullptr;
     }
+    static NativeDesktopView::BlankContextMenuHandler
+    TakeNativeBlankContextMenuHandler(DesktopSurfaceWindow& surface) {
+        if (!surface.nativeDesktop_) return nullptr;
+        auto handler = std::move(
+            surface.nativeDesktop_->blankContextMenuHandler_);
+        surface.nativeDesktop_->blankContextMenuHandler_ = nullptr;
+        return handler;
+    }
+    static void RestoreNativeBlankContextMenuHandler(
+        DesktopSurfaceWindow& surface,
+        NativeDesktopView::BlankContextMenuHandler handler) {
+        if (surface.nativeDesktop_) {
+            surface.nativeDesktop_->blankContextMenuHandler_ =
+                std::move(handler);
+        }
+    }
+#ifndef NDEBUG
+    static std::pair<unsigned, unsigned> NativeBlankMenuDebugCounters(
+        const DesktopSurfaceWindow& surface) {
+        if (!surface.nativeDesktop_) return {0u, 0u};
+        return {surface.nativeDesktop_->debugBlankMenuEvents_,
+                surface.nativeDesktop_->debugBlankMenuDownOnItem_};
+    }
+#endif
     static std::vector<std::wstring> NativeSelected(const DesktopSurfaceWindow& surface) {
         return surface.nativeDesktop_ ? surface.nativeDesktop_->SelectedIdentities() : std::vector<std::wstring>{};
     }
@@ -19731,11 +19755,11 @@ int RunSmokeNativeDesktopHost(HINSTANCE instance) {
     };
     DesktopLayout layout; DesktopViewSnapshot source; std::wstring error;
     std::vector<DesktopPosition> before, after;
-    if (!layout.CaptureViewSnapshot(source,error) || !layout.CaptureAllPositions(before,error)) return 492;
+    if (!layout.CaptureViewSnapshot(source,error) || !layout.CaptureAllPositions(before,error)) { report << "snapshot_failed: " << Utf8Text(error) << "\n"; report.flush(); return 492; }
     const auto item = std::find_if(source.items.begin(),source.items.end(),[](const DesktopViewItem& v) {
         return v.path.find(L"d5364d37-fcf0-4a07-8f76-4676398264a9.png") != std::wstring::npos;
     });
-    if (item == source.items.end()) return 492;
+    if (item == source.items.end()) { report << "fixture_png_missing items=" << source.items.size() << "\n"; report.flush(); return 492; }
     std::vector<std::wstring> otherAssigned;
     for(const auto& original:source.items) if(original.path!=item->path) otherAssigned.push_back(original.path);
     POINT savedCursor{}; GetCursorPos(&savedCursor);
@@ -19743,12 +19767,12 @@ int RunSmokeNativeDesktopHost(HINSTANCE instance) {
     Microsoft::WRL::ComPtr<IFolderView> originalFolder;
     Microsoft::WRL::ComPtr<IShellView> originalView;
     HWND originalWindow=nullptr;
-    if(!layout.AcquireFolderViewOnce(originalFolder.GetAddressOf(),originalView.GetAddressOf(),originalWindow,error)) return 492;
+    if(!layout.AcquireFolderViewOnce(originalFolder.GetAddressOf(),originalView.GetAddressOf(),originalWindow,error)) { report << "acquire_failed: " << Utf8Text(error) << "\n"; report.flush(); return 492; }
     std::vector<const DesktopViewItem*> selectedBefore;
     for(int i=static_cast<int>(SendMessageW(source.listViewWindow,LVM_GETNEXTITEM,static_cast<WPARAM>(-1),LVNI_SELECTED));
         i>=0;i=static_cast<int>(SendMessageW(source.listViewWindow,LVM_GETNEXTITEM,i,LVNI_SELECTED))) {
         auto found=std::find_if(source.items.begin(),source.items.end(),[&](const DesktopViewItem& p){return p.viewIndex==i;});
-        if(found==source.items.end()) return 492;
+        if(found==source.items.end()) { report << "selected_index_missing\n"; report.flush(); return 492; }
         selectedBefore.push_back(&*found);
     }
     int originalFocus=-1; originalFolder->GetFocusedItem(&originalFocus);
@@ -19776,7 +19800,7 @@ int RunSmokeNativeDesktopHost(HINSTANCE instance) {
     const auto idle=[] { return ((GetAsyncKeyState(VK_LBUTTON)|GetAsyncKeyState(VK_CONTROL)|GetAsyncKeyState(VK_SHIFT)|GetAsyncKeyState(VK_MENU))&0x8000)==0; };
     const ULONGLONG idleUntil=GetTickCount64()+30000;
     while(!idle() && GetTickCount64()<idleUntil) pump(20);
-    if(!idle() || WindowFromPoint(iconPoint)!=source.listViewWindow) return 492;
+    if(!idle() || WindowFromPoint(iconPoint)!=source.listViewWindow) { report << "idle_or_occluded idle=" << (idle()?1:0) << " hit_native=" << (WindowFromPoint(iconPoint)==source.listViewWindow) << "\n"; report.flush(); return 492; }
     std::optional<POINT> blank;
     for(int y=source.screenRect.top+64;!blank && y<source.screenRect.bottom-64;y+=100)
         for(int x=source.screenRect.left+64;!blank && x<source.screenRect.right-64;x+=120) {
@@ -19785,7 +19809,7 @@ int RunSmokeNativeDesktopHost(HINSTANCE instance) {
                 return std::abs(v.screenPoint.x-x)<144 && std::abs(v.screenPoint.y-y)<180;
             })) blank=p;
         }
-    if(!blank || !click(*blank)) return 492;
+    if(!blank || !click(*blank)) { report << "blank_or_click_failed blank=" << (blank.has_value()?1:0) << "\n"; report.flush(); return 492; }
     pump(100);
     if(focusOther!=source.items.end()) originalView->SelectItem(reinterpret_cast<PCUITEMID_CHILD>(focusOther->shellChildPidl.data()),
         SVSI_FOCUSED|SVSI_SELECT|SVSI_DESELECTOTHERS);
@@ -19835,6 +19859,150 @@ int RunSmokeNativeDesktopHost(HINSTANCE instance) {
     SaveCapturedPixelsBmp(stateRect,nativeHover,std::filesystem::path(root)/L"host-native-hover.bmp");
     SaveCapturedPixelsBmp(stateRect,nativeSelected,std::filesystem::path(root)/L"host-native-selected.bmp");
     report << "hover_same=" << hoverSame << " selected_same=" << selectedSame << '\n'; report.flush();
+    // A right press that starts on the native view background must be routed
+    // to the injected handler so the real Explorer desktop can show its
+    // native background menu; a press that starts on an item must keep the
+    // native view item behavior and never reach that handler. The production
+    // handler is replaced by a counting stub, so no real background menu is
+    // raised here. The item probe sends only WM_RBUTTONDOWN because a real
+    // button-up on an item would open the Shell item menu and block.
+    if (ready) {
+        unsigned blankContextMenuForwards = 0;
+        POINT forwardedScreen{};
+        NativeDesktopView::BlankContextMenuHandler productionHandler =
+            DesktopSurfaceWindowSmokeAccess::TakeNativeBlankContextMenuHandler(
+                surface);
+        DesktopSurfaceWindowSmokeAccess::RestoreNativeBlankContextMenuHandler(
+            surface,
+            [&](POINT screen) {
+                ++blankContextMenuForwards;
+                forwardedScreen = screen;
+            });
+        const HWND blankMenuList =
+            DesktopSurfaceWindowSmokeAccess::NativeList(surface);
+        RECT blankListRect{};
+        const bool blankListValid = blankMenuList != nullptr &&
+            GetClientRect(blankMenuList, &blankListRect) != FALSE;
+        bool blankPointVerified = false, blankForwarded = false;
+        bool upDelivered = true;
+        if (blankListValid) {
+            POINT backgroundClient{
+                blankListRect.right / 2, blankListRect.bottom - 24};
+            LVHITTESTINFO blankProbe{};
+            blankProbe.pt = backgroundClient;
+            // LVM_HITTEST returns -1 when nothing is hit; only a
+            // non-negative index plus an ONITEM flag means a real item.
+            if (const LRESULT probeItem = SendMessageW(
+                    blankMenuList, LVM_HITTEST, 0,
+                    reinterpret_cast<LPARAM>(&blankProbe));
+                probeItem >= 0 && (blankProbe.flags & LVHT_ONITEM) != 0) {
+                backgroundClient = POINT{
+                    blankListRect.right - 24, blankListRect.bottom / 2};
+                blankProbe = LVHITTESTINFO{};
+                blankProbe.pt = backgroundClient;
+            }
+            const LRESULT verifiedItem = SendMessageW(
+                blankMenuList, LVM_HITTEST, 0,
+                reinterpret_cast<LPARAM>(&blankProbe));
+            blankPointVerified =
+                verifiedItem < 0 || (blankProbe.flags & LVHT_ONITEM) == 0;
+            if (blankPointVerified) {
+                SendMessageW(
+                    blankMenuList, WM_RBUTTONDOWN, MK_RBUTTON,
+                    MAKELPARAM(backgroundClient.x, backgroundClient.y));
+                // A forwarded button-up is intercepted synchronously by the
+                // subclass procedure, so it returns immediately. If the fix
+                // regressed, the Shell opens a real background menu inside
+                // that call and this timeout fires instead of hanging the
+                // fixture; the background-menu thread result decides.
+                unsigned upDeliveredResult = 0;
+                std::thread upSender([&] {
+                    DWORD_PTR delivered = 0;
+                    const bool timeoutOk =
+                        SendMessageTimeoutW(
+                            blankMenuList, WM_RBUTTONUP, 0,
+                            MAKELPARAM(backgroundClient.x, backgroundClient.y),
+                            SMTO_NORMAL, 3000, &delivered) != FALSE;
+                    upDeliveredResult = timeoutOk ? 1u : 0u;
+                });
+                const ULONGLONG until = GetTickCount64() + 8000;
+                while (!upDeliveredResult && GetTickCount64() < until) {
+                    pump(10);
+                }
+                upSender.join();
+                upDelivered = upDeliveredResult == 1u;
+            }
+            POINT expectedScreen = backgroundClient;
+            const bool blankScreenMapped =
+                ClientToScreen(blankMenuList, &expectedScreen) != FALSE;
+            blankForwarded =
+                blankContextMenuForwards == 1 && blankScreenMapped &&
+                upDelivered &&
+                forwardedScreen.x == expectedScreen.x &&
+                forwardedScreen.y == expectedScreen.y;
+        }
+        const int blankMenuItemCount = blankListValid
+            ? static_cast<int>(SendMessageW(
+                  blankMenuList, LVM_GETITEMCOUNT, 0, 0))
+            : 0;
+        bool itemPressSilent = true;
+        if (blankListValid && blankMenuItemCount > 0) {
+            RECT itemRect{};
+            itemRect.left = LVIR_ICON;
+            if (SendMessageW(
+                    blankMenuList, LVM_GETITEMRECT, 0,
+                    reinterpret_cast<LPARAM>(&itemRect)) != FALSE) {
+                POINT itemClient{
+                    (itemRect.left + itemRect.right) / 2,
+                    (itemRect.top + itemRect.bottom) / 2};
+                LVHITTESTINFO itemProbe{};
+                itemProbe.pt = itemClient;
+                const LRESULT probeItem = SendMessageW(
+                    blankMenuList, LVM_HITTEST, 0,
+                    reinterpret_cast<LPARAM>(&itemProbe));
+                if (probeItem >= 0 && (itemProbe.flags & LVHT_ONITEM) != 0) {
+                    SendMessageW(
+                        blankMenuList, WM_RBUTTONDOWN, MK_RBUTTON,
+                        MAKELPARAM(itemClient.x, itemClient.y));
+                    itemPressSilent = blankContextMenuForwards == 1;
+                }
+            }
+        }
+        // The production handler is restored before any verdict so later
+        // scenarios keep the real Explorer background-menu forwarding.
+        DesktopSurfaceWindowSmokeAccess::RestoreNativeBlankContextMenuHandler(
+            surface, std::move(productionHandler));
+        if (!blankPointVerified || !blankForwarded || !itemPressSilent) {
+            std::ofstream diagnostic(
+                std::filesystem::path(root) /
+                    L"blank-context-menu-result.txt",
+                std::ios::trunc);
+            diagnostic << "verified=" << blankPointVerified
+                       << " forwarded=" << blankForwarded
+                       << " item_silent=" << itemPressSilent
+                       << " forwards=" << blankContextMenuForwards
+                       << " items=" << blankMenuItemCount
+                       << " list_valid=" << blankListValid
+                       << " up_delivered=" << upDelivered
+                       << " handler_x=" << forwardedScreen.x
+                       << " handler_y=" << forwardedScreen.y;
+#ifndef NDEBUG
+            const auto menuCounters =
+                DesktopSurfaceWindowSmokeAccess::NativeBlankMenuDebugCounters(
+                    surface);
+            diagnostic << " events=" << menuCounters.first
+                       << " down_on_item=" << menuCounters.second;
+#endif
+            diagnostic << '\n';
+        }
+        report << "blank_menu_verified=" << blankPointVerified
+            << " blank_menu_forwarded=" << blankForwarded
+            << " blank_menu_item_silent=" << itemPressSilent << '\n';
+        report.flush();
+        if (!blankPointVerified || !blankForwarded || !itemPressSilent) {
+            return 494;
+        }
+    }
     const auto key=[](WORD code) {
         INPUT events[2]{}; events[0].type=events[1].type=INPUT_KEYBOARD;
         events[0].ki.wVk=events[1].ki.wVk=code; events[1].ki.dwFlags=KEYEVENTF_KEYUP;
